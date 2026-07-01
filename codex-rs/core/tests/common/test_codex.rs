@@ -19,6 +19,7 @@ use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::TimeProvider;
 use codex_core::config::Config;
+use codex_core::config::ThreadStoreConfig;
 use codex_core::resolve_installation_id;
 use codex_core::shell::Shell;
 use codex_core::shell::get_shell_by_model_provided_path;
@@ -608,7 +609,7 @@ impl TestCodexBuilder {
             user_instructions_provider,
             /*analytics_events_client*/ None,
             thread_store,
-            codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
+            codex_core::agent_graph_store_from_config(&config, state_db.as_ref()),
             installation_id,
             /*attestation_provider*/ None,
             /*external_time_provider*/ self.external_time_provider.clone(),
@@ -708,6 +709,7 @@ impl TestCodexBuilder {
         } else {
             load_default_config_for_test(home).await
         };
+        config.experimental_thread_store = ThreadStoreConfig::Local;
         config.cwd = cwd_override;
         config.model_provider = model_provider;
         if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
