@@ -13,7 +13,7 @@ env:
 jobs:
   linux-cargo-build:
     name: Linux remote SQL cargo build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: codex-rs
@@ -43,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/codex-release
-          for bin in codex codex-app-server codex-mcp-server codex-thread-manager-sample; do
+          for bin in codex; do
             if [ -x "target/debug/${bin}" ]; then
               cp "target/debug/${bin}" "target/codex-release/${bin}"
             fi
@@ -59,6 +59,6 @@ jobs:
           ls -lh target/codex-release
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: codex-linux-gnu
+          name: codex-linux-glibc235
           path: codex-rs/target/codex-release/
           if-no-files-found: error
