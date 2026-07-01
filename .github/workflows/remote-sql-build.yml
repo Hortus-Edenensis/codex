@@ -48,11 +48,17 @@ jobs:
               cp "target/debug/${bin}" "target/codex-release/${bin}"
             fi
           done
+          for bin in target/codex-release/*; do
+            if [ -f "${bin}" ] && [ -x "${bin}" ]; then
+              strip --strip-unneeded "${bin}"
+            fi
+          done
           test -x target/codex-release/codex
           sha256sum target/codex-release/* > target/codex-release/SHA256SUMS
+          du -sh target/codex-release
           ls -lh target/codex-release
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: codex-linux-debug
+          name: codex-linux-gnu
           path: codex-rs/target/codex-release/
           if-no-files-found: error
