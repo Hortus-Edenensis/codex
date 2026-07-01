@@ -84,6 +84,7 @@ members = [
     "network-proxy",
     "ollama",
     "process-hardening",
+    "postgres-thread-store",
     "protocol",
     "prompts",
     "rollout",
@@ -233,6 +234,7 @@ codex-ollama = { path = "ollama" }
 codex-otel = { path = "otel" }
 codex-plugin = { path = "plugin" }
 codex-model-provider = { path = "model-provider" }
+codex-postgres-thread-store = { path = "postgres-thread-store" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }
 codex-prompts = { path = "prompts" }
@@ -441,6 +443,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "json",
     "macros",
     "migrate",
+    "postgres",
     "runtime-tokio",
     "tls-rustls",
     "sqlite-bundled",

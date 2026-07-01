@@ -1,0 +1,41 @@
+name: remote-sql-build
+
+on:
+  push:
+    branches:
+      - remote-sql-postgres-workspace
+  workflow_dispatch:
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  linux-cargo-build:
+    name: Linux remote SQL cargo build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Install native build dependencies
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libcap-dev \
+            libssl-dev \
+            pkg-config \
+            protobuf-compiler
+      - name: Build remote SQL targets
+        run: |
+          cargo build --ignore-rust-version \
+            -p codex-postgres-thread-store \
+            -p codex-core \
+            -p codex-app-server \
+            -p codex-mcp-server \
+            -p codex-thread-manager-sample \
+            -p codex-cli

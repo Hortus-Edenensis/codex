@@ -280,11 +280,13 @@ fn resolve_mcp_oauth_credentials_store_mode(
 #[cfg(test)]
 pub(crate) async fn test_config() -> Config {
     let codex_home = tempfile::tempdir().expect("create temp dir");
+    let base_config = ConfigToml {
+        model: Some("gpt-5.5".to_string()),
+        experimental_thread_store: Some(ThreadStoreToml::Local {}),
+        ..Default::default()
+    };
     Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            model: Some("gpt-5.5".to_string()),
-            ..Default::default()
-        },
+        base_config,
         ConfigOverrides::default(),
         AbsolutePathBuf::from_absolute_path(codex_home.path()).expect("temp dir should resolve"),
     )
@@ -587,13 +589,29 @@ fn build_network_proxy_spec(
 }
 
 /// Configured thread persistence backend.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadStoreConfig {
-    /// Persist threads locally using rollout JSONL files and sqlite metadata.
-    #[default]
+    /// Persist threads in remote PostgreSQL. This is the required default for
+    /// shared workspaces; local JSONL/SQLite remains a legacy explicit mode.
+    Postgres {
+        database_url_env: String,
+        default_workspace_id: String,
+        redis_url_env: Option<String>,
+    },
+    /// Legacy local rollout JSONL files and SQLite metadata.
     Local,
     /// In-memory thread store for test and debug configurations.
     InMemory { id: String },
+}
+
+impl Default for ThreadStoreConfig {
+    fn default() -> Self {
+        Self::Postgres {
+            database_url_env: codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV.to_string(),
+            default_workspace_id: codex_postgres_thread_store::DEFAULT_WORKSPACE_ID.to_string(),
+            redis_url_env: Some("CODEX_REDIS_URL".to_string()),
+        }
+    }
 }
 
 /// Application configuration loaded from disk and merged with overrides.
@@ -2401,8 +2419,21 @@ fn resolve_tool_suggest_config_from_config(
 fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConfig {
     match thread_store {
         Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
+        Some(ThreadStoreToml::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        }) => ThreadStoreConfig::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        },
         Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
-        None => ThreadStoreConfig::Local,
+        None => ThreadStoreConfig::Postgres {
+            database_url_env: codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV.to_string(),
+            default_workspace_id: codex_postgres_thread_store::DEFAULT_WORKSPACE_ID.to_string(),
+            redis_url_env: Some("CODEX_REDIS_URL".to_string()),
+        },
     }
 }
 

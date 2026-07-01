@@ -2796,6 +2796,7 @@ dependencies = [
  "codex-network-proxy",
  "codex-otel",
  "codex-plugin",
+ "codex-postgres-thread-store",
  "codex-prompts",
  "codex-protocol",
  "codex-response-debug-context",
@@ -3929,6 +3930,22 @@ dependencies = [
  "codex-utils-plugins",
  "pretty_assertions",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codex-postgres-thread-store"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "codex-agent-graph-store",
+ "codex-protocol",
+ "codex-thread-store",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
