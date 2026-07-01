@@ -57,6 +57,7 @@ use codex_config::ConfigLoadError;
 use codex_config::TextRange as CoreTextRange;
 use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
+use codex_core::config::ThreadStoreConfig;
 use codex_core::config::find_codex_home;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
@@ -563,13 +564,20 @@ pub async fn run_main_with_transport_options(
         }
         _ => None,
     };
-    let state_db_init = match init_sqlite_state_db_with_fresh_start_on_corruption(&config).await {
-        Ok(state_db_init) => state_db_init,
-        Err(err) => {
-            return Err(std::io::Error::other(format!(
-                "failed to initialize sqlite state runtime under {}: {err}",
-                config.sqlite_home.display()
-            )));
+    let state_db_init = if should_initialize_sqlite_state_db(&config) {
+        match init_sqlite_state_db_with_fresh_start_on_corruption(&config).await {
+            Ok(state_db_init) => state_db_init,
+            Err(err) => {
+                return Err(std::io::Error::other(format!(
+                    "failed to initialize sqlite state runtime under {}: {err}",
+                    config.sqlite_home.display()
+                )));
+            }
+        }
+    } else {
+        StateDbInitResult {
+            state_db: None,
+            recovery_notice: None,
         }
     };
     let state_db = state_db_init.state_db;
@@ -1204,6 +1212,10 @@ struct RecoveredSqliteDatabase {
 struct StateDbInitResult {
     state_db: Option<rollout_state_db::StateDbHandle>,
     recovery_notice: Option<SqliteRecoveryNotice>,
+}
+
+fn should_initialize_sqlite_state_db(config: &Config) -> bool {
+    matches!(config.experimental_thread_store, ThreadStoreConfig::Local)
 }
 
 async fn init_sqlite_state_db_with_fresh_start_on_corruption(
