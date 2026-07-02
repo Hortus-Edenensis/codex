@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_LTO: "false"
   RUST_MIN_STACK: "8388608"
 
 jobs:
@@ -33,12 +36,8 @@ jobs:
       - name: Build remote SQL targets
         run: |
           cargo build --ignore-rust-version --release \
-            -p codex-postgres-thread-store \
-            -p codex-core \
-            -p codex-app-server \
-            -p codex-mcp-server \
-            -p codex-thread-manager-sample \
-            -p codex-cli
+            -p codex-cli \
+            --bin codex
       - name: Stage release artifact
         run: |
           set -euo pipefail
