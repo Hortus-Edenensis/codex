@@ -735,7 +735,7 @@ fn latest_session_lookup_params(
         sort_key: Some(AppServerThreadSortKey::UpdatedAt),
         sort_direction: None,
         model_providers: if uses_remote_workspace {
-            None
+            Some(Vec::new())
         } else {
             Some(vec![config.model_provider_id.clone()])
         },
@@ -2465,7 +2465,7 @@ mod tests {
             LatestSessionLookupMode::StateDbOnly,
         );
 
-        assert_eq!(params.model_providers, None);
+        assert_eq!(params.model_providers, Some(Vec::new()));
         assert_eq!(params.cwd, None);
         Ok(())
     }
@@ -2511,7 +2511,7 @@ mod tests {
             LatestSessionLookupMode::StateDbOnly,
         );
 
-        assert_eq!(params.model_providers, None);
+        assert_eq!(params.model_providers, Some(Vec::new()));
         assert_eq!(
             params.cwd,
             Some(ThreadListCwdFilter::One(String::from("repo/on/server")))
