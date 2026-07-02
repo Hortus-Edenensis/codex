@@ -18,6 +18,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::GitSha;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionSource;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::CreateThreadParams;
@@ -43,6 +44,7 @@ use codex_thread_store::TurnPage;
 use codex_thread_store::UpdateThreadMetadataParams;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use serde_json::json;
 use sqlx::PgPool;
 use sqlx::Postgres;
@@ -308,6 +310,8 @@ impl ThreadStore for PostgresThreadStore {
                 first_user_message: None,
                 history: None,
             };
+            let source_key = canonical_session_source_key(&stored.source)?;
+            let thread_source_key = stored.thread_source.as_ref().map(ToString::to_string);
             let stored_json = serde_json::to_value(&stored).map_err(internal_error)?;
             let mut tx = pool.begin().await.map_err(internal_error)?;
             sqlx::query(
@@ -350,13 +354,8 @@ INSERT INTO threads (
             .bind(stored.forked_from_id.map(|id| id.to_string()))
             .bind(stored.parent_thread_id.map(|id| id.to_string()))
             .bind(format!("{:?}", stored.history_mode))
-            .bind(format!("{:?}", stored.source))
-            .bind(
-                stored
-                    .thread_source
-                    .as_ref()
-                    .map(|source| source.to_string()),
-            )
+            .bind(source_key)
+            .bind(thread_source_key)
             .bind(stored.model_provider.as_str())
             .bind(stored.cwd.to_string_lossy().to_string())
             .bind(stored.name.as_deref())
@@ -556,7 +555,10 @@ VALUES ($1, $2, $3, $4)
                 let allowed_sources = params
                     .allowed_sources
                     .iter()
-                    .map(|source| format!("{source:?}"))
+                    .map(session_source_filter_keys)
+                    .collect::<ThreadStoreResult<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
                     .collect::<Vec<_>>();
                 builder.push(" AND source = ANY(");
                 builder.push_bind(allowed_sources);
@@ -748,6 +750,8 @@ FOR UPDATE
                     message: format!("thread {} is archived", params.thread_id),
                 });
             }
+            let source_key = canonical_session_source_key(&stored.source)?;
+            let thread_source_key = stored.thread_source.as_ref().map(ToString::to_string);
             let stored_json = serde_json::to_value(&stored).map_err(internal_error)?;
             sqlx::query(
                 r#"
@@ -762,7 +766,9 @@ SET revision = revision + 1,
     archived_at = $9,
     updated_at = $10,
     recency_at = $11,
-    stored_thread_json = $12
+    source = $12,
+    thread_source = $13,
+    stored_thread_json = $14
 WHERE workspace_id = $1 AND id = $2
                 "#,
             )
@@ -782,6 +788,8 @@ WHERE workspace_id = $1 AND id = $2
             .bind(stored.archived_at)
             .bind(stored.updated_at)
             .bind(stored.recency_at)
+            .bind(source_key)
+            .bind(thread_source_key)
             .bind(stored_json)
             .execute(&mut *tx)
             .await
@@ -1067,6 +1075,63 @@ fn stored_thread_from_row(row: &sqlx::postgres::PgRow) -> ThreadStoreResult<Stor
     serde_json::from_value(value).map_err(internal_error)
 }
 
+fn canonical_session_source_key(source: &SessionSource) -> ThreadStoreResult<String> {
+    let value = serde_json::to_value(source).map_err(internal_error)?;
+    session_source_key_from_value(&value)
+}
+
+fn session_source_filter_keys(source: &SessionSource) -> ThreadStoreResult<Vec<String>> {
+    let value = serde_json::to_value(source).map_err(internal_error)?;
+    let mut keys = Vec::new();
+    push_unique_key(&mut keys, session_source_key_from_value(&value)?);
+    push_unique_key(&mut keys, format!("{source:?}"));
+    push_unique_key(&mut keys, source.to_string());
+    if !value.is_string() {
+        push_unique_key(&mut keys, postgres_jsonb_compat_key(&value)?);
+    }
+    Ok(keys)
+}
+
+fn session_source_key_from_value(value: &Value) -> ThreadStoreResult<String> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        value => serde_json::to_string(value).map_err(internal_error),
+    }
+}
+
+fn postgres_jsonb_compat_key(value: &Value) -> ThreadStoreResult<String> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => {
+            serde_json::to_string(value).map_err(internal_error)
+        }
+        Value::String(value) => serde_json::to_string(value).map_err(internal_error),
+        Value::Array(values) => values
+            .iter()
+            .map(postgres_jsonb_compat_key)
+            .collect::<ThreadStoreResult<Vec<_>>>()
+            .map(|values| format!("[{}]", values.join(", "))),
+        Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let key = serde_json::to_string(key).map_err(internal_error)?;
+                    let value = postgres_jsonb_compat_key(value)?;
+                    Ok(format!("{key}: {value}"))
+                })
+                .collect::<ThreadStoreResult<Vec<_>>>()
+                .map(|entries| format!("{{{}}}", entries.join(", ")))
+        }
+    }
+}
+
+fn push_unique_key(keys: &mut Vec<String>, key: String) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
 fn decode_offset_cursor(cursor: Option<&str>) -> ThreadStoreResult<usize> {
     let Some(cursor) = cursor else {
         return Ok(0);
@@ -1100,3 +1165,7 @@ fn agent_graph_error(err: impl std::fmt::Display) -> codex_agent_graph_store::Ag
         message: err.to_string(),
     }
 }
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;

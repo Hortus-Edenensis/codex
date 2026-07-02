@@ -32,7 +32,7 @@ jobs:
             protobuf-compiler
       - name: Build remote SQL targets
         run: |
-          cargo build --ignore-rust-version \
+          cargo build --ignore-rust-version --release \
             -p codex-postgres-thread-store \
             -p codex-core \
             -p codex-app-server \
@@ -44,8 +44,8 @@ jobs:
           set -euo pipefail
           mkdir -p target/codex-release
           for bin in codex; do
-            if [ -x "target/debug/${bin}" ]; then
-              cp "target/debug/${bin}" "target/codex-release/${bin}"
+            if [ -x "target/release/${bin}" ]; then
+              cp "target/release/${bin}" "target/codex-release/${bin}"
             fi
           done
           for bin in target/codex-release/*; do
