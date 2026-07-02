@@ -2003,6 +2003,7 @@ dependencies = [
  "codex-models-manager",
  "codex-otel",
  "codex-plugin",
+ "codex-postgres-thread-store",
  "codex-protocol",
  "codex-rmcp-client",
  "codex-rollout",

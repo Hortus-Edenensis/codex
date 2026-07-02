@@ -59,6 +59,7 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 pub const DEFAULT_DATABASE_URL_ENV: &str = "CODEX_REMOTE_SQL_URL";
 pub const DEFAULT_WORKSPACE_ID: &str = "default";
+const REMOTE_CONTROL_APP_SERVER_CLIENT_NAME_NONE: &str = "";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostgresThreadStoreConfig {
@@ -75,6 +76,18 @@ impl Default for PostgresThreadStoreConfig {
             redis_url_env: Some("CODEX_REDIS_URL".to_string()),
         }
     }
+}
+
+/// Persisted remote-control server enrollment for a remote SQL workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteControlEnrollmentRecord {
+    pub websocket_url: String,
+    pub account_id: String,
+    pub app_server_client_name: Option<String>,
+    pub server_id: String,
+    pub environment_id: String,
+    pub server_name: String,
+    pub remote_control_enabled: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -151,6 +164,144 @@ impl PostgresThreadStore {
 
     pub async fn migrate(&self) -> ThreadStoreResult<()> {
         self.ensure_migrated().await
+    }
+
+    pub async fn get_remote_control_enrollment(
+        &self,
+        websocket_url: &str,
+        account_id: &str,
+        app_server_client_name: Option<&str>,
+    ) -> ThreadStoreResult<Option<RemoteControlEnrollmentRecord>> {
+        self.ensure_migrated().await?;
+        let (pool, workspace_id) = self.pool_and_workspace()?;
+        let row = sqlx::query(
+            r#"
+SELECT websocket_url, account_id, app_server_client_name, server_id, environment_id, server_name,
+    remote_control_enabled
+FROM remote_control_enrollments
+WHERE workspace_id = $1 AND websocket_url = $2 AND account_id = $3 AND app_server_client_name = $4
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(websocket_url)
+        .bind(account_id)
+        .bind(remote_control_app_server_client_name_key(
+            app_server_client_name,
+        ))
+        .fetch_optional(pool)
+        .await
+        .map_err(internal_error)?;
+
+        row.map(remote_control_enrollment_from_row).transpose()
+    }
+
+    pub async fn upsert_remote_control_enrollment(
+        &self,
+        enrollment: &RemoteControlEnrollmentRecord,
+    ) -> ThreadStoreResult<()> {
+        self.ensure_migrated().await?;
+        let (pool, workspace_id) = self.pool_and_workspace()?;
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        sqlx::query(
+            "INSERT INTO workspaces (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(workspace_id)
+        .bind("Default workspace")
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        sqlx::query(
+            r#"
+INSERT INTO remote_control_enrollments (
+    workspace_id,
+    websocket_url,
+    account_id,
+    app_server_client_name,
+    server_id,
+    environment_id,
+    server_name,
+    remote_control_enabled,
+    updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT(workspace_id, websocket_url, account_id, app_server_client_name) DO UPDATE SET
+    server_id = EXCLUDED.server_id,
+    environment_id = EXCLUDED.environment_id,
+    server_name = EXCLUDED.server_name,
+    updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(&enrollment.websocket_url)
+        .bind(&enrollment.account_id)
+        .bind(remote_control_app_server_client_name_key(
+            enrollment.app_server_client_name.as_deref(),
+        ))
+        .bind(&enrollment.server_id)
+        .bind(&enrollment.environment_id)
+        .bind(&enrollment.server_name)
+        .bind(enrollment.remote_control_enabled)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+        Ok(())
+    }
+
+    pub async fn set_remote_control_enabled(
+        &self,
+        websocket_url: &str,
+        account_id: &str,
+        app_server_client_name: Option<&str>,
+        remote_control_enabled: bool,
+    ) -> ThreadStoreResult<u64> {
+        self.ensure_migrated().await?;
+        let (pool, workspace_id) = self.pool_and_workspace()?;
+        let result = sqlx::query(
+            r#"
+UPDATE remote_control_enrollments
+SET remote_control_enabled = $5, updated_at = $6
+WHERE workspace_id = $1 AND websocket_url = $2 AND account_id = $3 AND app_server_client_name = $4
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(websocket_url)
+        .bind(account_id)
+        .bind(remote_control_app_server_client_name_key(
+            app_server_client_name,
+        ))
+        .bind(remote_control_enabled)
+        .bind(Utc::now())
+        .execute(pool)
+        .await
+        .map_err(internal_error)?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn delete_remote_control_enrollment(
+        &self,
+        websocket_url: &str,
+        account_id: &str,
+        app_server_client_name: Option<&str>,
+    ) -> ThreadStoreResult<u64> {
+        self.ensure_migrated().await?;
+        let (pool, workspace_id) = self.pool_and_workspace()?;
+        let result = sqlx::query(
+            r#"
+DELETE FROM remote_control_enrollments
+WHERE workspace_id = $1 AND websocket_url = $2 AND account_id = $3 AND app_server_client_name = $4
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(websocket_url)
+        .bind(account_id)
+        .bind(remote_control_app_server_client_name_key(
+            app_server_client_name,
+        ))
+        .execute(pool)
+        .await
+        .map_err(internal_error)?;
+        Ok(result.rows_affected())
     }
 
     fn unconfigured(message: String) -> Self {
@@ -1073,6 +1224,37 @@ fn apply_metadata_patch(stored: &mut StoredThread, patch: codex_thread_store::Th
 fn stored_thread_from_row(row: &sqlx::postgres::PgRow) -> ThreadStoreResult<StoredThread> {
     let value: serde_json::Value = row.try_get("stored_thread_json").map_err(internal_error)?;
     serde_json::from_value(value).map_err(internal_error)
+}
+
+fn remote_control_app_server_client_name_key(app_server_client_name: Option<&str>) -> &str {
+    app_server_client_name.unwrap_or(REMOTE_CONTROL_APP_SERVER_CLIENT_NAME_NONE)
+}
+
+fn app_server_client_name_from_key(app_server_client_name: String) -> Option<String> {
+    if app_server_client_name.is_empty() {
+        None
+    } else {
+        Some(app_server_client_name)
+    }
+}
+
+fn remote_control_enrollment_from_row(
+    row: sqlx::postgres::PgRow,
+) -> ThreadStoreResult<RemoteControlEnrollmentRecord> {
+    let app_server_client_name: String = row
+        .try_get("app_server_client_name")
+        .map_err(internal_error)?;
+    Ok(RemoteControlEnrollmentRecord {
+        websocket_url: row.try_get("websocket_url").map_err(internal_error)?,
+        account_id: row.try_get("account_id").map_err(internal_error)?,
+        app_server_client_name: app_server_client_name_from_key(app_server_client_name),
+        server_id: row.try_get("server_id").map_err(internal_error)?,
+        environment_id: row.try_get("environment_id").map_err(internal_error)?,
+        server_name: row.try_get("server_name").map_err(internal_error)?,
+        remote_control_enabled: row
+            .try_get("remote_control_enabled")
+            .map_err(internal_error)?,
+    })
 }
 
 fn canonical_session_source_key(source: &SessionSource) -> ThreadStoreResult<String> {

@@ -34,8 +34,10 @@ use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionState;
 use crate::transport::OutboundConnectionState;
+use crate::transport::PersistedRemoteControlEnrollment;
 use crate::transport::RemoteControlPolicy;
 use crate::transport::RemoteControlStartConfig;
+use crate::transport::RemoteControlStateStore;
 use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
@@ -43,7 +45,7 @@ use crate::transport::auth::policy_from_settings;
 use crate::transport::prepare_control_socket_path;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_control_socket_acceptor;
-use crate::transport::start_remote_control;
+use crate::transport::start_remote_control_with_state_store;
 use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
 use codex_analytics::AppServerRpcTransport;
@@ -544,6 +546,17 @@ pub async fn run_main_with_transport_options(
     })?;
     codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
     codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
+    let remote_control_policy = if config
+        .config_layer_stack
+        .requirements()
+        .allow_remote_control
+        .as_ref()
+        .is_some_and(|requirement| !requirement.value)
+    {
+        RemoteControlPolicy::DisabledByRequirements
+    } else {
+        RemoteControlPolicy::Allowed
+    };
     let unix_socket_startup_lock = match &transport {
         AppServerTransport::UnixSocket { socket_path } => {
             let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
@@ -693,17 +706,6 @@ pub async fn run_main_with_transport_options(
             None => error!("{}", warning.summary),
         }
     }
-    let remote_control_policy = if config
-        .config_layer_stack
-        .requirements()
-        .allow_remote_control
-        .as_ref()
-        .is_some_and(|requirement| !requirement.value)
-    {
-        RemoteControlPolicy::DisabledByRequirements
-    } else {
-        RemoteControlPolicy::Allowed
-    };
     let remote_control_startup_mode = runtime_options.remote_control_startup_mode;
     let remote_control_explicitly_requested =
         remote_control_startup_mode == RemoteControlStartupMode::EnabledEphemeral;
@@ -762,11 +764,13 @@ pub async fn run_main_with_transport_options(
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
 
+    let remote_control_state_store =
+        remote_control_state_store_for_config(&config, state_db.clone());
     let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
         && remote_control_explicitly_requested
-        && state_db.is_some();
-    if remote_control_explicitly_requested && state_db.is_none() {
-        error!("remote control disabled because sqlite state db is unavailable");
+        && remote_control_state_store.is_some();
+    if remote_control_explicitly_requested && remote_control_state_store.is_none() {
+        error!("remote control disabled because state storage is unavailable");
     }
     let no_local_transport = transport_accept_handles.is_empty();
     if no_local_transport
@@ -777,28 +781,29 @@ pub async fn run_main_with_transport_options(
             ErrorKind::InvalidInput,
             if remote_control_policy == RemoteControlPolicy::DisabledByRequirements {
                 "no transport configured; remote control disabled by managed requirements"
-            } else if remote_control_explicitly_requested && state_db.is_none() {
-                "no transport configured; remote control disabled because sqlite state db is unavailable"
+            } else if remote_control_explicitly_requested && remote_control_state_store.is_none() {
+                "no transport configured; remote control disabled because state storage is unavailable"
             } else {
                 "no transport configured; use --listen or enable remote control"
             },
         ));
     }
 
-    let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
-        RemoteControlStartConfig {
-            remote_control_url: config.chatgpt_base_url.clone(),
-            installation_id: installation_id.clone(),
-            policy: remote_control_policy,
-        },
-        state_db.clone(),
-        auth_manager.clone(),
-        transport_event_tx.clone(),
-        transport_shutdown_token.clone(),
-        app_server_client_name_rx,
-        remote_control_startup_mode,
-    )
-    .await?;
+    let (remote_control_accept_handle, remote_control_handle) =
+        start_remote_control_with_state_store(
+            RemoteControlStartConfig {
+                remote_control_url: config.chatgpt_base_url.clone(),
+                installation_id: installation_id.clone(),
+                policy: remote_control_policy,
+            },
+            remote_control_state_store.clone(),
+            auth_manager.clone(),
+            transport_event_tx.clone(),
+            transport_shutdown_token.clone(),
+            app_server_client_name_rx,
+            remote_control_startup_mode,
+        )
+        .await?;
     if no_local_transport
         && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
     {
@@ -1208,6 +1213,139 @@ struct RecoveredSqliteDatabase {
 struct StateDbInitResult {
     state_db: Option<rollout_state_db::StateDbHandle>,
     recovery_notice: Option<SqliteRecoveryNotice>,
+}
+
+#[derive(Clone)]
+struct PostgresRemoteControlStateStore {
+    store: codex_postgres_thread_store::PostgresThreadStore,
+}
+
+impl RemoteControlStateStore for PostgresRemoteControlStateStore {
+    fn get_remote_control_enrollment<'a>(
+        &'a self,
+        websocket_url: &'a str,
+        account_id: &'a str,
+        app_server_client_name: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<Option<PersistedRemoteControlEnrollment>>>
+    {
+        Box::pin(async move {
+            self.store
+                .get_remote_control_enrollment(websocket_url, account_id, app_server_client_name)
+                .await
+                .map(|enrollment| enrollment.map(persisted_remote_control_enrollment_from_postgres))
+                .map_err(std::io::Error::other)
+        })
+    }
+
+    fn upsert_remote_control_enrollment<'a>(
+        &'a self,
+        enrollment: &'a PersistedRemoteControlEnrollment,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            self.store
+                .upsert_remote_control_enrollment(
+                    &postgres_remote_control_enrollment_from_persisted(enrollment),
+                )
+                .await
+                .map_err(std::io::Error::other)
+        })
+    }
+
+    fn set_remote_control_enabled<'a>(
+        &'a self,
+        websocket_url: &'a str,
+        account_id: &'a str,
+        app_server_client_name: Option<&'a str>,
+        remote_control_enabled: bool,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<u64>> {
+        Box::pin(async move {
+            self.store
+                .set_remote_control_enabled(
+                    websocket_url,
+                    account_id,
+                    app_server_client_name,
+                    remote_control_enabled,
+                )
+                .await
+                .map_err(std::io::Error::other)
+        })
+    }
+
+    fn delete_remote_control_enrollment<'a>(
+        &'a self,
+        websocket_url: &'a str,
+        account_id: &'a str,
+        app_server_client_name: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<u64>> {
+        Box::pin(async move {
+            self.store
+                .delete_remote_control_enrollment(websocket_url, account_id, app_server_client_name)
+                .await
+                .map_err(std::io::Error::other)
+        })
+    }
+}
+
+fn remote_control_state_store_for_config(
+    config: &Config,
+    state_db: Option<rollout_state_db::StateDbHandle>,
+) -> Option<Arc<dyn RemoteControlStateStore>> {
+    match &config.experimental_thread_store {
+        ThreadStoreConfig::Local => {
+            state_db.map(|state_db| state_db as Arc<dyn RemoteControlStateStore>)
+        }
+        ThreadStoreConfig::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        } => {
+            if !std::env::var(database_url_env).is_ok_and(|value| !value.trim().is_empty()) {
+                warn!(
+                    database_url_env = %database_url_env,
+                    "remote control state storage unavailable because remote SQL URL env is unset"
+                );
+                return None;
+            }
+            Some(Arc::new(PostgresRemoteControlStateStore {
+                store: codex_postgres_thread_store::PostgresThreadStore::from_env_or_unconfigured(
+                    codex_postgres_thread_store::PostgresThreadStoreConfig {
+                        database_url_env: database_url_env.clone(),
+                        default_workspace_id: default_workspace_id.clone(),
+                        redis_url_env: redis_url_env.clone(),
+                    },
+                ),
+            }))
+        }
+        ThreadStoreConfig::InMemory { .. } => None,
+    }
+}
+
+fn postgres_remote_control_enrollment_from_persisted(
+    enrollment: &PersistedRemoteControlEnrollment,
+) -> codex_postgres_thread_store::RemoteControlEnrollmentRecord {
+    codex_postgres_thread_store::RemoteControlEnrollmentRecord {
+        websocket_url: enrollment.websocket_url.clone(),
+        account_id: enrollment.account_id.clone(),
+        app_server_client_name: enrollment.app_server_client_name.clone(),
+        server_id: enrollment.server_id.clone(),
+        environment_id: enrollment.environment_id.clone(),
+        server_name: enrollment.server_name.clone(),
+        remote_control_enabled: enrollment.remote_control_enabled,
+    }
+}
+
+fn persisted_remote_control_enrollment_from_postgres(
+    enrollment: codex_postgres_thread_store::RemoteControlEnrollmentRecord,
+) -> PersistedRemoteControlEnrollment {
+    PersistedRemoteControlEnrollment {
+        websocket_url: enrollment.websocket_url,
+        account_id: enrollment.account_id,
+        app_server_client_name: enrollment.app_server_client_name,
+        server_id: enrollment.server_id,
+        environment_id: enrollment.environment_id,
+        server_name: enrollment.server_name,
+        remote_control_enabled: enrollment.remote_control_enabled,
+    }
 }
 
 fn should_initialize_sqlite_state_db(config: &Config) -> bool {
