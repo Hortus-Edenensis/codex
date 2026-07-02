@@ -6,12 +6,18 @@ use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::protocol::ThreadHistoryMode;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
+const THREAD_FORK_DEDUPE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const THREAD_FORK_DEDUPE_IN_FLIGHT_TTL: Duration = Duration::from_secs(5 * 60);
+const THREAD_FORK_DEDUPE_MAX_ENTRIES: usize = 256;
 
 struct ThreadListFilters {
     model_providers: Option<Vec<String>>,
@@ -21,6 +27,135 @@ struct ThreadListFilters {
     search_term: Option<String>,
     use_state_db_only: bool,
     relation_filter: Option<StoreThreadRelationFilter>,
+}
+
+#[derive(Clone)]
+struct CachedThreadForkResponse {
+    response: ThreadForkResponse,
+    thread_originator: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ThreadForkDedupeKey {
+    source_thread_id: String,
+    history_hash: u64,
+    request_hash: u64,
+}
+
+enum ThreadForkDedupeEntry {
+    InFlight {
+        sender: watch::Sender<Option<Result<CachedThreadForkResponse, JSONRPCErrorError>>>,
+        started_at: Instant,
+    },
+    Completed {
+        outcome: CachedThreadForkResponse,
+        completed_at: Instant,
+    },
+}
+
+enum ThreadForkDedupeClaim {
+    Owner(ThreadForkDedupeKey),
+    Replay(CachedThreadForkResponse),
+    Wait(watch::Receiver<Option<Result<CachedThreadForkResponse, JSONRPCErrorError>>>),
+}
+
+struct ThreadForkDedupeKeyInputs<'a> {
+    source_thread_id: &'a ThreadId,
+    history_items: &'a [RolloutItem],
+    source_thread_name: Option<&'a str>,
+    last_turn_id: Option<&'a str>,
+    model: Option<&'a str>,
+    model_provider: Option<&'a str>,
+    service_tier: Option<&'a Option<String>>,
+    cwd: Option<&'a str>,
+    runtime_workspace_roots: Option<&'a Vec<AbsolutePathBuf>>,
+    approval_policy: Option<&'a AskForApproval>,
+    approvals_reviewer: Option<&'a codex_app_server_protocol::ApprovalsReviewer>,
+    sandbox: Option<&'a SandboxMode>,
+    permissions: Option<&'a str>,
+    cli_overrides: Option<&'a HashMap<String, serde_json::Value>>,
+    base_instructions: Option<&'a str>,
+    developer_instructions: Option<&'a str>,
+    thread_source: Option<&'a ThreadSource>,
+    exclude_turns: bool,
+    app_server_client_name: Option<&'a str>,
+    app_server_client_version: Option<&'a str>,
+    supports_openai_form_elicitation: bool,
+}
+
+fn thread_fork_dedupe_key(inputs: ThreadForkDedupeKeyInputs<'_>) -> ThreadForkDedupeKey {
+    let mut history_hasher = DefaultHasher::new();
+    hash_serde(&mut history_hasher, inputs.history_items);
+    let history_hash = history_hasher.finish();
+
+    let mut request_hasher = DefaultHasher::new();
+    hash_serde(&mut request_hasher, &inputs.source_thread_name);
+    hash_serde(&mut request_hasher, &inputs.last_turn_id);
+    hash_serde(&mut request_hasher, &inputs.model);
+    hash_serde(&mut request_hasher, &inputs.model_provider);
+    hash_serde(&mut request_hasher, &inputs.service_tier);
+    hash_serde(&mut request_hasher, &inputs.cwd);
+    hash_serde(&mut request_hasher, &inputs.runtime_workspace_roots);
+    hash_serde(&mut request_hasher, &inputs.approval_policy);
+    hash_serde(&mut request_hasher, &inputs.approvals_reviewer);
+    hash_serde(&mut request_hasher, &inputs.sandbox);
+    hash_serde(&mut request_hasher, &inputs.permissions);
+    hash_cli_overrides(&mut request_hasher, inputs.cli_overrides);
+    hash_serde(&mut request_hasher, &inputs.base_instructions);
+    hash_serde(&mut request_hasher, &inputs.developer_instructions);
+    hash_serde(&mut request_hasher, &inputs.thread_source);
+    inputs.exclude_turns.hash(&mut request_hasher);
+    hash_serde(&mut request_hasher, &inputs.app_server_client_name);
+    hash_serde(&mut request_hasher, &inputs.app_server_client_version);
+    inputs
+        .supports_openai_form_elicitation
+        .hash(&mut request_hasher);
+
+    ThreadForkDedupeKey {
+        source_thread_id: inputs.source_thread_id.to_string(),
+        history_hash,
+        request_hash: request_hasher.finish(),
+    }
+}
+
+fn hash_cli_overrides(
+    hasher: &mut DefaultHasher,
+    cli_overrides: Option<&HashMap<String, serde_json::Value>>,
+) {
+    match cli_overrides {
+        Some(cli_overrides) => {
+            true.hash(hasher);
+            let sorted = cli_overrides
+                .iter()
+                .map(|(key, value)| (key.as_str(), value))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            hash_serde(hasher, &sorted);
+        }
+        None => false.hash(hasher),
+    }
+}
+
+fn hash_serde<T>(hasher: &mut DefaultHasher, value: &T)
+where
+    T: serde::Serialize + ?Sized,
+{
+    match serde_json::to_vec(value) {
+        Ok(serialized) => serialized.hash(hasher),
+        Err(err) => err.to_string().hash(hasher),
+    }
+}
+
+async fn wait_for_thread_fork_dedupe(
+    mut receiver: watch::Receiver<Option<Result<CachedThreadForkResponse, JSONRPCErrorError>>>,
+) -> Result<CachedThreadForkResponse, JSONRPCErrorError> {
+    loop {
+        if let Some(outcome) = receiver.borrow().clone() {
+            return outcome;
+        }
+        if receiver.changed().await.is_err() {
+            return Err(internal_error("thread fork dedupe owner dropped"));
+        }
+    }
 }
 
 fn collect_resume_override_mismatches(
@@ -364,6 +499,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) log_db: Option<LogDbLayer>,
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+    thread_fork_dedupe: Arc<Mutex<HashMap<ThreadForkDedupeKey, ThreadForkDedupeEntry>>>,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -413,6 +549,7 @@ impl ThreadRequestProcessor {
             log_db,
             background_tasks: TaskTracker::new(),
             skills_watcher,
+            thread_fork_dedupe: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -3437,6 +3574,60 @@ impl ThreadRequestProcessor {
         };
         let history_cwd = Some(source_thread.cwd.clone());
 
+        let mut dedupe_claim = if ephemeral {
+            None
+        } else {
+            let key = thread_fork_dedupe_key(ThreadForkDedupeKeyInputs {
+                source_thread_id: &source_thread_id,
+                history_items: history_items.as_slice(),
+                source_thread_name: source_thread_name.as_deref(),
+                last_turn_id: last_turn_id.as_deref(),
+                model: model.as_deref(),
+                model_provider: model_provider.as_deref(),
+                service_tier: service_tier.as_ref(),
+                cwd: cwd.as_deref(),
+                runtime_workspace_roots: runtime_workspace_roots.as_ref(),
+                approval_policy: approval_policy.as_ref(),
+                approvals_reviewer: approvals_reviewer.as_ref(),
+                sandbox: sandbox.as_ref(),
+                permissions: permissions.as_deref(),
+                cli_overrides: cli_overrides.as_ref(),
+                base_instructions: base_instructions.as_deref(),
+                developer_instructions: developer_instructions.as_deref(),
+                thread_source: thread_source.as_ref(),
+                exclude_turns,
+                app_server_client_name: app_server_client_name.as_deref(),
+                app_server_client_version: app_server_client_version.as_deref(),
+                supports_openai_form_elicitation,
+            });
+            match self.claim_thread_fork_dedupe(key).await {
+                ThreadForkDedupeClaim::Owner(key) => Some(key),
+                ThreadForkDedupeClaim::Replay(cached) => {
+                    self.replay_thread_fork_response(request_id, cached).await;
+                    return Ok(());
+                }
+                ThreadForkDedupeClaim::Wait(receiver) => {
+                    let cached = wait_for_thread_fork_dedupe(receiver).await?;
+                    self.replay_thread_fork_response(request_id, cached).await;
+                    return Ok(());
+                }
+            }
+        };
+        macro_rules! fork_try {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if let Some(dedupe_key) = dedupe_claim.take() {
+                            self.complete_thread_fork_dedupe(dedupe_key, Err(error.clone()))
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+        }
+
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
         if cfg!(windows) {
@@ -3476,11 +3667,12 @@ impl ThreadRequestProcessor {
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
-        let config = self
-            .config_manager
-            .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
-            .await
-            .map_err(|err| config_load_error(&err))?;
+        let config = fork_try!(
+            self.config_manager
+                .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
+                .await
+                .map_err(|err| config_load_error(&err))
+        );
 
         let fallback_model_provider = config.model_provider_id.clone();
 
@@ -3489,49 +3681,54 @@ impl ThreadRequestProcessor {
             thread: forked_thread,
             session_configured,
             ..
-        } = self
-            .thread_manager
-            .fork_thread_from_history(
-                ForkSnapshot::Interrupted,
-                config,
-                InitialHistory::Resumed(ResumedHistory {
-                    conversation_id: source_thread_id,
-                    history: Arc::clone(&history_items),
-                    rollout_path: source_thread.rollout_path.clone(),
-                }),
-                thread_source.map(Into::into),
-                self.request_trace_context(&request_id).await,
-                supports_openai_form_elicitation,
+        } = fork_try!(
+            self.thread_manager
+                .fork_thread_from_history(
+                    ForkSnapshot::Interrupted,
+                    config,
+                    InitialHistory::Resumed(ResumedHistory {
+                        conversation_id: source_thread_id,
+                        history: Arc::clone(&history_items),
+                        rollout_path: source_thread.rollout_path.clone(),
+                    }),
+                    thread_source.map(Into::into),
+                    self.request_trace_context(&request_id).await,
+                    supports_openai_form_elicitation,
+                )
+                .await
+                .map_err(|err| match err {
+                    CodexErr::Io(_) | CodexErr::Json(_) => {
+                        invalid_request(format!("failed to load thread {source_thread_id}: {err}"))
+                    }
+                    CodexErr::InvalidRequest(message) => invalid_request(message),
+                    err => internal_error(format!("error forking thread: {err}")),
+                })
+        );
+
+        fork_try!(
+            Self::set_app_server_client_info(
+                forked_thread.as_ref(),
+                app_server_client_name,
+                app_server_client_version,
             )
             .await
-            .map_err(|err| match err {
-                CodexErr::Io(_) | CodexErr::Json(_) => {
-                    invalid_request(format!("failed to load thread {source_thread_id}: {err}"))
-                }
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                err => internal_error(format!("error forking thread: {err}")),
-            })?;
-
-        Self::set_app_server_client_info(
-            forked_thread.as_ref(),
-            app_server_client_name,
-            app_server_client_version,
-        )
-        .await?;
+        );
         if session_configured.rollout_path.is_some()
             && let Some(name) = source_thread_name.clone()
         {
-            self.thread_manager
-                .update_thread_metadata(
-                    thread_id,
-                    StoreThreadMetadataPatch {
-                        name: Some(Some(name)),
-                        ..Default::default()
-                    },
-                    /*include_archived*/ true,
-                )
-                .await
-                .map_err(|err| core_thread_write_error("inherit source thread name", err))?;
+            fork_try!(
+                self.thread_manager
+                    .update_thread_metadata(
+                        thread_id,
+                        StoreThreadMetadataPatch {
+                            name: Some(Some(name)),
+                            ..Default::default()
+                        },
+                        /*include_archived*/ true,
+                    )
+                    .await
+                    .map_err(|err| core_thread_write_error("inherit source thread name", err))
+            );
         }
 
         let instruction_sources = forked_thread.legacy_instruction_sources().await;
@@ -3552,9 +3749,10 @@ impl ThreadRequestProcessor {
         // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
         // pathless, so they rebuild their visible history from the copied source history instead.
         let mut thread = if session_configured.rollout_path.is_some() {
-            let stored_thread = self
-                .read_stored_thread_for_new_fork(thread_id, include_turns)
-                .await?;
+            let stored_thread = fork_try!(
+                self.read_stored_thread_for_new_fork(thread_id, include_turns)
+                    .await
+            );
             self.stored_thread_to_api_thread(
                 stored_thread,
                 fallback_model_provider.as_str(),
@@ -3627,6 +3825,10 @@ impl ThreadRequestProcessor {
         let notif = thread_started_notification(thread);
         let connection_id = request_id.connection_id;
         let token_usage_thread = include_turns.then(|| response.thread.clone());
+        let cached_response = CachedThreadForkResponse {
+            response: response.clone(),
+            thread_originator: thread_originator.clone(),
+        };
         self.outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)
             .await;
@@ -3653,7 +3855,95 @@ impl ThreadRequestProcessor {
         self.outgoing
             .send_server_notification(ServerNotification::ThreadStarted(notif))
             .await;
+        if let Some(dedupe_key) = dedupe_claim.take() {
+            self.complete_thread_fork_dedupe(dedupe_key, Ok(cached_response))
+                .await;
+        }
         Ok(())
+    }
+
+    async fn claim_thread_fork_dedupe(&self, key: ThreadForkDedupeKey) -> ThreadForkDedupeClaim {
+        let now = Instant::now();
+        let mut dedupe = self.thread_fork_dedupe.lock().await;
+        dedupe.retain(|_, entry| match entry {
+            ThreadForkDedupeEntry::InFlight { started_at, .. } => {
+                now.duration_since(*started_at) < THREAD_FORK_DEDUPE_IN_FLIGHT_TTL
+            }
+            ThreadForkDedupeEntry::Completed { completed_at, .. } => {
+                now.duration_since(*completed_at) < THREAD_FORK_DEDUPE_TTL
+            }
+        });
+        if dedupe.len() > THREAD_FORK_DEDUPE_MAX_ENTRIES {
+            dedupe.clear();
+        }
+
+        if let Some(entry) = dedupe.get(&key) {
+            return match entry {
+                ThreadForkDedupeEntry::InFlight { sender, .. } => {
+                    ThreadForkDedupeClaim::Wait(sender.subscribe())
+                }
+                ThreadForkDedupeEntry::Completed { outcome, .. } => {
+                    ThreadForkDedupeClaim::Replay(outcome.clone())
+                }
+            };
+        }
+
+        let (sender, _) = watch::channel(None);
+        dedupe.insert(
+            key.clone(),
+            ThreadForkDedupeEntry::InFlight {
+                sender,
+                started_at: now,
+            },
+        );
+        ThreadForkDedupeClaim::Owner(key)
+    }
+
+    async fn complete_thread_fork_dedupe(
+        &self,
+        key: ThreadForkDedupeKey,
+        outcome: Result<CachedThreadForkResponse, JSONRPCErrorError>,
+    ) {
+        let mut dedupe = self.thread_fork_dedupe.lock().await;
+        if let Some(ThreadForkDedupeEntry::InFlight { sender, .. }) = dedupe.remove(&key) {
+            let _ = sender.send(Some(outcome.clone()));
+        }
+        if let Ok(outcome) = outcome {
+            dedupe.insert(
+                key,
+                ThreadForkDedupeEntry::Completed {
+                    outcome,
+                    completed_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    async fn replay_thread_fork_response(
+        &self,
+        request_id: ConnectionRequestId,
+        cached: CachedThreadForkResponse,
+    ) {
+        if let Ok(thread_id) = ThreadId::from_string(&cached.response.thread.id) {
+            log_listener_attach_result(
+                self.ensure_conversation_listener(
+                    thread_id,
+                    request_id.connection_id,
+                    /*raw_events_enabled*/ false,
+                )
+                .await,
+                thread_id,
+                request_id.connection_id,
+                "thread",
+            );
+        }
+        self.outgoing
+            .send_response_with_thread_originator(
+                request_id,
+                cached.response,
+                cached.thread_originator,
+            )
+            .await;
     }
 
     async fn get_thread_summary_response_inner(
