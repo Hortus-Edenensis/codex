@@ -5188,20 +5188,53 @@ impl ThreadRequestProcessor {
                 })
                 .await
                 .map_err(|err| conversation_summary_thread_id_read_error(conversation_id, err)),
-            GetConversationSummaryParams::RolloutPath { rollout_path } => self
-                .thread_store
-                .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
-                    rollout_path: rollout_path.clone(),
-                    include_archived: true,
-                    include_history: false,
-                })
-                .await
-                .map_err(|err| conversation_summary_rollout_path_read_error(&rollout_path, err)),
+            GetConversationSummaryParams::RolloutPath { rollout_path } => {
+                self.read_conversation_summary_source_by_rollout_path(rollout_path)
+                    .await
+            }
         };
 
         let stored_thread = read_result?;
         let summary = summary_from_stored_thread(stored_thread, fallback_provider);
         Ok(GetConversationSummaryResponse { summary })
+    }
+
+    async fn read_conversation_summary_source_by_rollout_path(
+        &self,
+        rollout_path: PathBuf,
+    ) -> Result<StoredThread, JSONRPCErrorError> {
+        match self
+            .thread_store
+            .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
+                rollout_path: rollout_path.clone(),
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+        {
+            Ok(stored_thread) => Ok(stored_thread),
+            Err(
+                err @ (ThreadStoreError::Unsupported { .. }
+                | ThreadStoreError::InvalidRequest { .. }),
+            ) => {
+                let path_error = conversation_summary_rollout_path_read_error(&rollout_path, err);
+                let Some(thread_id) = thread_id_from_rollout_path(&rollout_path) else {
+                    return Err(path_error);
+                };
+                self.thread_store
+                    .read_thread(StoreReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await
+                    .map_err(|_err| path_error)
+            }
+            Err(err) => Err(conversation_summary_rollout_path_read_error(
+                &rollout_path,
+                err,
+            )),
+        }
     }
 
     async fn list_threads_common(
@@ -5797,6 +5830,18 @@ fn conversation_summary_rollout_path_read_error(
             err
         )),
     }
+}
+
+fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
+    let file_name = path.file_name()?.to_str()?;
+    let file_name = file_name.strip_suffix(".zst").unwrap_or(file_name);
+    let core = file_name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    core.match_indices('-').rev().find_map(|(idx, _)| {
+        let suffix = &core[idx + 1..];
+        Uuid::parse_str(suffix)
+            .ok()
+            .and_then(|uuid| ThreadId::from_string(&uuid.to_string()).ok())
+    })
 }
 
 pub(super) fn core_thread_write_error(operation: &str, err: CodexErr) -> JSONRPCErrorError {
