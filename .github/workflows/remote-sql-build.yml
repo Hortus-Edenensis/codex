@@ -154,7 +154,7 @@ jobs:
 
           pod_artifact="/tmp/codex-${EXPECTED_CODEX_SHA256}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp "${artifact}" "${pod}:${pod_artifact}" -c "${CODEX_DEPLOY_CONTAINER}"
-          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -s -- \
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -s -- \
             "${EXPECTED_CODEX_SHA256}" "${CODEX_DEPLOY_RELEASE_NAME}" "${pod_artifact}" <<'POD_SCRIPT'
           set -eu
 
