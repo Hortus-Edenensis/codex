@@ -136,7 +136,7 @@ jobs:
           fi
 
           artifact="codex-artifact/codex"
-          test -x "${artifact}"
+          test -f "${artifact}"
           actual_sha256="$(sha256sum "${artifact}" | cut -d ' ' -f 1)"
           if [ "${actual_sha256}" != "${EXPECTED_CODEX_SHA256}" ]; then
             echo "::error::Downloaded artifact sha256 does not match build output"
