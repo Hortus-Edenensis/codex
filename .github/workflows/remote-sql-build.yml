@@ -5,12 +5,18 @@ on:
     branches:
       - remote-sql-postgres-workspace
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: Version to embed in the Codex binary, for example 0.142.5-patch-1.
+        required: false
+        type: string
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   CARGO_PROFILE_RELEASE_DEBUG: "0"
   CARGO_PROFILE_RELEASE_LTO: "false"
+  CODEX_REMOTE_SQL_DEFAULT_VERSION: "0.142.5-patch-1"
   RUST_MIN_STACK: "8388608"
 
 jobs:
@@ -33,6 +39,25 @@ jobs:
             libssl-dev \
             pkg-config \
             protobuf-compiler
+      - name: Embed release version
+        env:
+          INPUT_RELEASE_VERSION: ${{ github.event.inputs.release_version }}
+        run: |
+          set -euo pipefail
+          release_version="${INPUT_RELEASE_VERSION:-}"
+          if [ -z "${release_version}" ] && [[ "${GITHUB_REF_NAME}" =~ v([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*) ]]; then
+            release_version="${BASH_REMATCH[1]}"
+          fi
+          if [ -z "${release_version}" ]; then
+            release_version="${CODEX_REMOTE_SQL_DEFAULT_VERSION}"
+          fi
+          if [[ ! "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::release_version must be a Cargo-compatible semver value: ${release_version}"
+            exit 1
+          fi
+          sed -i "s/^version = \"0\.0\.0\"$/version = \"${release_version}\"/" Cargo.toml
+          grep -qx "version = \"${release_version}\"" Cargo.toml
+          cargo metadata --format-version 1 --no-deps >/dev/null
       - name: Build remote SQL targets
         run: |
           cargo build --ignore-rust-version --release \
