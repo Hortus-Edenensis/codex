@@ -701,6 +701,7 @@ VALUES ($1, $2, $3, $4)
                 builder.push(" AND archived_at IS NOT NULL");
             } else {
                 builder.push(" AND archived_at IS NULL");
+                push_exclude_empty_shell_threads(&mut builder);
             }
             if !params.allowed_sources.is_empty() {
                 let allowed_sources = params
@@ -1224,6 +1225,32 @@ fn apply_metadata_patch(stored: &mut StoredThread, patch: codex_thread_store::Th
 fn stored_thread_from_row(row: &sqlx::postgres::PgRow) -> ThreadStoreResult<StoredThread> {
     let value: serde_json::Value = row.try_get("stored_thread_json").map_err(internal_error)?;
     serde_json::from_value(value).map_err(internal_error)
+}
+
+fn push_exclude_empty_shell_threads(builder: &mut QueryBuilder<Postgres>) {
+    builder.push(
+        r#"
+ AND NOT (
+    preview = ''
+    AND EXISTS (
+        SELECT 1 FROM thread_items
+        WHERE thread_items.thread_id = threads.id
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM turns
+        WHERE turns.thread_id = threads.id
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM thread_items
+        WHERE thread_items.thread_id = threads.id
+          AND (
+            COALESCE(item_json->>'type', '') <> 'event_msg'
+            OR COALESCE(item_json->'payload'->>'type', '') NOT IN ('session_configured', 'warning')
+          )
+    )
+)
+"#,
+    );
 }
 
 fn remote_control_app_server_client_name_key(app_server_client_name: Option<&str>) -> &str {
