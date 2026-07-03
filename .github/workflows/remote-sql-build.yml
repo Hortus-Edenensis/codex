@@ -106,48 +106,35 @@ jobs:
 
   deploy-copy-workspace:
     name: Deploy remote SQL artifact to copy workspace
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
     needs: linux-cargo-build
     if: ${{ github.event_name == 'push' || inputs.deploy == true }}
     env:
+      ALL_PROXY: http://10.42.0.1:10809
       CODEX_DEPLOY_CONTAINER: workspace
       CODEX_DEPLOY_NAMESPACE: codex-internal
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
       CODEX_DEPLOY_RELEASE_NAME: remote-sql-e1b36e9caa-x86_64-unknown-linux-gnu
-      CODEX_DEPLOY_SSH_HOST: ${{ secrets.CODEX_DEPLOY_SSH_HOST || vars.CODEX_DEPLOY_SSH_HOST }}
-      CODEX_DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.CODEX_DEPLOY_SSH_KNOWN_HOSTS }}
-      CODEX_DEPLOY_SSH_PORT: ${{ secrets.CODEX_DEPLOY_SSH_PORT || vars.CODEX_DEPLOY_SSH_PORT }}
-      CODEX_DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.CODEX_DEPLOY_SSH_PRIVATE_KEY }}
-      CODEX_DEPLOY_SSH_USER: ${{ secrets.CODEX_DEPLOY_SSH_USER || vars.CODEX_DEPLOY_SSH_USER }}
       EXPECTED_CODEX_SHA256: ${{ needs.linux-cargo-build.outputs.codex_sha256 }}
+      HTTPS_PROXY: http://10.42.0.1:10809
+      HTTP_PROXY: http://10.42.0.1:10809
+      NO_PROXY: 127.0.0.1,localhost,10.0.0.0/8,10.42.0.0/16,202.189.11.100
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: codex-linux-glibc235
           path: codex-artifact
 
-      - name: Deploy artifact over SSH
+      - name: Deploy artifact from self-hosted runner
         shell: bash
         run: |
           set -euo pipefail
 
-          missing=()
-          for name in \
-            CODEX_DEPLOY_SSH_HOST \
-            CODEX_DEPLOY_SSH_PRIVATE_KEY \
-            CODEX_DEPLOY_SSH_USER \
-            EXPECTED_CODEX_SHA256
-          do
-            if [ -z "${!name:-}" ]; then
-              missing+=("${name}")
-            fi
-          done
-          if [ "${#missing[@]}" -ne 0 ]; then
-            printf '::notice::Skipping deployment; missing required configuration: %s\n' "${missing[*]}"
-            exit 0
+          if [ -z "${EXPECTED_CODEX_SHA256:-}" ]; then
+            echo "::error::Missing build sha256 output"
+            exit 1
           fi
 
-          CODEX_DEPLOY_SSH_PORT="${CODEX_DEPLOY_SSH_PORT:-22}"
           artifact="codex-artifact/codex"
           test -x "${artifact}"
           actual_sha256="$(sha256sum "${artifact}" | cut -d ' ' -f 1)"
@@ -156,68 +143,17 @@ jobs:
             exit 1
           fi
 
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          key_path=~/.ssh/codex-deploy-key
-          printf '%s\n' "${CODEX_DEPLOY_SSH_PRIVATE_KEY}" > "${key_path}"
-          chmod 600 "${key_path}"
-
-          known_hosts_path=~/.ssh/known_hosts
-          if [ -n "${CODEX_DEPLOY_SSH_KNOWN_HOSTS:-}" ]; then
-            printf '%s\n' "${CODEX_DEPLOY_SSH_KNOWN_HOSTS}" > "${known_hosts_path}"
-          else
-            ssh-keyscan -p "${CODEX_DEPLOY_SSH_PORT}" "${CODEX_DEPLOY_SSH_HOST}" > "${known_hosts_path}"
-          fi
-          chmod 600 "${known_hosts_path}"
-
-          remote_artifact="/tmp/codex-${GITHUB_RUN_ID}-${GITHUB_SHA:0:12}"
-          ssh_base=(
-            ssh
-            -i "${key_path}"
-            -p "${CODEX_DEPLOY_SSH_PORT}"
-            -o IdentitiesOnly=yes
-            -o StrictHostKeyChecking=yes
-            -o UserKnownHostsFile="${known_hosts_path}"
-            "${CODEX_DEPLOY_SSH_USER}@${CODEX_DEPLOY_SSH_HOST}"
-          )
-          scp_base=(
-            scp
-            -i "${key_path}"
-            -P "${CODEX_DEPLOY_SSH_PORT}"
-            -o IdentitiesOnly=yes
-            -o StrictHostKeyChecking=yes
-            -o UserKnownHostsFile="${known_hosts_path}"
-          )
-
-          "${scp_base[@]}" "${artifact}" "${CODEX_DEPLOY_SSH_USER}@${CODEX_DEPLOY_SSH_HOST}:${remote_artifact}"
-
-          "${ssh_base[@]}" \
-            "EXPECTED_CODEX_SHA256='${EXPECTED_CODEX_SHA256}' \
-             CODEX_DEPLOY_CONTAINER='${CODEX_DEPLOY_CONTAINER}' \
-             CODEX_DEPLOY_NAMESPACE='${CODEX_DEPLOY_NAMESPACE}' \
-             CODEX_DEPLOY_POD_PREFIX='${CODEX_DEPLOY_POD_PREFIX}' \
-             CODEX_DEPLOY_RELEASE_NAME='${CODEX_DEPLOY_RELEASE_NAME}' \
-             REMOTE_ARTIFACT='${remote_artifact}' \
-             bash -s" <<'REMOTE_SCRIPT'
-          set -euo pipefail
-
-          actual_sha256="$(sha256sum "${REMOTE_ARTIFACT}" | cut -d ' ' -f 1)"
-          if [ "${actual_sha256}" != "${EXPECTED_CODEX_SHA256}" ]; then
-            echo "remote artifact sha256 mismatch" >&2
-            exit 1
-          fi
-
           pod="$(
             kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
               | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" { print $1; exit }'
           )"
           if [ -z "${pod}" ]; then
-            echo "no running ${CODEX_DEPLOY_POD_PREFIX} pod found" >&2
+            echo "::error::No running ${CODEX_DEPLOY_POD_PREFIX} pod found"
             exit 1
           fi
 
           pod_artifact="/tmp/codex-${EXPECTED_CODEX_SHA256}"
-          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp "${REMOTE_ARTIFACT}" "${pod}:${pod_artifact}" -c "${CODEX_DEPLOY_CONTAINER}"
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp "${artifact}" "${pod}:${pod_artifact}" -c "${CODEX_DEPLOY_CONTAINER}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -s -- \
             "${EXPECTED_CODEX_SHA256}" "${CODEX_DEPLOY_RELEASE_NAME}" "${pod_artifact}" <<'POD_SCRIPT'
           set -eu
@@ -275,7 +211,5 @@ jobs:
             CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \
             su -m codex -c "${codex_bin} app-server daemon version"
           sha256sum "${codex_bin}"
+          rm -f "${src}"
           POD_SCRIPT
-
-          rm -f "${REMOTE_ARTIFACT}"
-          REMOTE_SCRIPT
