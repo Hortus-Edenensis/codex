@@ -932,7 +932,8 @@ async fn goal_service_external_set_active_resets_baseline_without_live_thread() 
     let outcome = harness
         .goal_service
         .set_thread_goal(
-            runtime.as_ref(),
+            runtime.thread_goals(),
+            Some(runtime.as_ref()),
             GoalSetRequest {
                 thread_id,
                 objective: GoalObjectiveUpdate::Set("new objective"),
@@ -999,7 +1000,7 @@ async fn thread_stop_unregisters_goal_runtime_from_service() -> anyhow::Result<(
     assert!(
         harness
             .goal_service
-            .clear_thread_goal(runtime.as_ref(), thread_id)
+            .clear_thread_goal(runtime.thread_goals(), thread_id)
             .await?
     );
     assert_eq!(Vec::<CapturedGoalEvent>::new(), harness.sink.goal_events());
@@ -1061,7 +1062,8 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
 
     let set = api
         .set_thread_goal(
-            runtime.as_ref(),
+            runtime.thread_goals(),
+            Some(runtime.as_ref()),
             GoalSetRequest {
                 thread_id,
                 objective: GoalObjectiveUpdate::Set(" ship goal API ownership "),
@@ -1071,7 +1073,7 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
         )
         .await?;
     let get = api
-        .get_thread_goal(runtime.as_ref(), thread_id)
+        .get_thread_goal(runtime.thread_goals(), thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
     let metadata = runtime
@@ -1085,12 +1087,19 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
     assert_eq!(Some(123), get.token_budget);
     assert_eq!(Some("ship goal API ownership"), metadata.preview.as_deref());
 
-    assert!(api.clear_thread_goal(runtime.as_ref(), thread_id).await?);
+    assert!(
+        api.clear_thread_goal(runtime.thread_goals(), thread_id)
+            .await?
+    );
     assert_eq!(
         None,
-        api.get_thread_goal(runtime.as_ref(), thread_id).await?
+        api.get_thread_goal(runtime.thread_goals(), thread_id)
+            .await?
     );
-    assert!(!api.clear_thread_goal(runtime.as_ref(), thread_id).await?);
+    assert!(
+        !api.clear_thread_goal(runtime.thread_goals(), thread_id)
+            .await?
+    );
     Ok(())
 }
 

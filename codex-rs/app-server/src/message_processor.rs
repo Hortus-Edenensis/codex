@@ -45,6 +45,7 @@ use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
+use crate::thread_state::ThreadGoalStoreHandle;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
@@ -69,6 +70,7 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_chatgpt::workspace_settings;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_core::config::ThreadStoreConfig;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
@@ -286,6 +288,30 @@ impl ConnectionSessionState {
     }
 }
 
+fn thread_goal_store_from_config(
+    config: &Config,
+    state_db: Option<StateDbHandle>,
+) -> Option<ThreadGoalStoreHandle> {
+    match &config.experimental_thread_store {
+        ThreadStoreConfig::Local => state_db
+            .map(|state_db| Arc::new(state_db.thread_goals().clone()) as ThreadGoalStoreHandle),
+        ThreadStoreConfig::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        } => Some(Arc::new(
+            codex_postgres_thread_store::PostgresThreadStore::from_env_or_unconfigured(
+                codex_postgres_thread_store::PostgresThreadStoreConfig {
+                    database_url_env: database_url_env.clone(),
+                    default_workspace_id: default_workspace_id.clone(),
+                    redis_url_env: redis_url_env.clone(),
+                },
+            ),
+        ) as ThreadGoalStoreHandle),
+        ThreadStoreConfig::InMemory { .. } => None,
+    }
+}
+
 pub(crate) struct MessageProcessorArgs {
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
@@ -335,6 +361,7 @@ impl MessageProcessor {
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
         let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
+        let goal_store = thread_goal_store_from_config(config.as_ref(), state_db.clone());
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);
         let restriction_product = session_source.restriction_product();
@@ -360,6 +387,7 @@ impl MessageProcessor {
                         ),
                         auth_manager: auth_manager.clone(),
                         state_db: state_db.clone(),
+                        goal_store: goal_store.clone(),
                         analytics_events_client: analytics_events_client.clone(),
                         thread_manager: thread_manager.clone(),
                         goal_service: Arc::clone(&goal_service),
@@ -473,10 +501,12 @@ impl MessageProcessor {
         let search_processor = SearchRequestProcessor::new(outgoing.clone());
         let thread_goal_processor = ThreadGoalRequestProcessor::new(
             Arc::clone(&thread_manager),
+            Arc::clone(&thread_store),
             outgoing.clone(),
             Arc::clone(&config),
             thread_state_manager.clone(),
             state_db.clone(),
+            goal_store,
             Arc::clone(&goal_service),
         );
         let thread_processor = ThreadRequestProcessor::new(

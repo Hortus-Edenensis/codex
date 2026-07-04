@@ -20,6 +20,7 @@ pub use api::GoalTokenBudgetUpdate;
 pub use extension::GoalExtension;
 pub use extension::GoalExtensionConfig;
 pub use extension::install_with_backend;
+pub use extension::install_with_goal_store;
 pub use runtime::GoalRuntimeHandle;
 pub use runtime::PreviousGoalSnapshot;
 pub use spec::CREATE_GOAL_TOOL_NAME;
