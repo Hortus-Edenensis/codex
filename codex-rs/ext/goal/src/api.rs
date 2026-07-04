@@ -95,11 +95,10 @@ impl GoalService {
 
     pub async fn get_thread_goal(
         &self,
-        state_db: &codex_state::StateRuntime,
+        goal_store: &dyn codex_state::ThreadGoalStore,
         thread_id: ThreadId,
     ) -> Result<Option<ThreadGoal>, GoalServiceError> {
-        state_db
-            .thread_goals()
+        goal_store
             .get_thread_goal(thread_id)
             .await
             .map(|goal| goal.map(protocol_goal_from_state))
@@ -108,7 +107,8 @@ impl GoalService {
 
     pub async fn set_thread_goal(
         &self,
-        state_db: &codex_state::StateRuntime,
+        goal_store: &dyn codex_state::ThreadGoalStore,
+        preview_state_db: Option<&codex_state::StateRuntime>,
         request: GoalSetRequest<'_>,
     ) -> Result<GoalSetOutcome, GoalServiceError> {
         let GoalSetRequest {
@@ -154,17 +154,12 @@ impl GoalService {
         }
 
         let (goal, previous_goal) = if let Some(objective) = objective {
-            let existing_goal = state_db
-                .thread_goals()
-                .get_thread_goal(thread_id)
-                .await
-                .map_err(|err| {
-                    GoalServiceError::Internal(format!("failed to read thread goal: {err}"))
-                })?;
+            let existing_goal = goal_store.get_thread_goal(thread_id).await.map_err(|err| {
+                GoalServiceError::Internal(format!("failed to read thread goal: {err}"))
+            })?;
             if let Some(existing_goal) = existing_goal.as_ref() {
                 let previous_goal = PreviousGoalSnapshot::from(existing_goal);
-                state_db
-                    .thread_goals()
+                goal_store
                     .update_thread_goal(
                         thread_id,
                         codex_state::GoalUpdate {
@@ -185,11 +180,10 @@ impl GoalService {
                     })
                     .map(|goal| (goal, Some(previous_goal)))?
             } else {
-                state_db
-                    .thread_goals()
+                goal_store
                     .replace_thread_goal(
                         thread_id,
-                        objective,
+                        objective.to_string(),
                         status.unwrap_or(codex_state::ThreadGoalStatus::Active),
                         token_budget.flatten(),
                     )
@@ -200,8 +194,7 @@ impl GoalService {
                     .map(|goal| (goal, None))?
             }
         } else {
-            let existing_goal = state_db
-                .thread_goals()
+            let existing_goal = goal_store
                 .get_thread_goal(thread_id)
                 .await
                 .map_err(|err| {
@@ -214,8 +207,7 @@ impl GoalService {
                 })?;
             let previous_goal = PreviousGoalSnapshot::from(&existing_goal);
             let expected_goal_id = existing_goal.goal_id.clone();
-            state_db
-                .thread_goals()
+            goal_store
                 .update_thread_goal(
                     thread_id,
                     codex_state::GoalUpdate {
@@ -238,7 +230,7 @@ impl GoalService {
         };
 
         if objective.is_some() {
-            fill_empty_thread_preview_if_possible(state_db, thread_id, &goal).await;
+            fill_empty_thread_preview_if_possible(preview_state_db, thread_id, &goal).await;
         }
         Ok(GoalSetOutcome {
             goal: protocol_goal_from_state(goal.clone()),
@@ -249,7 +241,7 @@ impl GoalService {
 
     pub async fn clear_thread_goal(
         &self,
-        state_db: &codex_state::StateRuntime,
+        goal_store: &dyn codex_state::ThreadGoalStore,
         thread_id: ThreadId,
     ) -> Result<bool, GoalServiceError> {
         let runtime = self.runtime_for_thread(thread_id);
@@ -270,8 +262,7 @@ impl GoalService {
             tracing::warn!("failed to prepare external goal mutation: {err}");
         }
 
-        let cleared_goal = state_db
-            .thread_goals()
+        let cleared_goal = goal_store
             .delete_thread_goal(thread_id)
             .await
             .map_err(|err| {

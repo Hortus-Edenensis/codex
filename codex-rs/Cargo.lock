@@ -3714,9 +3714,11 @@ dependencies = [
 name = "codex-postgres-thread-store"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "codex-agent-graph-store",
  "codex-protocol",
+ "codex-state",
  "codex-thread-store",
  "serde",
  "serde_json",

@@ -19,6 +19,7 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::GitSha;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+use codex_state::ThreadGoalStore as _;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::CreateThreadParams;
@@ -1025,6 +1026,552 @@ WHERE workspace_id = $1 AND id = $2
     }
 }
 
+impl codex_state::ThreadGoalStore for PostgresThreadStore {
+    fn get_thread_goal(
+        &self,
+        thread_id: ThreadId,
+    ) -> codex_state::ThreadGoalStoreFuture<'_, Option<codex_state::ThreadGoal>> {
+        Box::pin(async move {
+            self.ensure_migrated().await.map_err(anyhow_from_store)?;
+            let (pool, _) = self.pool_and_workspace().map_err(anyhow_from_store)?;
+            let row = sqlx::query(
+                r#"
+SELECT
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+FROM thread_goals
+WHERE thread_id = $1
+                "#,
+            )
+            .bind(thread_id.to_string())
+            .fetch_optional(pool)
+            .await?;
+
+            row.map(|row| thread_goal_from_pg_row(&row)).transpose()
+        })
+    }
+
+    fn replace_thread_goal(
+        &self,
+        thread_id: ThreadId,
+        objective: String,
+        status: codex_state::ThreadGoalStatus,
+        token_budget: Option<i64>,
+    ) -> codex_state::ThreadGoalStoreFuture<'_, codex_state::ThreadGoal> {
+        Box::pin(async move {
+            self.ensure_migrated().await.map_err(anyhow_from_store)?;
+            let (pool, _) = self.pool_and_workspace().map_err(anyhow_from_store)?;
+            let now = Utc::now();
+            let now_ms = datetime_to_epoch_millis(now);
+            let goal_id = new_goal_id(thread_id, now);
+            let status = status_after_budget_limit(status, /*tokens_used*/ 0, token_budget);
+            let row = sqlx::query(
+                r#"
+INSERT INTO thread_goals (
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms,
+    updated_at
+) VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $8)
+ON CONFLICT(thread_id) DO UPDATE SET
+    goal_id = EXCLUDED.goal_id,
+    objective = EXCLUDED.objective,
+    status = EXCLUDED.status,
+    token_budget = EXCLUDED.token_budget,
+    tokens_used = 0,
+    time_used_seconds = 0,
+    created_at_ms = EXCLUDED.created_at_ms,
+    updated_at_ms = EXCLUDED.updated_at_ms,
+    updated_at = EXCLUDED.updated_at
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+                "#,
+            )
+            .bind(thread_id.to_string())
+            .bind(goal_id)
+            .bind(objective.as_str())
+            .bind(status.as_str())
+            .bind(token_budget)
+            .bind(now_ms)
+            .bind(now_ms)
+            .bind(now)
+            .fetch_one(pool)
+            .await?;
+
+            thread_goal_from_pg_row(&row)
+        })
+    }
+
+    fn insert_thread_goal(
+        &self,
+        thread_id: ThreadId,
+        objective: String,
+        status: codex_state::ThreadGoalStatus,
+        token_budget: Option<i64>,
+    ) -> codex_state::ThreadGoalStoreFuture<'_, Option<codex_state::ThreadGoal>> {
+        Box::pin(async move {
+            self.ensure_migrated().await.map_err(anyhow_from_store)?;
+            let (pool, _) = self.pool_and_workspace().map_err(anyhow_from_store)?;
+            let now = Utc::now();
+            let now_ms = datetime_to_epoch_millis(now);
+            let goal_id = new_goal_id(thread_id, now);
+            let status = status_after_budget_limit(status, /*tokens_used*/ 0, token_budget);
+            let row = sqlx::query(
+                r#"
+INSERT INTO thread_goals (
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms,
+    updated_at
+) VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $8)
+ON CONFLICT(thread_id) DO UPDATE SET
+    goal_id = EXCLUDED.goal_id,
+    objective = EXCLUDED.objective,
+    status = EXCLUDED.status,
+    token_budget = EXCLUDED.token_budget,
+    tokens_used = 0,
+    time_used_seconds = 0,
+    created_at_ms = EXCLUDED.created_at_ms,
+    updated_at_ms = EXCLUDED.updated_at_ms,
+    updated_at = EXCLUDED.updated_at
+WHERE thread_goals.status = 'complete'
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+                "#,
+            )
+            .bind(thread_id.to_string())
+            .bind(goal_id)
+            .bind(objective.as_str())
+            .bind(status.as_str())
+            .bind(token_budget)
+            .bind(now_ms)
+            .bind(now_ms)
+            .bind(now)
+            .fetch_optional(pool)
+            .await?;
+
+            row.map(|row| thread_goal_from_pg_row(&row)).transpose()
+        })
+    }
+
+    fn update_thread_goal(
+        &self,
+        thread_id: ThreadId,
+        update: codex_state::GoalUpdate,
+    ) -> codex_state::ThreadGoalStoreFuture<'_, Option<codex_state::ThreadGoal>> {
+        Box::pin(async move {
+            self.ensure_migrated().await.map_err(anyhow_from_store)?;
+            let (pool, _) = self.pool_and_workspace().map_err(anyhow_from_store)?;
+            let codex_state::GoalUpdate {
+                objective,
+                status,
+                token_budget,
+                expected_goal_id,
+            } = update;
+            let objective = objective.as_deref();
+            let expected_goal_id = expected_goal_id.as_deref();
+            let now = Utc::now();
+            let now_ms = datetime_to_epoch_millis(now);
+            let result = match (status, token_budget) {
+                (Some(status), Some(token_budget)) => {
+                    sqlx::query(
+                        r#"
+UPDATE thread_goals
+SET
+    objective = COALESCE($1, objective),
+    status = CASE
+        WHEN status = $2 AND $3 IN ($4, $5) THEN status
+        WHEN $6 = 'active' AND $7::BIGINT IS NOT NULL AND tokens_used >= $8 THEN $9
+        ELSE $10
+    END,
+    token_budget = $11,
+    updated_at = $12,
+    updated_at_ms = $13
+WHERE thread_id = $14
+  AND ($15::TEXT IS NULL OR goal_id = $16)
+                        "#,
+                    )
+                    .bind(objective)
+                    .bind(codex_state::ThreadGoalStatus::BudgetLimited.as_str())
+                    .bind(status.as_str())
+                    .bind(codex_state::ThreadGoalStatus::Paused.as_str())
+                    .bind(codex_state::ThreadGoalStatus::Blocked.as_str())
+                    .bind(status.as_str())
+                    .bind(token_budget)
+                    .bind(token_budget)
+                    .bind(codex_state::ThreadGoalStatus::BudgetLimited.as_str())
+                    .bind(status.as_str())
+                    .bind(token_budget)
+                    .bind(now)
+                    .bind(now_ms)
+                    .bind(thread_id.to_string())
+                    .bind(expected_goal_id)
+                    .bind(expected_goal_id)
+                    .execute(pool)
+                    .await?
+                }
+                (Some(status), None) => {
+                    sqlx::query(
+                        r#"
+UPDATE thread_goals
+SET
+    objective = COALESCE($1, objective),
+    status = CASE
+        WHEN status = $2 AND $3 IN ($4, $5) THEN status
+        WHEN $6 = 'active' AND token_budget IS NOT NULL AND tokens_used >= token_budget THEN $7
+        ELSE $8
+    END,
+    updated_at = $9,
+    updated_at_ms = $10
+WHERE thread_id = $11
+  AND ($12::TEXT IS NULL OR goal_id = $13)
+                        "#,
+                    )
+                    .bind(objective)
+                    .bind(codex_state::ThreadGoalStatus::BudgetLimited.as_str())
+                    .bind(status.as_str())
+                    .bind(codex_state::ThreadGoalStatus::Paused.as_str())
+                    .bind(codex_state::ThreadGoalStatus::Blocked.as_str())
+                    .bind(status.as_str())
+                    .bind(codex_state::ThreadGoalStatus::BudgetLimited.as_str())
+                    .bind(status.as_str())
+                    .bind(now)
+                    .bind(now_ms)
+                    .bind(thread_id.to_string())
+                    .bind(expected_goal_id)
+                    .bind(expected_goal_id)
+                    .execute(pool)
+                    .await?
+                }
+                (None, Some(token_budget)) => {
+                    sqlx::query(
+                        r#"
+UPDATE thread_goals
+SET
+    objective = COALESCE($1, objective),
+    token_budget = $2,
+    status = CASE
+        WHEN status = 'active' AND $3::BIGINT IS NOT NULL AND tokens_used >= $4 THEN $5
+        ELSE status
+    END,
+    updated_at = $6,
+    updated_at_ms = $7
+WHERE thread_id = $8
+  AND ($9::TEXT IS NULL OR goal_id = $10)
+                        "#,
+                    )
+                    .bind(objective)
+                    .bind(token_budget)
+                    .bind(token_budget)
+                    .bind(token_budget)
+                    .bind(codex_state::ThreadGoalStatus::BudgetLimited.as_str())
+                    .bind(now)
+                    .bind(now_ms)
+                    .bind(thread_id.to_string())
+                    .bind(expected_goal_id)
+                    .bind(expected_goal_id)
+                    .execute(pool)
+                    .await?
+                }
+                (None, None) => {
+                    if let Some(objective) = objective {
+                        sqlx::query(
+                            r#"
+UPDATE thread_goals
+SET
+    objective = $1,
+    updated_at = $2,
+    updated_at_ms = $3
+WHERE thread_id = $4
+  AND ($5::TEXT IS NULL OR goal_id = $6)
+                            "#,
+                        )
+                        .bind(objective)
+                        .bind(now)
+                        .bind(now_ms)
+                        .bind(thread_id.to_string())
+                        .bind(expected_goal_id)
+                        .bind(expected_goal_id)
+                        .execute(pool)
+                        .await?
+                    } else {
+                        let goal = self.get_thread_goal(thread_id).await?;
+                        return Ok(match (goal, expected_goal_id) {
+                            (Some(goal), Some(expected_goal_id))
+                                if goal.goal_id != expected_goal_id =>
+                            {
+                                None
+                            }
+                            (goal, _) => goal,
+                        });
+                    }
+                }
+            };
+
+            if result.rows_affected() == 0 {
+                return Ok(None);
+            }
+
+            self.get_thread_goal(thread_id).await
+        })
+    }
+
+    fn pause_active_thread_goal(
+        &self,
+        thread_id: ThreadId,
+    ) -> codex_state::ThreadGoalStoreFuture<'_, Option<codex_state::ThreadGoal>> {
+        update_active_thread_goal_status(self, thread_id, codex_state::ThreadGoalStatus::Paused)
+    }
+
+    fn usage_limit_active_thread_goal(
+        &self,
+        thread_id: ThreadId,
+    ) -> codex_state::ThreadGoalStoreFuture<'_, Option<codex_state::ThreadGoal>> {
+        update_active_thread_goal_status(
+            self,
+            thread_id,
+            codex_state::ThreadGoalStatus::UsageLimited,
+        )
+    }
+
+    fn delete_thread_goal(
+        &self,
+        thread_id: ThreadId,
+    ) -> codex_state::ThreadGoalStoreFuture<'_, Option<codex_state::ThreadGoal>> {
+        Box::pin(async move {
+            self.ensure_migrated().await.map_err(anyhow_from_store)?;
+            let (pool, _) = self.pool_and_workspace().map_err(anyhow_from_store)?;
+            let row = sqlx::query(
+                r#"
+DELETE FROM thread_goals
+WHERE thread_id = $1
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+                "#,
+            )
+            .bind(thread_id.to_string())
+            .fetch_optional(pool)
+            .await?;
+
+            row.map(|row| thread_goal_from_pg_row(&row)).transpose()
+        })
+    }
+
+    fn account_thread_goal_usage(
+        &self,
+        thread_id: ThreadId,
+        time_delta_seconds: i64,
+        token_delta: i64,
+        mode: codex_state::GoalAccountingMode,
+        expected_goal_id: Option<String>,
+    ) -> codex_state::ThreadGoalStoreFuture<'_, codex_state::GoalAccountingOutcome> {
+        Box::pin(async move {
+            self.ensure_migrated().await.map_err(anyhow_from_store)?;
+            let (pool, _) = self.pool_and_workspace().map_err(anyhow_from_store)?;
+            let time_delta_seconds = time_delta_seconds.max(0);
+            let token_delta = token_delta.max(0);
+            if time_delta_seconds == 0 && token_delta == 0 {
+                return Ok(codex_state::GoalAccountingOutcome::Unchanged(
+                    self.get_thread_goal(thread_id).await?,
+                ));
+            }
+
+            let now = Utc::now();
+            let now_ms = datetime_to_epoch_millis(now);
+            let active_or_stopped_status_filter =
+                "status IN ('active', 'paused', 'blocked', 'usage_limited', 'budget_limited')";
+            let status_filter = match mode {
+                codex_state::GoalAccountingMode::ActiveStatusOnly => "status = 'active'",
+                codex_state::GoalAccountingMode::ActiveOnly => {
+                    "status IN ('active', 'budget_limited')"
+                }
+                codex_state::GoalAccountingMode::ActiveOrComplete => {
+                    "status IN ('active', 'budget_limited', 'complete')"
+                }
+                codex_state::GoalAccountingMode::ActiveOrStopped => active_or_stopped_status_filter,
+            };
+            let budget_limit_status_filter = match mode {
+                codex_state::GoalAccountingMode::ActiveStatusOnly
+                | codex_state::GoalAccountingMode::ActiveOnly
+                | codex_state::GoalAccountingMode::ActiveOrComplete => "status = 'active'",
+                codex_state::GoalAccountingMode::ActiveOrStopped => active_or_stopped_status_filter,
+            };
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+UPDATE thread_goals
+SET
+    time_used_seconds = time_used_seconds +
+                "#,
+            );
+            builder.push_bind(time_delta_seconds);
+            builder.push(
+                r#",
+    tokens_used = tokens_used +
+                "#,
+            );
+            builder.push_bind(token_delta);
+            builder.push(
+                r#",
+    status = CASE
+        WHEN
+                "#,
+            );
+            builder.push(budget_limit_status_filter);
+            builder.push(
+                r#"
+            AND token_budget IS NOT NULL
+            AND tokens_used +
+                "#,
+            );
+            builder.push_bind(token_delta);
+            builder.push(
+                r#"
+                >= token_budget
+            THEN
+                "#,
+            );
+            builder.push_bind(codex_state::ThreadGoalStatus::BudgetLimited.as_str());
+            builder.push(
+                r#"
+        ELSE status
+    END,
+    updated_at =
+                "#,
+            );
+            builder.push_bind(now);
+            builder.push(
+                r#",
+    updated_at_ms =
+                "#,
+            );
+            builder.push_bind(now_ms);
+            builder.push(
+                r#"
+WHERE thread_id =
+                "#,
+            );
+            builder.push_bind(thread_id.to_string());
+            builder.push(" AND ");
+            builder.push(status_filter);
+            if let Some(expected_goal_id) = expected_goal_id {
+                builder.push(" AND goal_id = ").push_bind(expected_goal_id);
+            }
+            builder.push(
+                r#"
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+                "#,
+            );
+
+            let row = builder.build().fetch_optional(pool).await?;
+
+            let Some(row) = row else {
+                return Ok(codex_state::GoalAccountingOutcome::Unchanged(
+                    self.get_thread_goal(thread_id).await?,
+                ));
+            };
+
+            Ok(codex_state::GoalAccountingOutcome::Updated(
+                thread_goal_from_pg_row(&row)?,
+            ))
+        })
+    }
+}
+
+fn update_active_thread_goal_status(
+    store: &PostgresThreadStore,
+    thread_id: ThreadId,
+    status: codex_state::ThreadGoalStatus,
+) -> codex_state::ThreadGoalStoreFuture<'_, Option<codex_state::ThreadGoal>> {
+    Box::pin(async move {
+        store.ensure_migrated().await.map_err(anyhow_from_store)?;
+        let (pool, _) = store.pool_and_workspace().map_err(anyhow_from_store)?;
+        let now = Utc::now();
+        let now_ms = datetime_to_epoch_millis(now);
+        let result = sqlx::query(
+            r#"
+UPDATE thread_goals
+SET
+    status = $1,
+    updated_at = $2,
+    updated_at_ms = $3
+WHERE thread_id = $4
+  AND (
+      status = 'active'
+      OR (
+          $5 = 'usage_limited'
+          AND status = 'budget_limited'
+      )
+  )
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(now)
+        .bind(now_ms)
+        .bind(thread_id.to_string())
+        .bind(status.as_str())
+        .execute(pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        store.get_thread_goal(thread_id).await
+    })
+}
+
 impl AgentGraphStore for PostgresThreadStore {
     fn upsert_thread_spawn_edge(
         &self,
@@ -1361,6 +1908,64 @@ fn graph_status(status: ThreadSpawnEdgeStatus) -> &'static str {
         ThreadSpawnEdgeStatus::Open => "open",
         ThreadSpawnEdgeStatus::Closed => "closed",
     }
+}
+
+fn thread_goal_from_pg_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<codex_state::ThreadGoal> {
+    let thread_id: String = row.try_get("thread_id")?;
+    let status: String = row.try_get("status")?;
+    let created_at_ms: i64 = row.try_get("created_at_ms")?;
+    let updated_at_ms: i64 = row.try_get("updated_at_ms")?;
+    Ok(codex_state::ThreadGoal {
+        thread_id: ThreadId::try_from(thread_id)?,
+        goal_id: row.try_get("goal_id")?,
+        objective: row.try_get("objective")?,
+        status: codex_state::ThreadGoalStatus::try_from(status.as_str())?,
+        token_budget: row.try_get("token_budget")?,
+        tokens_used: row.try_get("tokens_used")?,
+        time_used_seconds: row.try_get("time_used_seconds")?,
+        created_at: epoch_millis_to_datetime(created_at_ms)?,
+        updated_at: epoch_millis_to_datetime(updated_at_ms)?,
+    })
+}
+
+fn status_after_budget_limit(
+    status: codex_state::ThreadGoalStatus,
+    tokens_used: i64,
+    token_budget: Option<i64>,
+) -> codex_state::ThreadGoalStatus {
+    if status == codex_state::ThreadGoalStatus::Active
+        && token_budget.is_some_and(|budget| tokens_used >= budget)
+    {
+        codex_state::ThreadGoalStatus::BudgetLimited
+    } else {
+        status
+    }
+}
+
+fn new_goal_id(thread_id: ThreadId, now: DateTime<Utc>) -> String {
+    let timestamp_nanos = now
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| now.timestamp_micros().saturating_mul(1000));
+    format!("{thread_id}:{timestamp_nanos}")
+}
+
+fn datetime_to_epoch_millis(dt: DateTime<Utc>) -> i64 {
+    dt.timestamp_millis()
+}
+
+fn epoch_millis_to_datetime(value: i64) -> anyhow::Result<DateTime<Utc>> {
+    const MIN_EPOCH_MILLIS: i64 = 1_577_836_800_000;
+    let millis = if value < MIN_EPOCH_MILLIS {
+        value.saturating_mul(1000)
+    } else {
+        value
+    };
+    DateTime::<Utc>::from_timestamp_millis(millis)
+        .ok_or_else(|| anyhow::anyhow!("invalid unix timestamp millis: {value}"))
+}
+
+fn anyhow_from_store(err: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("{err}")
 }
 
 fn internal_error(err: impl std::fmt::Display) -> ThreadStoreError {

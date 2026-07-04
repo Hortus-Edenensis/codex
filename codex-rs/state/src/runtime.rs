@@ -78,6 +78,8 @@ pub use goals::GoalAccountingMode;
 pub use goals::GoalAccountingOutcome;
 pub use goals::GoalStore;
 pub use goals::GoalUpdate;
+pub use goals::ThreadGoalStore;
+pub use goals::ThreadGoalStoreFuture;
 pub use memories::MemoryStore;
 pub use recovery::RuntimeDbBackup;
 pub use recovery::backup_runtime_db_for_fresh_start;

@@ -493,8 +493,9 @@ pub(super) async fn handle_thread_listener_command(
                 ))
                 .await;
         }
-        ThreadListenerCommand::EmitThreadGoalSnapshot { state_db } => {
-            send_thread_goal_snapshot_notification(outgoing, conversation_id, &state_db).await;
+        ThreadListenerCommand::EmitThreadGoalSnapshot { goal_store } => {
+            send_thread_goal_snapshot_notification(outgoing, conversation_id, goal_store.as_ref())
+                .await;
         }
         ThreadListenerCommand::ResolveServerRequest {
             request_id,
@@ -679,12 +680,13 @@ pub(super) async fn handle_pending_thread_resume_request(
         .await;
     }
     if pending.emit_thread_goal_update {
-        if let Some(state_db) = pending.thread_goal_state_db {
-            send_thread_goal_snapshot_notification(outgoing, conversation_id, &state_db).await;
+        if let Some(goal_store) = pending.thread_goal_store {
+            send_thread_goal_snapshot_notification(outgoing, conversation_id, goal_store.as_ref())
+                .await;
         } else {
             tracing::warn!(
                 thread_id = %conversation_id,
-                "state db unavailable when reading thread goal for running thread resume"
+                "goal store unavailable when reading thread goal for running thread resume"
             );
         }
     }
@@ -701,9 +703,9 @@ pub(super) async fn handle_pending_thread_resume_request(
 pub(super) async fn send_thread_goal_snapshot_notification(
     outgoing: &Arc<OutgoingMessageSender>,
     thread_id: ThreadId,
-    state_db: &StateDbHandle,
+    goal_store: &dyn codex_state::ThreadGoalStore,
 ) {
-    match state_db.thread_goals().get_thread_goal(thread_id).await {
+    match goal_store.get_thread_goal(thread_id).await {
         Ok(Some(goal)) => {
             outgoing
                 .send_server_notification(ServerNotification::ThreadGoalUpdated(
