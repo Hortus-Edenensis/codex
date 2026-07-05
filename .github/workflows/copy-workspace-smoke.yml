@@ -115,31 +115,31 @@ jobs:
 
           sql_file="$(mktemp)"
           cat >"${sql_file}" <<SQL
-WITH counts AS (
-    SELECT 'threads' AS metric, COUNT(*)::BIGINT AS value
-    FROM threads
-    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
-    UNION ALL
-    SELECT 'thread_goals', COUNT(*)::BIGINT
-    FROM thread_goals
-    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
-    UNION ALL
-    SELECT 'memories', COUNT(*)::BIGINT
-    FROM memories
-    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
-    UNION ALL
-    SELECT 'memory_stage1_outputs', COUNT(*)::BIGINT
-    FROM memory_stage1_outputs
-    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
-    UNION ALL
-    SELECT 'memory_jobs', COUNT(*)::BIGINT
-    FROM memory_jobs
-    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
-)
-SELECT metric || '=' || value
-FROM counts
-ORDER BY metric;
-SQL
+          WITH counts AS (
+              SELECT 'threads' AS metric, COUNT(*)::BIGINT AS value
+              FROM threads
+              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+              UNION ALL
+              SELECT 'thread_goals', COUNT(*)::BIGINT
+              FROM thread_goals
+              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+              UNION ALL
+              SELECT 'memories', COUNT(*)::BIGINT
+              FROM memories
+              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+              UNION ALL
+              SELECT 'memory_stage1_outputs', COUNT(*)::BIGINT
+              FROM memory_stage1_outputs
+              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+              UNION ALL
+              SELECT 'memory_jobs', COUNT(*)::BIGINT
+              FROM memory_jobs
+              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+          )
+          SELECT metric || '=' || value
+          FROM counts
+          ORDER BY metric;
+          SQL
 
           probe_name="copy-workspace-pg-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() {
