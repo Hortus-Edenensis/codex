@@ -216,18 +216,11 @@ jobs:
               "${github_ref_name}" > "${tag_dir}/REMOTE_SQL_BUILD_TAG"
           done
 
-          for proc in /proc/[0-9]*; do
-            p="${proc#/proc/}"
-            [ -r "${proc}/comm" ] || continue
-            [ "$(cat "${proc}/comm" 2>/dev/null || true)" = codex ] || continue
-            cmd="$(tr '\0' ' ' < "${proc}/cmdline" 2>/dev/null || true)"
-            case "${cmd}" in
-              *app-server*) kill "${p}" 2>/dev/null || true ;;
-            esac
-          done
-          sleep 1
-
           codex_bin=/home/codex/.codex/packages/standalone/current/bin/codex
+          env HOME=/home/codex USER=codex LOGNAME=codex \
+            CODEX_REMOTE_SQL_URL="${CODEX_REMOTE_SQL_URL:-}" \
+            CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \
+            su -m codex -c "${codex_bin} app-server daemon stop" || true
           env HOME=/home/codex USER=codex LOGNAME=codex \
             CODEX_REMOTE_SQL_URL="${CODEX_REMOTE_SQL_URL:-}" \
             CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \

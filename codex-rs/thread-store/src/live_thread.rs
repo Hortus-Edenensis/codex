@@ -157,7 +157,7 @@ impl LiveThread {
         self.thread_store
             .append_items(AppendThreadItemsParams {
                 thread_id: self.thread_id,
-                items: items.to_vec(),
+                items: canonical_items.clone(),
             })
             .await?;
         if let Some(measurement) = measurement.as_ref() {
@@ -320,3 +320,7 @@ impl LiveThread {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "live_thread_tests.rs"]
+mod tests;
