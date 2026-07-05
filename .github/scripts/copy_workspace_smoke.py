@@ -35,6 +35,16 @@ class SmokeSummary:
     smoke_goal_objective: str
     codex_home: Optional[str]
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": "ok",
+            "interactiveThreadCount": self.interactive_thread_count,
+            "knownThreadId": self.known_thread_id,
+            "smokeThreadId": self.smoke_thread_id,
+            "smokeGoalObjective": self.smoke_goal_objective,
+            "codexHome": self.codex_home,
+        }
+
 
 class ProxyWebSocketClient:
     def __init__(self, command: List[str], request_timeout_seconds: float) -> None:
@@ -312,6 +322,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-thread-id", required=True)
     parser.add_argument("--min-interactive-threads", type=int, default=8)
     parser.add_argument("--request-timeout-seconds", type=float, default=REQUEST_TIMEOUT_SECONDS)
+    parser.add_argument("--keep-smoke-thread", action="store_true")
+    parser.add_argument("--summary-json-path")
+    parser.add_argument("--delete-only-thread-id")
     return parser.parse_args()
 
 
@@ -336,11 +349,20 @@ def proxy_command(args: argparse.Namespace) -> List[str]:
     ]
 
 
+def delete_thread(args: argparse.Namespace, thread_id: str) -> None:
+    command = proxy_command(args)
+    with ProxyWebSocketClient(command, args.request_timeout_seconds) as client:
+        client.initialize()
+        client.request("thread/delete", {"threadId": thread_id})
+        print(f"step: thread/delete ok threadId={thread_id}", flush=True)
+
+
 def run_smoke(args: argparse.Namespace) -> SmokeSummary:
     command = proxy_command(args)
     smoke_thread_id: Optional[str] = None
     smoke_goal_objective = f"copy-workspace smoke goal persistence {int(time.time())}"
     codex_home: Optional[str] = None
+    retain_smoke_thread = False
 
     try:
         with ProxyWebSocketClient(command, args.request_timeout_seconds) as client:
@@ -454,8 +476,12 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             if goal.get("tokenBudget") != 1234:
                 raise SmokeError("persisted thread goal budget did not survive reconnect")
             print(f"step: reconnect goal/get ok threadId={smoke_thread_id}", flush=True)
-            client.request("thread/delete", {"threadId": smoke_thread_id})
-            print(f"step: thread/delete ok threadId={smoke_thread_id}", flush=True)
+            if args.keep_smoke_thread:
+                retain_smoke_thread = True
+                print(f"step: retained smoke thread threadId={smoke_thread_id}", flush=True)
+            else:
+                client.request("thread/delete", {"threadId": smoke_thread_id})
+                print(f"step: thread/delete ok threadId={smoke_thread_id}", flush=True)
 
         return SmokeSummary(
             interactive_thread_count=interactive_thread_count,
@@ -465,11 +491,9 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             codex_home=codex_home,
         )
     except Exception:
-        if smoke_thread_id is not None:
+        if smoke_thread_id is not None and not retain_smoke_thread:
             try:
-                with ProxyWebSocketClient(command, args.request_timeout_seconds) as cleanup_client:
-                    cleanup_client.initialize()
-                    cleanup_client.request("thread/delete", {"threadId": smoke_thread_id})
+                delete_thread(args, smoke_thread_id)
             except Exception as cleanup_exc:
                 print(
                     f"cleanup warning: failed to delete smoke thread {smoke_thread_id}: {cleanup_exc}",
@@ -480,20 +504,16 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
 
 def main() -> int:
     args = parse_args()
+    if args.delete_only_thread_id is not None:
+        delete_thread(args, args.delete_only_thread_id)
+        return 0
+
     summary = run_smoke(args)
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "interactiveThreadCount": summary.interactive_thread_count,
-                "knownThreadId": summary.known_thread_id,
-                "smokeThreadId": summary.smoke_thread_id,
-                "smokeGoalObjective": summary.smoke_goal_objective,
-                "codexHome": summary.codex_home,
-            },
-            sort_keys=True,
-        )
-    )
+    if args.summary_json_path is not None:
+        with open(args.summary_json_path, "w", encoding="utf-8") as summary_file:
+            json.dump(summary.to_dict(), summary_file, sort_keys=True)
+            summary_file.write("\n")
+    print(json.dumps(summary.to_dict(), sort_keys=True))
     return 0
 
 

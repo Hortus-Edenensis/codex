@@ -39,6 +39,7 @@ jobs:
       NO_PROXY: 127.0.0.1,localhost,10.0.0.0/8,10.42.0.0/16,202.189.11.100
     steps:
       - name: Smoke test copy workspace control plane
+        id: control_plane_smoke
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -82,13 +83,29 @@ jobs:
             fi
           '
 
+          summary_path="${RUNNER_TEMP}/copy-workspace-smoke-summary.json"
           python3 "${smoke_script}" \
             --namespace "${CODEX_DEPLOY_NAMESPACE}" \
             --pod "${pod}" \
             --container "${CODEX_DEPLOY_CONTAINER}" \
             --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
             --resume-thread-id "${resume_thread_id}" \
-            --min-interactive-threads "${min_interactive_threads}"
+            --min-interactive-threads "${min_interactive_threads}" \
+            --keep-smoke-thread \
+            --summary-json-path "${summary_path}"
+
+          python3 - "${summary_path}" "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import sys
+
+          summary_path = sys.argv[1]
+          github_output = sys.argv[2]
+          with open(summary_path, "r", encoding="utf-8") as summary_file:
+              summary = json.load(summary_file)
+          with open(github_output, "a", encoding="utf-8") as output_file:
+              output_file.write(f"smoke_thread_id={summary['smokeThreadId']}\n")
+              output_file.write(f"smoke_goal_objective={summary['smokeGoalObjective']}\n")
+          PY
 
       - name: Read PostgreSQL workspace memory and goal counts
         shell: bash
@@ -110,6 +127,13 @@ jobs:
           )"
           if [ -z "${database_url}" ]; then
             echo "::error::CODEX_REMOTE_SQL_URL is not set in ${pod}"
+            exit 1
+          fi
+
+          smoke_thread_id="${{ steps.control_plane_smoke.outputs.smoke_thread_id }}"
+          smoke_goal_objective="${{ steps.control_plane_smoke.outputs.smoke_goal_objective }}"
+          if [ -z "${smoke_thread_id}" ] || [ -z "${smoke_goal_objective}" ]; then
+            echo "::error::Missing smoke thread outputs from control plane step"
             exit 1
           fi
 
@@ -266,6 +290,27 @@ jobs:
               INSERT INTO probe_results (metric, value) VALUES ('thread_goals_route', route);
 
               value_count := 0;
+              IF to_regclass('public.thread_goals') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*) FROM public.thread_goals WHERE thread_id = $1'
+                      INTO value_count
+                      USING '__SMOKE_THREAD_ID__';
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_goal_count', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.thread_goals') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.thread_goals
+                       WHERE thread_id = $1
+                         AND objective = $2'
+                      INTO value_count
+                      USING '__SMOKE_THREAD_ID__', '__SMOKE_GOAL_OBJECTIVE__';
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_goal_objective_match', value_count::TEXT);
+
+              value_count := 0;
               route := 'none';
               IF to_regclass('public.memories') IS NOT NULL THEN
                   IF EXISTS (
@@ -384,6 +429,8 @@ jobs:
           ORDER BY metric;
           SQL
           sed -i.bak "s/__WORKSPACE_ID__/${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}/g" "${sql_file}"
+          sed -i.bak "s/__SMOKE_THREAD_ID__/${smoke_thread_id}/g" "${sql_file}"
+          sed -i.bak "s/__SMOKE_GOAL_OBJECTIVE__/${smoke_goal_objective}/g" "${sql_file}"
           rm -f "${sql_file}.bak"
 
           probe_name="copy-workspace-pg-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -417,6 +464,8 @@ jobs:
           memories=0
           memory_stage1_outputs=0
           memory_jobs=0
+          smoke_thread_goal_count=0
+          smoke_thread_goal_objective_match=0
           threads_workspace_route=none
           while IFS='=' read -r metric value; do
             case "${metric}" in
@@ -425,6 +474,8 @@ jobs:
               memories) memories="${value}" ;;
               memory_stage1_outputs) memory_stage1_outputs="${value}" ;;
               memory_jobs) memory_jobs="${value}" ;;
+              smoke_thread_goal_count) smoke_thread_goal_count="${value}" ;;
+              smoke_thread_goal_objective_match) smoke_thread_goal_objective_match="${value}" ;;
               threads_workspace_route) threads_workspace_route="${value}" ;;
             esac
           done <<< "${counts}"
@@ -440,11 +491,49 @@ jobs:
             echo "::error::Expected at least 100 Postgres threads for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got ${threads}"
             exit 1
           fi
-          if [ "${thread_goals}" -lt 1 ]; then
-            echo "::error::Expected Postgres thread goals for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got ${thread_goals}"
+          if [ "${smoke_thread_goal_count}" -lt 1 ]; then
+            echo "::error::Expected a PostgreSQL thread_goals row for smoke thread ${smoke_thread_id}, got ${smoke_thread_goal_count}"
+            exit 1
+          fi
+          if [ "${smoke_thread_goal_objective_match}" -lt 1 ]; then
+            echo "::error::Expected PostgreSQL smoke thread goal objective to match ${smoke_goal_objective}"
             exit 1
           fi
           if [ "${memories}" -lt 1 ] && [ "${memory_stage1_outputs}" -lt 1 ]; then
             echo "::error::Expected PostgreSQL-backed memories for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got memories=${memories} memory_stage1_outputs=${memory_stage1_outputs}"
             exit 1
           fi
+
+      - name: Delete retained smoke thread
+        if: ${{ always() && steps.control_plane_smoke.outputs.smoke_thread_id != '' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          smoke_thread_id="${{ steps.control_plane_smoke.outputs.smoke_thread_id }}"
+          smoke_script="/tmp/copy_workspace_smoke.py"
+          curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.github/scripts/copy_workspace_smoke.py?ref=${GITHUB_SHA}" \
+            -o "${smoke_script}"
+          chmod 0755 "${smoke_script}"
+
+          pod="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
+              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" { print $1; exit }'
+          )"
+          if [ -z "${pod}" ]; then
+            echo "::warning::Skipping smoke thread cleanup because no running ${CODEX_DEPLOY_POD_PREFIX} pod was found"
+            exit 0
+          fi
+
+          python3 "${smoke_script}" \
+            --namespace "${CODEX_DEPLOY_NAMESPACE}" \
+            --pod "${pod}" \
+            --container "${CODEX_DEPLOY_CONTAINER}" \
+            --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
+            --resume-thread-id "${COPY_WORKSPACE_RESUME_THREAD_ID}" \
+            --delete-only-thread-id "${smoke_thread_id}"
