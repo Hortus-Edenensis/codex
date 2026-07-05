@@ -54,6 +54,7 @@ use tokio::sync::Mutex;
 use tokio::sync::watch;
 
 use codex_rollout::state_db::StateDbHandle;
+use codex_state::GeneratedMemoryStore;
 
 #[derive(Clone, Debug)]
 pub struct ThreadConfigSnapshot {
@@ -567,6 +568,14 @@ impl CodexThread {
 
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.codex.state_db()
+    }
+
+    pub fn generated_memory_store(&self) -> Option<Arc<dyn GeneratedMemoryStore>> {
+        self.codex.session.services.generated_memory_store.clone()
+    }
+
+    pub fn thread_store(&self) -> Arc<dyn codex_thread_store::ThreadStore> {
+        Arc::clone(&self.codex.session.services.thread_store)
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::error_code::method_not_found;
+use crate::thread_state::GeneratedMemoryStoreHandle;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::config_types::MultiAgentMode;
@@ -496,6 +497,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
+    pub(super) generated_memory_store: Option<GeneratedMemoryStoreHandle>,
     pub(super) log_db: Option<LogDbLayer>,
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
@@ -529,6 +531,7 @@ impl ThreadRequestProcessor {
         thread_list_state_permit: Arc<Semaphore>,
         thread_goal_processor: ThreadGoalRequestProcessor,
         state_db: Option<StateDbHandle>,
+        generated_memory_store: Option<GeneratedMemoryStoreHandle>,
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
     ) -> Self {
@@ -546,6 +549,7 @@ impl ThreadRequestProcessor {
             thread_list_state_permit,
             thread_goal_processor,
             state_db,
+            generated_memory_store,
             log_db,
             background_tasks: TaskTracker::new(),
             skills_watcher,
@@ -1702,17 +1706,16 @@ impl ThreadRequestProcessor {
     }
 
     async fn memory_reset_response_inner(&self) -> Result<MemoryResetResponse, JSONRPCErrorError> {
-        let state_db = self
-            .state_db
+        let generated_memory_store = self
+            .generated_memory_store
             .clone()
-            .ok_or_else(|| internal_error("sqlite state db unavailable for memory reset"))?;
+            .ok_or_else(|| internal_error("generated memory store unavailable for memory reset"))?;
 
-        state_db
-            .memories()
+        generated_memory_store
             .clear_memory_data()
             .await
             .map_err(|err| {
-                internal_error(format!("failed to clear memory rows in memories db: {err}"))
+                internal_error(format!("failed to clear generated memory rows: {err}"))
             })?;
 
         clear_memory_roots_contents(&self.config.codex_home)
@@ -3303,7 +3306,15 @@ impl ThreadRequestProcessor {
         path: Option<&PathBuf>,
         include_history: bool,
     ) -> Result<StoredThread, JSONRPCErrorError> {
-        let result = if let Some(path) = path {
+        let parsed_thread_id = ThreadId::from_string(thread_id);
+        let result = if let Ok(existing_thread_id) = parsed_thread_id {
+            let params = StoreReadThreadParams {
+                thread_id: existing_thread_id,
+                include_archived: true,
+                include_history,
+            };
+            self.thread_store.read_thread(params).await
+        } else if let Some(path) = path {
             self.thread_store
                 .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
                     rollout_path: path.clone(),
@@ -3312,18 +3323,8 @@ impl ThreadRequestProcessor {
                 })
                 .await
         } else {
-            let existing_thread_id = match ThreadId::from_string(thread_id) {
-                Ok(id) => id,
-                Err(err) => {
-                    return Err(invalid_request(format!("invalid session id: {err}")));
-                }
-            };
-            let params = StoreReadThreadParams {
-                thread_id: existing_thread_id,
-                include_archived: true,
-                include_history,
-            };
-            self.thread_store.read_thread(params).await
+            let err = parsed_thread_id.expect_err("invalid thread id without path fallback");
+            return Err(invalid_request(format!("invalid session id: {err}")));
         };
 
         let stored_thread = result.map_err(thread_store_resume_read_error)?;
@@ -3407,32 +3408,18 @@ impl ThreadRequestProcessor {
             InitialHistory::Resumed(resumed) => {
                 let fallback_provider = config_snapshot.model_provider_id.as_str();
                 if let Some(stored_thread) = resume_source_thread {
-                    let stored_thread =
-                        if let Some(rollout_path) = stored_thread.rollout_path.clone() {
-                            self.thread_store
-                                .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
-                                    rollout_path,
-                                    include_archived: true,
-                                    include_history: false,
-                                })
-                                .await
-                                .unwrap_or(StoredThread {
-                                    history: None,
-                                    ..stored_thread
-                                })
-                        } else {
-                            self.thread_store
-                                .read_thread(StoreReadThreadParams {
-                                    thread_id: stored_thread.thread_id,
-                                    include_archived: true,
-                                    include_history: false,
-                                })
-                                .await
-                                .unwrap_or(StoredThread {
-                                    history: None,
-                                    ..stored_thread
-                                })
-                        };
+                    let stored_thread = self
+                        .thread_store
+                        .read_thread(StoreReadThreadParams {
+                            thread_id: stored_thread.thread_id,
+                            include_archived: true,
+                            include_history: false,
+                        })
+                        .await
+                        .unwrap_or(StoredThread {
+                            history: None,
+                            ..stored_thread
+                        });
                     Ok(thread_from_stored_thread(
                         stored_thread,
                         fallback_provider,

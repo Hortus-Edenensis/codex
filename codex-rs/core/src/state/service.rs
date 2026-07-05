@@ -39,6 +39,7 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout_trace::ThreadTraceContext;
+use codex_state::GeneratedMemoryStore;
 use codex_thread_store::LiveThread;
 use codex_thread_store::ThreadStore;
 use std::path::PathBuf;
@@ -90,6 +91,7 @@ pub(crate) struct SessionServices {
     pub(crate) managed_network_requirements_configured: bool,
     pub(crate) network_approval: Arc<NetworkApprovalService>,
     pub(crate) state_db: Option<StateDbHandle>,
+    pub(crate) generated_memory_store: Option<Arc<dyn GeneratedMemoryStore>>,
     pub(crate) live_thread: Option<LiveThread>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,

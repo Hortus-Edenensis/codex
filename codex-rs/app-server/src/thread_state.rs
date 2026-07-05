@@ -28,6 +28,7 @@ use tracing::error;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
 pub(crate) type ThreadGoalStoreHandle = Arc<dyn codex_state::ThreadGoalStore>;
+pub(crate) type GeneratedMemoryStoreHandle = Arc<dyn codex_state::GeneratedMemoryStore>;
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,

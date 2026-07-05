@@ -9,6 +9,7 @@ use crate::skills::SkillError;
 use crate::state::ActiveTurn;
 use codex_extension_api::ExtensionDataInit;
 use codex_login::auth::AgentIdentityAuthPolicy;
+use codex_postgres_thread_store::PostgresThreadStore;
 use codex_protocol::SessionId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -19,6 +20,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
+use codex_state::GeneratedMemoryStore;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
@@ -716,6 +718,11 @@ impl Session {
             state_db_ctx,
             (auth, mcp_config, mcp_servers, auth_statuses, tool_plugin_provenance),
         ) = tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
+        let generated_memory_store = generated_memory_store_for_session(
+            config.ephemeral,
+            state_db_ctx.as_ref(),
+            &thread_store,
+        );
 
         let mut live_thread_init =
             LiveThreadInitGuard::new(thread_persistence_result.map_err(|e| {
@@ -1090,6 +1097,7 @@ impl Session {
                 managed_network_requirements_configured,
                 network_approval: Arc::clone(&network_approval),
                 state_db: state_db_ctx.clone(),
+                generated_memory_store,
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
                 attestation_provider: attestation_provider.clone(),
@@ -1260,4 +1268,21 @@ impl Session {
             }
         }
     }
+}
+
+fn generated_memory_store_for_session(
+    ephemeral: bool,
+    state_db: Option<&state_db::StateDbHandle>,
+    thread_store: &Arc<dyn ThreadStore>,
+) -> Option<Arc<dyn GeneratedMemoryStore>> {
+    if ephemeral {
+        return None;
+    }
+    if let Some(state_db) = state_db {
+        return Some(Arc::new(state_db.memories().clone()) as Arc<dyn GeneratedMemoryStore>);
+    }
+    thread_store
+        .as_any()
+        .downcast_ref::<PostgresThreadStore>()
+        .map(|store| Arc::new(store.clone()) as Arc<dyn GeneratedMemoryStore>)
 }

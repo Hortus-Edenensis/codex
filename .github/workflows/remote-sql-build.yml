@@ -28,6 +28,7 @@ env:
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   CARGO_PROFILE_RELEASE_DEBUG: "0"
   CARGO_PROFILE_RELEASE_LTO: "false"
+  CODEX_REMOTE_SQL_CHANNEL: "copy"
   CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE: "0.142.5"
   RUST_MIN_STACK: "8388608"
 
@@ -65,7 +66,7 @@ jobs:
             release_version="${BASH_REMATCH[1]}"
           fi
           if [ -z "${release_version}" ]; then
-            release_version="${CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE}-remote-sql.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:12}"
+            release_version="${CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE}-remote-sql-${CODEX_REMOTE_SQL_CHANNEL}.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:12}"
           fi
           if [[ ! "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*$ ]]; then
             echo "::error::release_version must be a Cargo-compatible semver value: ${release_version}"
@@ -115,6 +116,7 @@ jobs:
     env:
       ALL_PROXY: http://10.42.0.1:10809
       CODEX_DEPLOY_CONTAINER: workspace
+      CODEX_DEPLOY_CHANNEL: copy-workspace
       CODEX_DEPLOY_NAMESPACE: codex-internal
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
       CODEX_DEPLOY_RELEASE_TAG: ${{ needs.linux-cargo-build.outputs.release_version }}
@@ -147,7 +149,7 @@ jobs:
             exit 1
           fi
 
-          release_name="${CODEX_DEPLOY_RELEASE_TAG//+/-}-${CODEX_DEPLOY_TARGET_TRIPLE}"
+          release_name="${CODEX_DEPLOY_CHANNEL}-${CODEX_DEPLOY_RELEASE_TAG//+/-}-${CODEX_DEPLOY_TARGET_TRIPLE}"
 
           pod="$(
             kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
@@ -204,8 +206,10 @@ jobs:
             "/workspace/shared-state/.git/codex-persist/codex-standalone/releases/${release_name}"
           do
             mkdir -p "${tag_dir}"
-            printf 'release_version=%s\ngit_sha=%s\nrun_id=%s\nrun_attempt=%s\nref_name=%s\n' \
+            printf 'release_version=%s\nrelease_name=%s\ndeploy_channel=%s\ngit_sha=%s\nrun_id=%s\nrun_attempt=%s\nref_name=%s\n' \
               "${release_tag}" \
+              "${release_name}" \
+              "${CODEX_DEPLOY_CHANNEL}" \
               "${github_sha}" \
               "${github_run_id}" \
               "${github_run_attempt}" \

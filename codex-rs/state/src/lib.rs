@@ -61,6 +61,8 @@ pub use runtime::ExternalAgentConfigImportDetailsRecord;
 pub use runtime::ExternalAgentConfigImportFailureRecord;
 pub use runtime::ExternalAgentConfigImportHistoryRecord;
 pub use runtime::ExternalAgentConfigImportSuccessRecord;
+pub use runtime::GeneratedMemoryStore;
+pub use runtime::GeneratedMemoryStoreFuture;
 pub use runtime::GoalAccountingMode;
 pub use runtime::GoalAccountingOutcome;
 pub use runtime::GoalStore;

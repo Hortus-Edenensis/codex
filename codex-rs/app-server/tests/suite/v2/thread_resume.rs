@@ -3600,22 +3600,20 @@ async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> 
 }
 
 #[tokio::test]
-async fn thread_resume_uses_path_over_non_running_thread_id() -> Result<()> {
+async fn thread_resume_uses_thread_id_over_path() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let RestartedThreadFixture {
-        mut mcp,
-        thread_id,
-        rollout_file_path,
-        ..
+        mut mcp, thread_id, ..
     } = start_materialized_thread_and_restart(codex_home.path(), "materialize").await?;
+    let wrong_path = codex_home.path().join("missing-rollout.jsonl");
 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: ThreadId::new().to_string(),
-            path: Some(rollout_file_path),
+            thread_id: thread_id.to_string(),
+            path: Some(wrong_path),
             ..Default::default()
         })
         .await?;
