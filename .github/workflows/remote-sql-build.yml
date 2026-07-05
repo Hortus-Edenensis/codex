@@ -164,7 +164,8 @@ jobs:
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp "${artifact}" "${pod}:${pod_artifact}" -c "${CODEX_DEPLOY_CONTAINER}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -s -- \
             "${EXPECTED_CODEX_SHA256}" "${release_name}" "${pod_artifact}" "${CODEX_DEPLOY_RELEASE_TAG}" \
-            "${GITHUB_SHA}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_REF_NAME}" <<'POD_SCRIPT'
+            "${GITHUB_SHA}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_REF_NAME}" \
+            "${CODEX_DEPLOY_CHANNEL}" <<'POD_SCRIPT'
           set -eu
 
           expected_sha256="$1"
@@ -175,6 +176,7 @@ jobs:
           github_run_id="$6"
           github_run_attempt="$7"
           github_ref_name="$8"
+          deploy_channel="$9"
 
           actual_line="$(sha256sum "${src}")"
           actual_sha256="${actual_line%% *}"
@@ -209,7 +211,7 @@ jobs:
             printf 'release_version=%s\nrelease_name=%s\ndeploy_channel=%s\ngit_sha=%s\nrun_id=%s\nrun_attempt=%s\nref_name=%s\n' \
               "${release_tag}" \
               "${release_name}" \
-              "${CODEX_DEPLOY_CHANNEL}" \
+              "${deploy_channel}" \
               "${github_sha}" \
               "${github_run_id}" \
               "${github_run_attempt}" \
