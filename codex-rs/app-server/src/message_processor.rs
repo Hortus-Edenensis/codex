@@ -100,6 +100,12 @@ use crate::models_refresh_worker::ModelsRefreshWorker;
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 
+struct ThreadStoreHandles {
+    thread_store: Arc<dyn codex_thread_store::ThreadStore>,
+    goal_store: Option<ThreadGoalStoreHandle>,
+    postgres_store: Option<Arc<codex_postgres_thread_store::PostgresThreadStore>>,
+}
+
 fn deserialize_client_request(
     request: &JSONRPCRequest,
 ) -> Result<ClientRequest, JSONRPCErrorError> {
@@ -288,27 +294,44 @@ impl ConnectionSessionState {
     }
 }
 
-fn thread_goal_store_from_config(
+fn thread_store_handles_from_config(
     config: &Config,
     state_db: Option<StateDbHandle>,
-) -> Option<ThreadGoalStoreHandle> {
+) -> ThreadStoreHandles {
     match &config.experimental_thread_store {
-        ThreadStoreConfig::Local => state_db
-            .map(|state_db| Arc::new(state_db.thread_goals().clone()) as ThreadGoalStoreHandle),
+        ThreadStoreConfig::Local => ThreadStoreHandles {
+            thread_store: codex_core::thread_store_from_config(config, state_db.clone()),
+            goal_store: state_db
+                .as_ref()
+                .map(|state_db| Arc::new(state_db.thread_goals().clone()) as ThreadGoalStoreHandle),
+            postgres_store: None,
+        },
         ThreadStoreConfig::Postgres {
             database_url_env,
             default_workspace_id,
             redis_url_env,
-        } => Some(Arc::new(
-            codex_postgres_thread_store::PostgresThreadStore::from_env_or_unconfigured(
-                codex_postgres_thread_store::PostgresThreadStoreConfig {
-                    database_url_env: database_url_env.clone(),
-                    default_workspace_id: default_workspace_id.clone(),
-                    redis_url_env: redis_url_env.clone(),
-                },
-            ),
-        ) as ThreadGoalStoreHandle),
-        ThreadStoreConfig::InMemory { .. } => None,
+        } => {
+            let postgres_store = Arc::new(
+                codex_postgres_thread_store::PostgresThreadStore::from_env_or_unconfigured(
+                    codex_postgres_thread_store::PostgresThreadStoreConfig {
+                        database_url_env: database_url_env.clone(),
+                        default_workspace_id: default_workspace_id.clone(),
+                        redis_url_env: redis_url_env.clone(),
+                    },
+                ),
+            );
+            ThreadStoreHandles {
+                thread_store: Arc::clone(&postgres_store)
+                    as Arc<dyn codex_thread_store::ThreadStore>,
+                goal_store: Some(Arc::clone(&postgres_store) as ThreadGoalStoreHandle),
+                postgres_store: Some(postgres_store),
+            }
+        }
+        ThreadStoreConfig::InMemory { .. } => ThreadStoreHandles {
+            thread_store: codex_core::thread_store_from_config(config, state_db),
+            goal_store: None,
+            postgres_store: None,
+        },
     }
 }
 
@@ -360,8 +383,13 @@ impl MessageProcessor {
         // The thread store is intentionally process-scoped. Config reloads can
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
-        let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
-        let goal_store = thread_goal_store_from_config(config.as_ref(), state_db.clone());
+        let thread_store_handles =
+            thread_store_handles_from_config(config.as_ref(), state_db.clone());
+        let ThreadStoreHandles {
+            thread_store,
+            goal_store,
+            postgres_store,
+        } = thread_store_handles;
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);
         let restriction_product = session_source.restriction_product();
@@ -401,7 +429,15 @@ impl MessageProcessor {
                 )),
                 Some(analytics_events_client.clone()),
                 Arc::clone(&thread_store),
-                codex_core::agent_graph_store_from_config(config.as_ref(), state_db.as_ref()),
+                postgres_store
+                    .as_ref()
+                    .map(|store| Arc::clone(store) as _)
+                    .or_else(|| {
+                        codex_core::agent_graph_store_from_config(
+                            config.as_ref(),
+                            state_db.as_ref(),
+                        )
+                    }),
                 installation_id,
                 Some(app_server_attestation_provider(
                     outgoing.clone(),
@@ -1550,6 +1586,10 @@ impl MessageProcessor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "message_processor_tests.rs"]
+mod message_processor_tests;
 
 #[cfg(test)]
 #[path = "message_processor_tracing_tests.rs"]
