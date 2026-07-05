@@ -29,7 +29,9 @@ jobs:
       CODEX_DEPLOY_CONTAINER: workspace
       CODEX_DEPLOY_NAMESPACE: codex-internal
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
+      COPY_WORKSPACE_CANONICAL_WORKSPACE_ID: codex-workspace
       COPY_WORKSPACE_MIN_INTERACTIVE_THREADS: "8"
+      COPY_WORKSPACE_PG_PROBE_IMAGE: dockerhub.aiebk.cn/library/postgres:16-alpine
       COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS: "120"
       COPY_WORKSPACE_RESUME_THREAD_ID: 019f1846-9419-7853-b035-f2ba0fad3d72
       HTTPS_PROXY: http://10.42.0.1:10809
@@ -87,3 +89,108 @@ jobs:
             --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
             --resume-thread-id "${resume_thread_id}" \
             --min-interactive-threads "${min_interactive_threads}"
+
+      - name: Read PostgreSQL workspace memory and goal counts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pod="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
+              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" { print $1; exit }'
+          )"
+          if [ -z "${pod}" ]; then
+            echo "::error::No running ${CODEX_DEPLOY_POD_PREFIX} pod found"
+            exit 1
+          fi
+
+          database_url="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- \
+              sh -lc 'printf %s "${CODEX_REMOTE_SQL_URL:-}"'
+          )"
+          if [ -z "${database_url}" ]; then
+            echo "::error::CODEX_REMOTE_SQL_URL is not set in ${pod}"
+            exit 1
+          fi
+
+          sql_file="$(mktemp)"
+          cat >"${sql_file}" <<SQL
+WITH counts AS (
+    SELECT 'threads' AS metric, COUNT(*)::BIGINT AS value
+    FROM threads
+    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+    UNION ALL
+    SELECT 'thread_goals', COUNT(*)::BIGINT
+    FROM thread_goals
+    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+    UNION ALL
+    SELECT 'memories', COUNT(*)::BIGINT
+    FROM memories
+    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+    UNION ALL
+    SELECT 'memory_stage1_outputs', COUNT(*)::BIGINT
+    FROM memory_stage1_outputs
+    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+    UNION ALL
+    SELECT 'memory_jobs', COUNT(*)::BIGINT
+    FROM memory_jobs
+    WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+)
+SELECT metric || '=' || value
+FROM counts
+ORDER BY metric;
+SQL
+
+          probe_name="copy-workspace-pg-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" delete pod "${probe_name}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+            rm -f "${sql_file}"
+          }
+          trap cleanup EXIT
+
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" run "${probe_name}" \
+            --image="${COPY_WORKSPACE_PG_PROBE_IMAGE}" \
+            --restart=Never \
+            --labels=app=copy-workspace-pg-probe \
+            --command -- sh -lc 'sleep 600'
+
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" wait --for=condition=Ready "pod/${probe_name}" --timeout=120s
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp \
+            "${sql_file}" \
+            "${probe_name}:/tmp/copy-workspace-counts.sql"
+
+          counts="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec "${probe_name}" -- env \
+              DATABASE_URL="${database_url}" \
+              sh -lc 'psql "$DATABASE_URL" -Atf /tmp/copy-workspace-counts.sql'
+          )"
+
+          printf '%s\n' "${counts}"
+
+          threads=0
+          thread_goals=0
+          memories=0
+          memory_stage1_outputs=0
+          memory_jobs=0
+          while IFS='=' read -r metric value; do
+            case "${metric}" in
+              threads) threads="${value}" ;;
+              thread_goals) thread_goals="${value}" ;;
+              memories) memories="${value}" ;;
+              memory_stage1_outputs) memory_stage1_outputs="${value}" ;;
+              memory_jobs) memory_jobs="${value}" ;;
+            esac
+          done <<< "${counts}"
+
+          if [ "${threads}" -lt 100 ]; then
+            echo "::error::Expected at least 100 Postgres threads for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got ${threads}"
+            exit 1
+          fi
+          if [ "${thread_goals}" -lt 1 ]; then
+            echo "::error::Expected Postgres thread goals for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got ${thread_goals}"
+            exit 1
+          fi
+          if [ "${memories}" -lt 1 ] && [ "${memory_stage1_outputs}" -lt 1 ]; then
+            echo "::error::Expected PostgreSQL-backed memories for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got memories=${memories} memory_stage1_outputs=${memory_stage1_outputs}"
+            exit 1
+          fi
