@@ -607,6 +607,9 @@ mod config_errors;
 mod request_errors;
 mod thread_delete;
 mod thread_goal_processor;
+#[cfg(test)]
+#[path = "request_processors/thread_goal_processor_tests.rs"]
+mod thread_goal_processor_tests;
 mod thread_lifecycle;
 mod thread_resume_redaction;
 mod thread_summary;
