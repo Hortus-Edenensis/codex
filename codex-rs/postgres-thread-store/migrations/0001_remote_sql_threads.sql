@@ -116,14 +116,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE TABLE IF NOT EXISTS thread_goals (
     thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
-    goal_id TEXT NOT NULL,
     objective TEXT NOT NULL,
     status TEXT NOT NULL,
-    token_budget BIGINT,
-    tokens_used BIGINT NOT NULL DEFAULT 0,
-    time_used_seconds BIGINT NOT NULL DEFAULT 0,
-    created_at_ms BIGINT NOT NULL,
-    updated_at_ms BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
