@@ -2960,7 +2960,7 @@ impl ThreadRequestProcessor {
             &thread_history,
             &mut request_overrides,
             &mut typesafe_overrides,
-            resume_source_thread.as_deref(),
+            resume_source_thread.as_ref(),
         )
         .await;
 
