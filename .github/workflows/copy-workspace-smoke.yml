@@ -115,91 +115,272 @@ jobs:
 
           sql_file="$(mktemp)"
           cat >"${sql_file}" <<SQL
-          WITH params AS (
-              SELECT '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'::TEXT AS workspace_id
-          ),
-          schema_capabilities AS (
+          CREATE TEMP TABLE probe_results (
+              metric TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+          );
+
+          DO \$probe\$
+          DECLARE
+              workspace TEXT := '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}';
+              value_count BIGINT := 0;
+              route TEXT := 'none';
+          BEGIN
+              INSERT INTO probe_results (metric, value)
               SELECT
-                  EXISTS (
+                  'columns_' || table_name,
+                  string_agg(column_name, ',' ORDER BY ordinal_position)
+              FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name IN (
+                    'threads',
+                    'sessions',
+                    'thread_events',
+                    'thread_goals',
+                    'memories',
+                    'memory_stage1_outputs',
+                    'memory_jobs'
+                )
+              GROUP BY table_name;
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  IF EXISTS (
                       SELECT 1
                       FROM information_schema.columns
                       WHERE table_schema = 'public'
                         AND table_name = 'threads'
                         AND column_name = 'workspace_id'
-                  ) AS threads_has_workspace_id,
-                  EXISTS (
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.threads WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'threads.workspace_id';
+                  ELSIF to_regclass('public.sessions') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'sessions'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.threads t
+                           JOIN public.sessions s ON s.id = t.session_id
+                           WHERE s.workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'sessions.workspace_id';
+                  ELSIF to_regclass('public.thread_events') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'thread_events'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(DISTINCT thread_id)
+                           FROM public.thread_events
+                           WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_events.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('threads', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('threads_workspace_route', route);
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.thread_goals') IS NOT NULL THEN
+                  IF EXISTS (
                       SELECT 1
                       FROM information_schema.columns
                       WHERE table_schema = 'public'
-                        AND table_name = 'sessions'
+                        AND table_name = 'thread_goals'
                         AND column_name = 'workspace_id'
-                  ) AS sessions_has_workspace_id
-          ),
-          counts AS (
-              SELECT
-                  'threads' AS metric,
-                  CASE
-                      WHEN schema_capabilities.threads_has_workspace_id THEN (
-                          SELECT COUNT(*)::BIGINT
-                          FROM threads, params
-                          WHERE threads.workspace_id = params.workspace_id
-                      )
-                      WHEN schema_capabilities.sessions_has_workspace_id THEN (
-                          SELECT COUNT(*)::BIGINT
-                          FROM threads
-                          JOIN sessions ON sessions.id = threads.session_id,
-                               params
-                          WHERE sessions.workspace_id = params.workspace_id
-                      )
-                      ELSE NULL::BIGINT
-                  END AS value
-              FROM schema_capabilities
-              UNION ALL
-              SELECT
-                  'thread_goals',
-                  CASE
-                      WHEN schema_capabilities.threads_has_workspace_id THEN (
-                          SELECT COUNT(*)::BIGINT
-                          FROM thread_goals
-                          JOIN threads ON threads.id = thread_goals.thread_id,
-                               params
-                          WHERE threads.workspace_id = params.workspace_id
-                      )
-                      WHEN schema_capabilities.sessions_has_workspace_id THEN (
-                          SELECT COUNT(*)::BIGINT
-                          FROM thread_goals
-                          JOIN threads ON threads.id = thread_goals.thread_id
-                          JOIN sessions ON sessions.id = threads.session_id,
-                               params
-                          WHERE sessions.workspace_id = params.workspace_id
-                      )
-                      ELSE NULL::BIGINT
-                  END
-              FROM schema_capabilities
-              UNION ALL
-              SELECT 'memories', COUNT(*)::BIGINT
-              FROM memories, params
-              WHERE memories.workspace_id = params.workspace_id
-              UNION ALL
-              SELECT 'memory_stage1_outputs', COUNT(*)::BIGINT
-              FROM memory_stage1_outputs, params
-              WHERE memory_stage1_outputs.workspace_id = params.workspace_id
-              UNION ALL
-              SELECT 'memory_jobs', COUNT(*)::BIGINT
-              FROM memory_jobs, params
-              WHERE memory_jobs.workspace_id = params.workspace_id
-              UNION ALL
-              SELECT
-                  'threads_workspace_route',
-                  CASE
-                      WHEN schema_capabilities.threads_has_workspace_id THEN 1::BIGINT
-                      WHEN schema_capabilities.sessions_has_workspace_id THEN 2::BIGINT
-                      ELSE 0::BIGINT
-                  END
-              FROM schema_capabilities
-          )
-          SELECT metric || '=' || COALESCE(value::TEXT, 'null')
-          FROM counts
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.thread_goals WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_goals.workspace_id';
+                  ELSIF to_regclass('public.threads') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'threads'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.thread_goals g
+                           JOIN public.threads t ON t.id = g.thread_id
+                           WHERE t.workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'threads.workspace_id';
+                  ELSIF to_regclass('public.sessions') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'sessions'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.thread_goals g
+                           JOIN public.threads t ON t.id = g.thread_id
+                           JOIN public.sessions s ON s.id = t.session_id
+                           WHERE s.workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'sessions.workspace_id';
+                  ELSIF to_regclass('public.thread_events') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'thread_events'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.thread_goals g
+                           JOIN (
+                               SELECT DISTINCT thread_id
+                               FROM public.thread_events
+                               WHERE workspace_id = $1
+                           ) visible_threads USING (thread_id)'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_events.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('thread_goals', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('thread_goals_route', route);
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.memories') IS NOT NULL THEN
+                  IF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memories'
+                        AND column_name = 'workspace_id'
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.memories WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'memories.workspace_id';
+                  ELSIF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memories'
+                        AND column_name = 'thread_id'
+                  ) AND to_regclass('public.thread_events') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'thread_events'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.memories m
+                           JOIN (
+                               SELECT DISTINCT thread_id
+                               FROM public.thread_events
+                               WHERE workspace_id = $1
+                           ) visible_threads ON visible_threads.thread_id = m.thread_id'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_events.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('memories', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('memories_route', route);
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.memory_stage1_outputs') IS NOT NULL THEN
+                  IF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memory_stage1_outputs'
+                        AND column_name = 'workspace_id'
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.memory_stage1_outputs
+                           WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'memory_stage1_outputs.workspace_id';
+                  ELSIF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memory_stage1_outputs'
+                        AND column_name = 'thread_id'
+                  ) AND to_regclass('public.thread_events') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'thread_events'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.memory_stage1_outputs m
+                           JOIN (
+                               SELECT DISTINCT thread_id
+                               FROM public.thread_events
+                               WHERE workspace_id = $1
+                           ) visible_threads ON visible_threads.thread_id = m.thread_id'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_events.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('memory_stage1_outputs', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('memory_stage1_outputs_route', route);
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.memory_jobs') IS NOT NULL THEN
+                  IF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memory_jobs'
+                        AND column_name = 'workspace_id'
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.memory_jobs WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'memory_jobs.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('memory_jobs', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('memory_jobs_route', route);
+          END
+          \$probe\$;
+
+          SELECT metric || '=' || value
+          FROM probe_results
           ORDER BY metric;
           SQL
 
@@ -234,7 +415,7 @@ jobs:
           memories=0
           memory_stage1_outputs=0
           memory_jobs=0
-          threads_workspace_route=0
+          threads_workspace_route=none
           while IFS='=' read -r metric value; do
             case "${metric}" in
               threads) threads="${value}" ;;
@@ -247,9 +428,10 @@ jobs:
           done <<< "${counts}"
 
           case "${threads_workspace_route}" in
-            1) echo "Postgres probe filtered threads directly by threads.workspace_id" ;;
-            2) echo "Postgres probe filtered threads via sessions.workspace_id fallback" ;;
-            0) echo "::warning::Postgres probe could not detect a workspace_id column on threads or sessions" ;;
+            threads.workspace_id) echo "Postgres probe filtered threads directly by threads.workspace_id" ;;
+            sessions.workspace_id) echo "Postgres probe filtered threads via sessions.workspace_id fallback" ;;
+            thread_events.workspace_id) echo "Postgres probe filtered threads via thread_events.workspace_id fallback" ;;
+            none) echo "::warning::Postgres probe could not detect a workspace filter path for threads" ;;
           esac
 
           if [ "${threads}" -lt 100 ]; then
