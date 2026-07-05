@@ -28,7 +28,7 @@ env:
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   CARGO_PROFILE_RELEASE_DEBUG: "0"
   CARGO_PROFILE_RELEASE_LTO: "false"
-  CODEX_REMOTE_SQL_DEFAULT_VERSION: "0.142.5-patch-1"
+  CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE: "0.142.5"
   RUST_MIN_STACK: "8388608"
 
 jobs:
@@ -37,6 +37,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       codex_sha256: ${{ steps.stage-release.outputs.codex_sha256 }}
+      release_version: ${{ steps.embed-release.outputs.release_version }}
     defaults:
       run:
         working-directory: codex-rs
@@ -54,6 +55,7 @@ jobs:
             pkg-config \
             protobuf-compiler
       - name: Embed release version
+        id: embed-release
         env:
           INPUT_RELEASE_VERSION: ${{ github.event.inputs.release_version }}
         run: |
@@ -63,12 +65,13 @@ jobs:
             release_version="${BASH_REMATCH[1]}"
           fi
           if [ -z "${release_version}" ]; then
-            release_version="${CODEX_REMOTE_SQL_DEFAULT_VERSION}"
+            release_version="${CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE}-remote-sql.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:12}"
           fi
           if [[ ! "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*$ ]]; then
             echo "::error::release_version must be a Cargo-compatible semver value: ${release_version}"
             exit 1
           fi
+          echo "release_version=${release_version}" >> "${GITHUB_OUTPUT}"
           sed -i "s/^version = \"0\.0\.0\"$/version = \"${release_version}\"/" Cargo.toml
           grep -qx "version = \"${release_version}\"" Cargo.toml
           cargo metadata --format-version 1 --no-deps >/dev/null
@@ -115,6 +118,7 @@ jobs:
       CODEX_DEPLOY_NAMESPACE: codex-internal
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
       CODEX_DEPLOY_RELEASE_NAME: remote-sql-e1b36e9caa-x86_64-unknown-linux-gnu
+      CODEX_DEPLOY_RELEASE_TAG: ${{ needs.linux-cargo-build.outputs.release_version }}
       EXPECTED_CODEX_SHA256: ${{ needs.linux-cargo-build.outputs.codex_sha256 }}
       HTTPS_PROXY: http://10.42.0.1:10809
       HTTP_PROXY: http://10.42.0.1:10809
@@ -155,12 +159,18 @@ jobs:
           pod_artifact="/tmp/codex-${EXPECTED_CODEX_SHA256}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp "${artifact}" "${pod}:${pod_artifact}" -c "${CODEX_DEPLOY_CONTAINER}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -s -- \
-            "${EXPECTED_CODEX_SHA256}" "${CODEX_DEPLOY_RELEASE_NAME}" "${pod_artifact}" <<'POD_SCRIPT'
+            "${EXPECTED_CODEX_SHA256}" "${CODEX_DEPLOY_RELEASE_NAME}" "${pod_artifact}" "${CODEX_DEPLOY_RELEASE_TAG}" \
+            "${GITHUB_SHA}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_REF_NAME}" <<'POD_SCRIPT'
           set -eu
 
           expected_sha256="$1"
           release_name="$2"
           src="$3"
+          release_tag="$4"
+          github_sha="$5"
+          github_run_id="$6"
+          github_run_attempt="$7"
+          github_ref_name="$8"
 
           actual_line="$(sha256sum "${src}")"
           actual_sha256="${actual_line%% *}"
@@ -184,6 +194,20 @@ jobs:
             chmod 0755 "${tmp}"
             mv -f "${tmp}" "${dest}"
             sha256sum "${dest}"
+          done
+
+          for tag_dir in \
+            "/home/codex/.codex/packages/standalone/current" \
+            "/home/codex/.codex/packages/standalone/releases/${release_name}" \
+            "/workspace/shared-state/.git/codex-persist/codex-standalone/releases/${release_name}"
+          do
+            mkdir -p "${tag_dir}"
+            printf 'release_version=%s\ngit_sha=%s\nrun_id=%s\nrun_attempt=%s\nref_name=%s\n' \
+              "${release_tag}" \
+              "${github_sha}" \
+              "${github_run_id}" \
+              "${github_run_attempt}" \
+              "${github_ref_name}" > "${tag_dir}/REMOTE_SQL_BUILD_TAG"
           done
 
           for proc in /proc/[0-9]*; do
