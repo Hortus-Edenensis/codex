@@ -6,6 +6,16 @@ on:
       - remote-sql-postgres-workspace
   workflow_dispatch:
     inputs:
+      operation:
+        description: "Operation to run: smoke, delete-thread, or unarchive-thread."
+        required: false
+        type: string
+        default: smoke
+      target_thread_id:
+        description: Thread id used by delete-thread and unarchive-thread operations.
+        required: false
+        type: string
+        default: ""
       resume_thread_id:
         description: Known Postgres-backed thread id to validate with thread/read and thread/resume.
         required: false
@@ -24,6 +34,7 @@ jobs:
   smoke-copy-workspace:
     name: Smoke test deployed copy workspace
     runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
+    timeout-minutes: 20
     env:
       ALL_PROXY: http://10.42.0.1:10809
       CODEX_DEPLOY_CONTAINER: workspace
@@ -47,6 +58,12 @@ jobs:
           set -euo pipefail
 
           python3 --version
+
+          operation="${{ github.event.inputs.operation }}"
+          if [ -z "${operation}" ]; then
+            operation="smoke"
+          fi
+          target_thread_id="${{ github.event.inputs.target_thread_id }}"
 
           resume_thread_id="${{ github.event.inputs.resume_thread_id }}"
           if [ -z "${resume_thread_id}" ]; then
@@ -83,6 +100,39 @@ jobs:
             fi
           '
 
+          if [ "${operation}" = "delete-thread" ]; then
+            if [ -z "${target_thread_id}" ]; then
+              echo "::error::target_thread_id is required for operation=delete-thread"
+              exit 1
+            fi
+            python3 "${smoke_script}" \
+              --namespace "${CODEX_DEPLOY_NAMESPACE}" \
+              --pod "${pod}" \
+              --container "${CODEX_DEPLOY_CONTAINER}" \
+              --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
+              --delete-only-thread-id "${target_thread_id}"
+            exit 0
+          fi
+
+          if [ "${operation}" = "unarchive-thread" ]; then
+            if [ -z "${target_thread_id}" ]; then
+              echo "::error::target_thread_id is required for operation=unarchive-thread"
+              exit 1
+            fi
+            python3 "${smoke_script}" \
+              --namespace "${CODEX_DEPLOY_NAMESPACE}" \
+              --pod "${pod}" \
+              --container "${CODEX_DEPLOY_CONTAINER}" \
+              --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
+              --unarchive-only-thread-id "${target_thread_id}"
+            exit 0
+          fi
+
+          if [ "${operation}" != "smoke" ]; then
+            echo "::error::Unsupported operation ${operation}"
+            exit 1
+          fi
+
           summary_path="${RUNNER_TEMP}/copy-workspace-smoke-summary.json"
           python3 "${smoke_script}" \
             --namespace "${CODEX_DEPLOY_NAMESPACE}" \
@@ -108,6 +158,7 @@ jobs:
           PY
 
       - name: Read PostgreSQL workspace memory and goal counts
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.operation == '' || github.event.inputs.operation == 'smoke' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -505,7 +556,7 @@ jobs:
           fi
 
       - name: Delete retained smoke thread
-        if: ${{ always() && steps.control_plane_smoke.outputs.smoke_thread_id != '' }}
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || github.event.inputs.operation == '' || github.event.inputs.operation == 'smoke') && steps.control_plane_smoke.outputs.smoke_thread_id != '' }}
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}

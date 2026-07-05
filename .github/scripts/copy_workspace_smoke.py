@@ -319,12 +319,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--pod", required=True)
     parser.add_argument("--container", required=True)
-    parser.add_argument("--resume-thread-id", required=True)
+    parser.add_argument("--resume-thread-id")
     parser.add_argument("--min-interactive-threads", type=int, default=8)
     parser.add_argument("--request-timeout-seconds", type=float, default=REQUEST_TIMEOUT_SECONDS)
     parser.add_argument("--keep-smoke-thread", action="store_true")
     parser.add_argument("--summary-json-path")
     parser.add_argument("--delete-only-thread-id")
+    parser.add_argument("--unarchive-only-thread-id")
     return parser.parse_args()
 
 
@@ -357,7 +358,18 @@ def delete_thread(args: argparse.Namespace, thread_id: str) -> None:
         print(f"step: thread/delete ok threadId={thread_id}", flush=True)
 
 
+def unarchive_thread(args: argparse.Namespace, thread_id: str) -> None:
+    command = proxy_command(args)
+    with ProxyWebSocketClient(command, args.request_timeout_seconds) as client:
+        client.initialize()
+        client.request("thread/unarchive", {"threadId": thread_id})
+        print(f"step: thread/unarchive ok threadId={thread_id}", flush=True)
+
+
 def run_smoke(args: argparse.Namespace) -> SmokeSummary:
+    if not isinstance(args.resume_thread_id, str) or not args.resume_thread_id:
+        raise SmokeError("--resume-thread-id is required for smoke mode")
+
     command = proxy_command(args)
     smoke_thread_id: Optional[str] = None
     smoke_goal_objective = f"copy-workspace smoke goal persistence {int(time.time())}"
@@ -506,6 +518,9 @@ def main() -> int:
     args = parse_args()
     if args.delete_only_thread_id is not None:
         delete_thread(args, args.delete_only_thread_id)
+        return 0
+    if args.unarchive_only_thread_id is not None:
+        unarchive_thread(args, args.unarchive_only_thread_id)
         return 0
 
     summary = run_smoke(args)

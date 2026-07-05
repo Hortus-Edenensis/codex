@@ -18,7 +18,7 @@ on:
 
 concurrency:
   group: remote-sql-build-${{ github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -36,6 +36,7 @@ jobs:
   linux-cargo-build:
     name: Linux remote SQL cargo build
     runs-on: ubuntu-22.04
+    timeout-minutes: 75
     outputs:
       codex_sha256: ${{ steps.stage-release.outputs.codex_sha256 }}
       release_version: ${{ steps.embed-release.outputs.release_version }}
@@ -111,6 +112,7 @@ jobs:
   deploy-copy-workspace:
     name: Deploy remote SQL artifact to copy workspace
     runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
+    timeout-minutes: 20
     needs: linux-cargo-build
     if: ${{ github.event_name == 'push' || inputs.deploy == true }}
     env:
@@ -242,6 +244,7 @@ jobs:
   smoke-copy-workspace:
     name: Smoke test copy workspace resume and goals
     runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
+    timeout-minutes: 20
     needs: deploy-copy-workspace
     env:
       ALL_PROXY: http://10.42.0.1:10809
