@@ -1,0 +1,81 @@
+name: copy-workspace-smoke
+
+on:
+  push:
+    branches:
+      - remote-sql-postgres-workspace
+  workflow_dispatch:
+    inputs:
+      resume_thread_id:
+        description: Known Postgres-backed thread id to validate with thread/read and thread/resume.
+        required: false
+        type: string
+        default: 019f1846-9419-7853-b035-f2ba0fad3d72
+      min_interactive_threads:
+        description: Minimum interactive thread count expected from thread/list.
+        required: false
+        type: string
+        default: "8"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-copy-workspace:
+    name: Smoke test deployed copy workspace
+    runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
+    env:
+      ALL_PROXY: http://10.42.0.1:10809
+      CODEX_DEPLOY_CONTAINER: workspace
+      CODEX_DEPLOY_NAMESPACE: codex-internal
+      CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
+      COPY_WORKSPACE_MIN_INTERACTIVE_THREADS: "8"
+      COPY_WORKSPACE_RESUME_THREAD_ID: 019f1846-9419-7853-b035-f2ba0fad3d72
+      HTTPS_PROXY: http://10.42.0.1:10809
+      HTTP_PROXY: http://10.42.0.1:10809
+      NO_PROXY: 127.0.0.1,localhost,10.0.0.0/8,10.42.0.0/16,202.189.11.100
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Smoke test copy workspace control plane
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 --version
+
+          resume_thread_id="${{ github.event.inputs.resume_thread_id }}"
+          if [ -z "${resume_thread_id}" ]; then
+            resume_thread_id="${COPY_WORKSPACE_RESUME_THREAD_ID}"
+          fi
+
+          min_interactive_threads="${{ github.event.inputs.min_interactive_threads }}"
+          if [ -z "${min_interactive_threads}" ]; then
+            min_interactive_threads="${COPY_WORKSPACE_MIN_INTERACTIVE_THREADS}"
+          fi
+
+          pod="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
+              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" { print $1; exit }'
+          )"
+          if [ -z "${pod}" ]; then
+            echo "::error::No running ${CODEX_DEPLOY_POD_PREFIX} pod found"
+            exit 1
+          fi
+
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -lc '
+            release_tag_file="/home/codex/.codex/packages/standalone/current/REMOTE_SQL_BUILD_TAG"
+            if [ -f "${release_tag_file}" ]; then
+              echo "== current deployed release =="
+              cat "${release_tag_file}"
+            fi
+          '
+
+          python3 .github/scripts/copy_workspace_smoke.py \
+            --namespace "${CODEX_DEPLOY_NAMESPACE}" \
+            --pod "${pod}" \
+            --container "${CODEX_DEPLOY_CONTAINER}" \
+            --resume-thread-id "${resume_thread_id}" \
+            --min-interactive-threads "${min_interactive_threads}"
