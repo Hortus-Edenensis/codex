@@ -1899,9 +1899,7 @@ async fn ensure_shared_migrations(pool: PgPool, scope_key: u64) -> ThreadStoreRe
                 MigrationGateState::Failed(message) => {
                     let message = message.clone();
                     *state = MigrationGateState::Pending;
-                    return Err(ThreadStoreError::Internal {
-                        message,
-                    });
+                    return Err(ThreadStoreError::Internal { message });
                 }
                 MigrationGateState::Succeeded => return Ok(()),
             }
@@ -1916,11 +1914,9 @@ async fn ensure_shared_migrations(pool: PgPool, scope_key: u64) -> ThreadStoreRe
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *state = match result {
                     Ok(()) => MigrationGateState::Succeeded,
-                    Err(err) => {
-                        MigrationGateState::Failed(format!(
-                            "failed to apply remote SQL migrations: {err}"
-                        ))
-                    }
+                    Err(err) => MigrationGateState::Failed(format!(
+                        "failed to apply remote SQL migrations: {err}"
+                    )),
                 };
                 drop(state);
                 gate.notify.notify_waiters();
