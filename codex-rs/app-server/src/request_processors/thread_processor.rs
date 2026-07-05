@@ -328,6 +328,40 @@ fn merge_persisted_approvals_reviewer(
             });
 }
 
+fn merge_stored_thread_resume_metadata(
+    request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &mut ConfigOverrides,
+    stored_thread: &StoredThread,
+) {
+    if has_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
+        return;
+    }
+
+    typesafe_overrides.model = stored_thread.model.clone();
+    typesafe_overrides.model_provider = Some(stored_thread.model_provider.clone());
+
+    if let Some(reasoning_effort) = stored_thread.reasoning_effort.as_ref() {
+        request_overrides.get_or_insert_with(HashMap::new).insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String(reasoning_effort.to_string()),
+        );
+    }
+}
+
+fn resolve_thread_list_model_providers(
+    requested_model_providers: Option<Vec<String>>,
+    relation_filter_present: bool,
+    uses_postgres_thread_store: bool,
+    default_model_provider: &str,
+) -> Option<Vec<String>> {
+    match requested_model_providers {
+        Some(providers) if providers.is_empty() => None,
+        Some(providers) => Some(providers),
+        None if relation_filter_present || uses_postgres_thread_store => None,
+        None => Some(vec![default_model_provider.to_string()]),
+    }
+}
+
 fn normalize_thread_list_cwd_filters(
     cwd: Option<ThreadListCwdFilter>,
 ) -> Result<Option<Vec<PathBuf>>, JSONRPCErrorError> {
@@ -2926,6 +2960,7 @@ impl ThreadRequestProcessor {
             &thread_history,
             &mut request_overrides,
             &mut typesafe_overrides,
+            resume_source_thread.as_deref(),
         )
         .await;
 
@@ -3118,23 +3153,38 @@ impl ThreadRequestProcessor {
         thread_history: &InitialHistory,
         request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: &mut ConfigOverrides,
-    ) -> Option<ThreadMetadata> {
+        resume_source_thread: Option<&StoredThread>,
+    ) {
         merge_persisted_approvals_reviewer(
             thread_history,
             request_overrides.as_ref(),
             typesafe_overrides,
         );
         let InitialHistory::Resumed(resumed_history) = thread_history else {
-            return None;
+            return;
         };
-        let state_db_ctx = self.state_db.clone()?;
-        let persisted_metadata = state_db_ctx
-            .get_thread(resumed_history.conversation_id)
-            .await
-            .ok()
-            .flatten()?;
-        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
-        Some(persisted_metadata)
+        if let Some(state_db_ctx) = self.state_db.clone()
+            && let Some(persisted_metadata) = state_db_ctx
+                .get_thread(resumed_history.conversation_id)
+                .await
+                .ok()
+                .flatten()
+        {
+            merge_persisted_resume_metadata(
+                request_overrides,
+                typesafe_overrides,
+                &persisted_metadata,
+            );
+            return;
+        }
+
+        if let Some(stored_thread) = resume_source_thread {
+            merge_stored_thread_resume_metadata(
+                request_overrides,
+                typesafe_overrides,
+                stored_thread,
+            );
+        }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -4074,17 +4124,15 @@ impl ThreadRequestProcessor {
         let mut items = Vec::with_capacity(requested_page_size);
         let mut next_cursor: Option<String> = None;
 
-        let model_provider_filter = match model_providers {
-            Some(providers) => {
-                if providers.is_empty() {
-                    None
-                } else {
-                    Some(providers)
-                }
-            }
-            None if relation_filter.is_some() => None,
-            None => Some(vec![self.config.model_provider_id.clone()]),
-        };
+        let model_provider_filter = resolve_thread_list_model_providers(
+            model_providers,
+            relation_filter.is_some(),
+            matches!(
+                &self.config.experimental_thread_store,
+                codex_core::config::ThreadStoreConfig::Postgres { .. }
+            ),
+            self.config.model_provider_id.as_str(),
+        );
         let (allowed_sources_vec, source_kind_filter) =
             if relation_filter.is_some() && source_kinds.is_none() {
                 (Vec::new(), None)

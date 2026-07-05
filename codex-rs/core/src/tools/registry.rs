@@ -356,7 +356,23 @@ impl ToolRegistry {
     }
 
     fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
-        self.tools.get(name).map(Arc::clone)
+        if let Some(tool) = self.tools.get(name) {
+            return Some(Arc::clone(tool));
+        }
+        if name.namespace.is_some() {
+            return None;
+        }
+
+        let mut matches = self
+            .tools
+            .iter()
+            .filter(|(tool_name, _)| flat_tool_name(tool_name).as_ref() == name.name)
+            .map(|(_, tool)| Arc::clone(tool));
+        let first_match = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first_match)
     }
 
     #[cfg(test)]

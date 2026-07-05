@@ -179,6 +179,26 @@ fn handler_looks_up_namespaced_aliases_explicitly() {
     );
 }
 
+#[test]
+fn handler_looks_up_flattened_namespaced_tool_name() {
+    let namespaced_name = codex_tools::ToolName::namespaced("codex_app", "read_thread");
+    let handler = Arc::new(TestHandler {
+        tool_name: namespaced_name.clone(),
+    }) as Arc<dyn CoreToolRuntime>;
+    let registry = ToolRegistry::new(HashMap::from([(
+        namespaced_name.clone(),
+        Arc::clone(&handler),
+    )]));
+
+    let flattened = registry.tool(&codex_tools::ToolName::plain("codex_appread_thread"));
+
+    assert!(
+        flattened
+            .as_ref()
+            .is_some_and(|resolved| Arc::ptr_eq(resolved, &handler))
+    );
+}
+
 #[tokio::test]
 async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::Result<()> {
     let (session, turn) = crate::session::tests::make_session_and_context().await;

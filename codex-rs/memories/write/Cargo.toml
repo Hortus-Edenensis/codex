@@ -29,6 +29,7 @@ codex-rollout-trace = { workspace = true }
 codex-secrets = { workspace = true }
 codex-state = { workspace = true }
 codex-terminal-detection = { workspace = true }
+codex-thread-store = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-output-truncation = { workspace = true }
 codex-utils-template = { workspace = true }

@@ -103,16 +103,17 @@ WHERE workspace_id = $1
   AND archived_at IS NULL
   AND source = ANY($2)
   AND memory_mode = 'enabled'
-  AND history_mode = 'legacy'
-  AND id != $3
-  AND updated_at >= $4
-  AND updated_at <= $5
+  AND history_mode = ANY($3)
+  AND id != $4
+  AND updated_at >= $5
+  AND updated_at <= $6
 ORDER BY updated_at DESC
-LIMIT $6
+LIMIT $7
                 "#,
             )
             .bind(workspace_id)
             .bind(allowed_sources)
+            .bind(generated_memory_history_mode_keys())
             .bind(current_thread_id)
             .bind(max_age_cutoff)
             .bind(idle_cutoff)
@@ -230,21 +231,22 @@ JOIN threads
  AND threads.id = so.thread_id
 WHERE so.workspace_id = $1
   AND threads.memory_mode = 'enabled'
-  AND threads.history_mode = 'legacy'
+  AND threads.history_mode = ANY($2)
   AND (length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0)
   AND (
-    (so.last_usage IS NOT NULL AND so.last_usage >= $2)
-    OR (so.last_usage IS NULL AND so.source_updated_at >= $2)
+    (so.last_usage IS NOT NULL AND so.last_usage >= $3)
+    OR (so.last_usage IS NULL AND so.source_updated_at >= $3)
   )
 ORDER BY
     COALESCE(so.usage_count, 0) DESC,
     COALESCE(so.last_usage, so.source_updated_at) DESC,
     so.source_updated_at DESC,
     so.thread_id DESC
-LIMIT $3
+LIMIT $4
                 "#,
             )
             .bind(workspace_id)
+            .bind(generated_memory_history_mode_keys())
             .bind(cutoff)
             .bind(i64::try_from(n).unwrap_or(i64::MAX))
             .fetch_all(pool)
@@ -1261,6 +1263,10 @@ fn remote_rollout_path(workspace_id: &str, thread_id: &ThreadId) -> PathBuf {
     PathBuf::from(format!(
         "/remote-sql/workspaces/{workspace_id}/threads/{thread_id}.jsonl"
     ))
+}
+
+fn generated_memory_history_mode_keys() -> Vec<String> {
+    vec!["legacy".to_string(), "paginated".to_string()]
 }
 
 fn new_memory_ownership_token(prefix: &str) -> String {
