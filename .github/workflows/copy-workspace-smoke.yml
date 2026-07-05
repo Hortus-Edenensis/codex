@@ -114,15 +114,15 @@ jobs:
           fi
 
           sql_file="$(mktemp)"
-          cat >"${sql_file}" <<SQL
+          cat >"${sql_file}" <<'SQL'
           CREATE TEMP TABLE probe_results (
               metric TEXT PRIMARY KEY,
               value TEXT NOT NULL
           );
 
-          DO \$probe\$
+          DO $probe$
           DECLARE
-              workspace TEXT := '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}';
+              workspace TEXT := :'workspace_id';
               value_count BIGINT := 0;
               route TEXT := 'none';
           BEGIN
@@ -377,7 +377,7 @@ jobs:
               INSERT INTO probe_results (metric, value) VALUES ('memory_jobs', value_count::TEXT);
               INSERT INTO probe_results (metric, value) VALUES ('memory_jobs_route', route);
           END
-          \$probe\$;
+          $probe$;
 
           SELECT metric || '=' || value
           FROM probe_results
@@ -405,7 +405,7 @@ jobs:
           counts="$(
             kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec "${probe_name}" -- env \
               DATABASE_URL="${database_url}" \
-              sh -lc 'psql "$DATABASE_URL" -Atf /tmp/copy-workspace-counts.sql'
+              sh -lc 'psql -v ON_ERROR_STOP=1 -v workspace_id='"'"'"${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}"'"'"' "$DATABASE_URL" -Atf /tmp/copy-workspace-counts.sql'
           )"
 
           printf '%s\n' "${counts}"
