@@ -11,6 +11,11 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Tuple
 
 
 HANDSHAKE_TIMEOUT_SECONDS = 20.0
@@ -28,13 +33,13 @@ class SmokeSummary:
     known_thread_id: str
     smoke_thread_id: str
     smoke_goal_objective: str
-    codex_home: str | None
+    codex_home: Optional[str]
 
 
 class ProxyWebSocketClient:
-    def __init__(self, command: list[str]) -> None:
+    def __init__(self, command: List[str]) -> None:
         self.command = command
-        self.process: subprocess.Popen[bytes] | None = None
+        self.process: Optional[subprocess.Popen] = None
         self.buffer = bytearray()
         self.next_request_id = 1
 
@@ -93,10 +98,10 @@ class ProxyWebSocketClient:
         self.notify("initialized", {})
         return response
 
-    def request(self, method: str, params: dict | None = None) -> dict:
+    def request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload: dict[str, object] = {"method": method, "id": request_id}
+        payload: Dict[str, Any] = {"method": method, "id": request_id}
         if params is not None:
             payload["params"] = params
         self.send_json(payload)
@@ -116,16 +121,16 @@ class ProxyWebSocketClient:
             if "method" in message and "id" in message:
                 self._reject_server_request(message)
 
-    def notify(self, method: str, params: dict | None = None) -> None:
-        payload: dict[str, object] = {"method": method}
+    def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {"method": method}
         if params is not None:
             payload["params"] = params
         self.send_json(payload)
 
-    def send_json(self, payload: dict[str, object]) -> None:
+    def send_json(self, payload: Dict[str, Any]) -> None:
         self._send_frame(0x1, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
 
-    def recv_json(self, deadline: float) -> dict:
+    def recv_json(self, deadline: float) -> Dict[str, Any]:
         while True:
             opcode, payload = self._recv_frame(deadline)
             if opcode == 0x8:
@@ -176,7 +181,7 @@ class ProxyWebSocketClient:
                 f"websocket handshake failed: {first_line}\nproxy stderr:\n{stderr_text}"
             )
 
-    def _recv_frame(self, deadline: float) -> tuple[int, bytes]:
+    def _recv_frame(self, deadline: float) -> Tuple[int, bytes]:
         self._fill_buffer(deadline, min_bytes=2)
         first, second = self.buffer[0], self.buffer[1]
         del self.buffer[:2]
@@ -268,7 +273,7 @@ class ProxyWebSocketClient:
             return ""
         try:
             stderr_fd = self.process.stderr.fileno()
-            chunks: list[bytes] = []
+            chunks: List[bytes] = []
             while True:
                 ready, _, _ = select.select([stderr_fd], [], [], 0)
                 if not ready:
@@ -281,7 +286,7 @@ class ProxyWebSocketClient:
         except Exception:
             return ""
 
-    def _reject_server_request(self, message: dict) -> None:
+    def _reject_server_request(self, message: Dict[str, Any]) -> None:
         request_id = message.get("id")
         if request_id is None:
             return
@@ -308,7 +313,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def proxy_command(args: argparse.Namespace) -> list[str]:
+def proxy_command(args: argparse.Namespace) -> List[str]:
     proxy_shell = (
         "env HOME=/home/codex USER=codex LOGNAME=codex "
         'su -m codex -c "/home/codex/.codex/packages/standalone/current/bin/codex app-server proxy"'
@@ -331,9 +336,9 @@ def proxy_command(args: argparse.Namespace) -> list[str]:
 
 def run_smoke(args: argparse.Namespace) -> SmokeSummary:
     command = proxy_command(args)
-    smoke_thread_id: str | None = None
+    smoke_thread_id: Optional[str] = None
     smoke_goal_objective = f"copy-workspace smoke goal persistence {int(time.time())}"
-    codex_home: str | None = None
+    codex_home: Optional[str] = None
 
     try:
         with ProxyWebSocketClient(command) as client:
