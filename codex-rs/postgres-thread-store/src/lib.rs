@@ -4,8 +4,14 @@
 //! store. It keeps the existing `ThreadStore` contract as the integration seam
 //! while making PostgreSQL the canonical history and metadata store.
 
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -54,7 +60,7 @@ use sqlx::Row;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::OnceCell;
+use tokio::sync::Notify;
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
@@ -101,11 +107,34 @@ enum PostgresThreadStoreInner {
         pool: PgPool,
         workspace_id: String,
         redis_url_env: Option<String>,
-        migrations: OnceCell<()>,
+        migration_scope_key: u64,
     },
     Unconfigured {
         message: String,
     },
+}
+
+#[derive(Debug)]
+struct MigrationGate {
+    state: StdMutex<MigrationGateState>,
+    notify: Notify,
+}
+
+#[derive(Debug)]
+enum MigrationGateState {
+    Pending,
+    Running,
+    Failed(String),
+    Succeeded,
+}
+
+impl Default for MigrationGate {
+    fn default() -> Self {
+        Self {
+            state: StdMutex::new(MigrationGateState::Pending),
+            notify: Notify::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -158,7 +187,7 @@ impl PostgresThreadStore {
                 pool,
                 workspace_id: config.default_workspace_id,
                 redis_url_env: config.redis_url_env,
-                migrations: OnceCell::new(),
+                migration_scope_key: migration_scope_key(&database_url),
             }),
         }
     }
@@ -327,11 +356,10 @@ WHERE workspace_id = $1 AND websocket_url = $2 AND account_id = $3 AND app_serve
     async fn ensure_migrated(&self) -> ThreadStoreResult<()> {
         match self.inner.as_ref() {
             PostgresThreadStoreInner::Pool {
-                pool, migrations, ..
-            } => migrations
-                .get_or_try_init(|| async { MIGRATOR.run(pool).await.map_err(internal_error) })
-                .await
-                .map(|_| ()),
+                pool,
+                migration_scope_key,
+                ..
+            } => ensure_shared_migrations(pool.clone(), *migration_scope_key).await,
             PostgresThreadStoreInner::Unconfigured { message } => {
                 Err(ThreadStoreError::InvalidRequest {
                     message: message.clone(),
@@ -1829,6 +1857,77 @@ fn remote_control_enrollment_from_row(
             .try_get("remote_control_enabled")
             .map_err(internal_error)?,
     })
+}
+
+fn migration_scope_key(database_url: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    database_url.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn migration_gates() -> &'static StdMutex<HashMap<u64, Arc<MigrationGate>>> {
+    static GATES: OnceLock<StdMutex<HashMap<u64, Arc<MigrationGate>>>> = OnceLock::new();
+    GATES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+async fn ensure_shared_migrations(pool: PgPool, scope_key: u64) -> ThreadStoreResult<()> {
+    let gate = {
+        let mut gates = migration_gates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            gates
+                .entry(scope_key)
+                .or_insert_with(|| Arc::new(MigrationGate::default())),
+        )
+    };
+
+    loop {
+        let notified = gate.notify.notified();
+        let mut start_worker = None;
+        {
+            let mut state = gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                MigrationGateState::Pending => {
+                    *state = MigrationGateState::Running;
+                    start_worker = Some(pool.clone());
+                }
+                MigrationGateState::Running => {}
+                MigrationGateState::Failed(message) => {
+                    let message = message.clone();
+                    *state = MigrationGateState::Pending;
+                    return Err(ThreadStoreError::Internal {
+                        message,
+                    });
+                }
+                MigrationGateState::Succeeded => return Ok(()),
+            }
+        }
+        if let Some(pool) = start_worker {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                let result = MIGRATOR.run(&pool).await;
+                let mut state = gate
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *state = match result {
+                    Ok(()) => MigrationGateState::Succeeded,
+                    Err(err) => {
+                        MigrationGateState::Failed(format!(
+                            "failed to apply remote SQL migrations: {err}"
+                        ))
+                    }
+                };
+                drop(state);
+                gate.notify.notify_waiters();
+            });
+        }
+        notified.await;
+    }
 }
 
 fn canonical_session_source_key(source: &SessionSource) -> ThreadStoreResult<String> {

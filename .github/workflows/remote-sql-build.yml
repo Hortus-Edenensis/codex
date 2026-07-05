@@ -201,7 +201,7 @@ jobs:
           env HOME=/home/codex USER=codex LOGNAME=codex \
             CODEX_REMOTE_SQL_URL="${CODEX_REMOTE_SQL_URL:-}" \
             CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \
-            su -m codex -c "${codex_bin} app-server daemon enable-remote-control" || true
+            su -m codex -c "${codex_bin} app-server daemon disable-remote-control" || true
           env HOME=/home/codex USER=codex LOGNAME=codex \
             CODEX_REMOTE_SQL_URL="${CODEX_REMOTE_SQL_URL:-}" \
             CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \
