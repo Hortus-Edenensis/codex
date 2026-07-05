@@ -122,7 +122,7 @@ jobs:
 
           DO $probe$
           DECLARE
-              workspace TEXT := :'workspace_id';
+              workspace TEXT := '__WORKSPACE_ID__';
               value_count BIGINT := 0;
               route TEXT := 'none';
           BEGIN
@@ -383,6 +383,8 @@ jobs:
           FROM probe_results
           ORDER BY metric;
           SQL
+          sed -i.bak "s/__WORKSPACE_ID__/${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}/g" "${sql_file}"
+          rm -f "${sql_file}.bak"
 
           probe_name="copy-workspace-pg-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() {
@@ -405,7 +407,7 @@ jobs:
           counts="$(
             kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec "${probe_name}" -- env \
               DATABASE_URL="${database_url}" \
-              sh -lc 'psql -v ON_ERROR_STOP=1 -v workspace_id='"'"'"${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}"'"'"' "$DATABASE_URL" -Atf /tmp/copy-workspace-counts.sql'
+              sh -lc 'psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -Atf /tmp/copy-workspace-counts.sql'
           )"
 
           printf '%s\n' "${counts}"
