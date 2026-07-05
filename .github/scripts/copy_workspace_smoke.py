@@ -37,8 +37,9 @@ class SmokeSummary:
 
 
 class ProxyWebSocketClient:
-    def __init__(self, command: List[str]) -> None:
+    def __init__(self, command: List[str], request_timeout_seconds: float) -> None:
         self.command = command
+        self.request_timeout_seconds = request_timeout_seconds
         self.process: Optional[subprocess.Popen] = None
         self.buffer = bytearray()
         self.next_request_id = 1
@@ -106,7 +107,7 @@ class ProxyWebSocketClient:
             payload["params"] = params
         self.send_json(payload)
 
-        deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+        deadline = time.monotonic() + self.request_timeout_seconds
         while True:
             message = self.recv_json(deadline)
             if "id" in message and message["id"] == request_id:
@@ -310,6 +311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--container", required=True)
     parser.add_argument("--resume-thread-id", required=True)
     parser.add_argument("--min-interactive-threads", type=int, default=8)
+    parser.add_argument("--request-timeout-seconds", type=float, default=REQUEST_TIMEOUT_SECONDS)
     return parser.parse_args()
 
 
@@ -341,15 +343,20 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
     codex_home: Optional[str] = None
 
     try:
-        with ProxyWebSocketClient(command) as client:
+        with ProxyWebSocketClient(command, args.request_timeout_seconds) as client:
             initialize = client.initialize()
             codex_home = initialize.get("codexHome")
+            print("step: initialize ok", flush=True)
 
             listed = client.request("thread/list", {"limit": 100, "sourceKinds": []})
             interactive_threads = listed.get("data")
             if not isinstance(interactive_threads, list):
                 raise SmokeError("thread/list returned a non-list data payload")
             interactive_thread_count = len(interactive_threads)
+            print(
+                f"step: thread/list ok interactiveThreadCount={interactive_thread_count}",
+                flush=True,
+            )
             if interactive_thread_count < args.min_interactive_threads:
                 raise SmokeError(
                     "interactive thread count stayed below the expected threshold: "
@@ -362,6 +369,13 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             read_thread = read_result.get("thread")
             if not isinstance(read_thread, dict) or read_thread.get("id") != args.resume_thread_id:
                 raise SmokeError("thread/read did not return the requested known thread")
+            print(
+                "step: thread/read ok "
+                f"threadId={args.resume_thread_id} "
+                f"status={read_thread.get('status')} "
+                f"path={read_thread.get('path')}",
+                flush=True,
+            )
 
             resumed = client.request(
                 "thread/resume",
@@ -373,12 +387,19 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
                 or resumed_thread.get("id") != args.resume_thread_id
             ):
                 raise SmokeError("thread/resume did not return the requested known thread")
+            print(
+                "step: thread/resume ok "
+                f"threadId={args.resume_thread_id} "
+                f"status={resumed_thread.get('status')}",
+                flush=True,
+            )
 
             known_goal_snapshot = client.request(
                 "thread/goal/get", {"threadId": args.resume_thread_id}
             )
             if "goal" not in known_goal_snapshot:
                 raise SmokeError("thread/goal/get response for known thread omitted `goal`")
+            print("step: thread/goal/get known thread ok", flush=True)
 
             started = client.request("thread/start", {"personality": "none"})
             started_thread = started.get("thread")
@@ -387,6 +408,7 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             smoke_thread_id = started_thread.get("id")
             if not isinstance(smoke_thread_id, str) or not smoke_thread_id:
                 raise SmokeError("thread/start returned an invalid smoke thread id")
+            print(f"step: thread/start ok threadId={smoke_thread_id}", flush=True)
 
             client.request(
                 "thread/name/set",
@@ -410,16 +432,19 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
                 raise SmokeError("thread/goal/set returned the wrong objective")
             if goal.get("tokenBudget") != 1234:
                 raise SmokeError("thread/goal/set returned the wrong token budget")
+            print(f"step: thread/goal/set ok threadId={smoke_thread_id}", flush=True)
 
             get_goal = client.request("thread/goal/get", {"threadId": smoke_thread_id})
             if get_goal.get("goal") != goal:
                 raise SmokeError("thread/goal/get did not round-trip the newly stored goal")
+            print(f"step: thread/goal/get smoke thread ok threadId={smoke_thread_id}", flush=True)
 
         if smoke_thread_id is None:
             raise SmokeError("smoke thread id was never created")
 
-        with ProxyWebSocketClient(command) as client:
+        with ProxyWebSocketClient(command, args.request_timeout_seconds) as client:
             client.initialize()
+            print("step: reconnect initialize ok", flush=True)
             persisted_goal = client.request("thread/goal/get", {"threadId": smoke_thread_id})
             goal = persisted_goal.get("goal")
             if not isinstance(goal, dict):
@@ -428,7 +453,9 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
                 raise SmokeError("persisted thread goal objective did not survive reconnect")
             if goal.get("tokenBudget") != 1234:
                 raise SmokeError("persisted thread goal budget did not survive reconnect")
+            print(f"step: reconnect goal/get ok threadId={smoke_thread_id}", flush=True)
             client.request("thread/delete", {"threadId": smoke_thread_id})
+            print(f"step: thread/delete ok threadId={smoke_thread_id}", flush=True)
 
         return SmokeSummary(
             interactive_thread_count=interactive_thread_count,
@@ -440,7 +467,7 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
     except Exception:
         if smoke_thread_id is not None:
             try:
-                with ProxyWebSocketClient(command) as cleanup_client:
+                with ProxyWebSocketClient(command, args.request_timeout_seconds) as cleanup_client:
                     cleanup_client.initialize()
                     cleanup_client.request("thread/delete", {"threadId": smoke_thread_id})
             except Exception as cleanup_exc:
