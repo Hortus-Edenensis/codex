@@ -25,6 +25,7 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::GitSha;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadMemoryMode;
 use codex_state::ThreadGoalStore as _;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ArchiveThreadParams;
@@ -67,6 +68,7 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 pub const DEFAULT_DATABASE_URL_ENV: &str = "CODEX_REMOTE_SQL_URL";
 pub const DEFAULT_WORKSPACE_ID: &str = "default";
+const DEFAULT_THREAD_MEMORY_MODE: ThreadMemoryMode = ThreadMemoryMode::Enabled;
 const REMOTE_CONTROL_APP_SERVER_CLIENT_NAME_NONE: &str = "";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -406,6 +408,24 @@ WHERE workspace_id = $1 AND id = $2
         Ok(stored)
     }
 
+    async fn read_thread_memory_mode(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<ThreadMemoryMode> {
+        self.ensure_migrated().await?;
+        let (pool, workspace_id) = self.pool_and_workspace()?;
+        let row = sqlx::query(
+            "SELECT memory_mode, stored_thread_json FROM threads WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(workspace_id)
+        .bind(thread_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .map_err(internal_error)?
+        .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+        stored_thread_memory_mode_from_row(&row)
+    }
+
     async fn load_history_inner(
         &self,
         thread_id: ThreadId,
@@ -493,7 +513,8 @@ impl ThreadStore for PostgresThreadStore {
             };
             let source_key = canonical_session_source_key(&stored.source)?;
             let thread_source_key = stored.thread_source.as_ref().map(ToString::to_string);
-            let stored_json = serde_json::to_value(&stored).map_err(internal_error)?;
+            let memory_mode = params.metadata.memory_mode;
+            let stored_json = stored_thread_json_with_memory_mode(&stored, memory_mode)?;
             let mut tx = pool.begin().await.map_err(internal_error)?;
             sqlx::query(
                 "INSERT INTO workspaces (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
@@ -520,12 +541,12 @@ ON CONFLICT (id) DO NOTHING
                 r#"
 INSERT INTO threads (
     id, workspace_id, session_id, forked_from_thread_id, parent_thread_id,
-    history_mode, source, thread_source, model_provider, cwd, title, preview,
+    history_mode, source, thread_source, model_provider, memory_mode, cwd, title, preview,
     created_at, updated_at, recency_at, stored_thread_json
 ) VALUES (
     $1, $2, $3, $4, $5,
-    $6, $7, $8, $9, $10, $11, $12,
-    $13, $14, $15, $16
+    $6, $7, $8, $9, $10, $11, $12, $13,
+    $14, $15, $16, $17
 )
                 "#,
             )
@@ -538,6 +559,7 @@ INSERT INTO threads (
             .bind(source_key)
             .bind(thread_source_key)
             .bind(stored.model_provider.as_str())
+            .bind(thread_memory_mode_key(memory_mode))
             .bind(stored.cwd.to_string_lossy().to_string())
             .bind(stored.name.as_deref())
             .bind(stored.preview.as_str())
@@ -571,6 +593,7 @@ INSERT INTO threads (
             let row = sqlx::query(
                 r#"
 SELECT latest_seq, stored_thread_json
+     , memory_mode
 FROM threads
 WHERE workspace_id = $1 AND id = $2
 FOR UPDATE
@@ -621,7 +644,8 @@ VALUES ($1, $2, $3, $4, $5)
                 .await
                 .map_err(internal_error)?;
             }
-            let stored_json = serde_json::to_value(&stored).map_err(internal_error)?;
+            let memory_mode = stored_thread_memory_mode_from_row(&row)?;
+            let stored_json = stored_thread_json_with_memory_mode(&stored, memory_mode)?;
             sqlx::query(
                 r#"
 UPDATE threads
@@ -910,7 +934,7 @@ VALUES ($1, $2, $3, $4)
             let mut tx = pool.begin().await.map_err(internal_error)?;
             let row = sqlx::query(
                 r#"
-SELECT stored_thread_json
+SELECT stored_thread_json, memory_mode
 FROM threads
 WHERE workspace_id = $1 AND id = $2
 FOR UPDATE
@@ -925,6 +949,10 @@ FOR UPDATE
                 thread_id: params.thread_id,
             })?;
             let mut stored = stored_thread_from_row(&row)?;
+            let memory_mode = params
+                .patch
+                .memory_mode
+                .unwrap_or(stored_thread_memory_mode_from_row(&row)?);
             apply_metadata_patch(&mut stored, params.patch);
             let archived_at = stored.archived_at;
             if archived_at.is_some() && !params.include_archived {
@@ -934,7 +962,7 @@ FOR UPDATE
             }
             let source_key = canonical_session_source_key(&stored.source)?;
             let thread_source_key = stored.thread_source.as_ref().map(ToString::to_string);
-            let stored_json = serde_json::to_value(&stored).map_err(internal_error)?;
+            let stored_json = stored_thread_json_with_memory_mode(&stored, memory_mode)?;
             sqlx::query(
                 r#"
 UPDATE threads
@@ -950,7 +978,8 @@ SET revision = revision + 1,
     recency_at = $11,
     source = $12,
     thread_source = $13,
-    stored_thread_json = $14
+    memory_mode = $14,
+    stored_thread_json = $15
 WHERE workspace_id = $1 AND id = $2
                 "#,
             )
@@ -972,6 +1001,7 @@ WHERE workspace_id = $1 AND id = $2
             .bind(stored.recency_at)
             .bind(source_key)
             .bind(thread_source_key)
+            .bind(thread_memory_mode_key(memory_mode))
             .bind(stored_json)
             .execute(&mut *tx)
             .await
@@ -997,7 +1027,11 @@ WHERE workspace_id = $1 AND id = $2
             })
             .await?;
             let (pool, workspace_id) = self.pool_and_workspace()?;
-            let stored_json = serde_json::to_value(&stored).map_err(internal_error)?;
+            let memory_mode = self
+                .read_thread_memory_mode(params.thread_id)
+                .await
+                .unwrap_or(DEFAULT_THREAD_MEMORY_MODE);
+            let stored_json = stored_thread_json_with_memory_mode(&stored, memory_mode)?;
             sqlx::query(
                 "UPDATE threads SET archived_at = $3, stored_thread_json = $4 WHERE workspace_id = $1 AND id = $2",
             )
@@ -1020,7 +1054,11 @@ WHERE workspace_id = $1 AND id = $2
                 .await?;
             stored.archived_at = None;
             stored.updated_at = Utc::now();
-            let stored_json = serde_json::to_value(&stored).map_err(internal_error)?;
+            let memory_mode = self
+                .read_thread_memory_mode(params.thread_id)
+                .await
+                .unwrap_or(DEFAULT_THREAD_MEMORY_MODE);
+            let stored_json = stored_thread_json_with_memory_mode(&stored, memory_mode)?;
             sqlx::query(
                 "UPDATE threads SET archived_at = NULL, updated_at = $3, stored_thread_json = $4 WHERE workspace_id = $1 AND id = $2",
             )
@@ -1795,6 +1833,58 @@ fn apply_metadata_patch(stored: &mut StoredThread, patch: codex_thread_store::Th
         if let Some(origin_url) = git_info.origin_url {
             stored_git_info.repository_url = origin_url;
         }
+    }
+}
+
+fn stored_thread_json_with_memory_mode(
+    stored: &StoredThread,
+    memory_mode: ThreadMemoryMode,
+) -> ThreadStoreResult<Value> {
+    let mut value = serde_json::to_value(stored).map_err(internal_error)?;
+    let Value::Object(object) = &mut value else {
+        return Err(internal_error("stored thread JSON must be an object"));
+    };
+    object.insert(
+        "memory_mode".to_string(),
+        Value::String(thread_memory_mode_key(memory_mode).to_string()),
+    );
+    Ok(value)
+}
+
+fn stored_thread_memory_mode_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> ThreadStoreResult<ThreadMemoryMode> {
+    if let Ok(memory_mode) = row.try_get::<String, _>("memory_mode") {
+        return parse_thread_memory_mode(memory_mode.as_str());
+    }
+    let value: Value = row.try_get("stored_thread_json").map_err(internal_error)?;
+    Ok(stored_thread_memory_mode_from_value(&value)?.unwrap_or(DEFAULT_THREAD_MEMORY_MODE))
+}
+
+fn stored_thread_memory_mode_from_value(
+    value: &Value,
+) -> ThreadStoreResult<Option<ThreadMemoryMode>> {
+    value
+        .get("memory_mode")
+        .and_then(Value::as_str)
+        .map(parse_thread_memory_mode)
+        .transpose()
+}
+
+fn parse_thread_memory_mode(value: &str) -> ThreadStoreResult<ThreadMemoryMode> {
+    match value {
+        "enabled" => Ok(ThreadMemoryMode::Enabled),
+        "disabled" => Ok(ThreadMemoryMode::Disabled),
+        _ => Err(internal_error(format!(
+            "unknown thread memory mode `{value}`"
+        ))),
+    }
+}
+
+fn thread_memory_mode_key(memory_mode: ThreadMemoryMode) -> &'static str {
+    match memory_mode {
+        ThreadMemoryMode::Enabled => "enabled",
+        ThreadMemoryMode::Disabled => "disabled",
     }
 }
 

@@ -1,7 +1,12 @@
 use std::time::Duration;
 
+use chrono::Utc;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadMemoryMode;
 use sqlx::migrate::AppliedMigration;
 use sqlx::migrate::Migrate;
 use sqlx::migrate::MigrateError;
@@ -73,6 +78,38 @@ fn session_source_filter_keys_include_custom_display_fallback() {
             r#"{"custom": "atlas"}"#.to_string(),
         ]
     );
+}
+
+#[test]
+fn stored_thread_json_with_memory_mode_sets_canonical_field() {
+    let value =
+        stored_thread_json_with_memory_mode(&sample_stored_thread(), ThreadMemoryMode::Disabled)
+            .expect("stored thread JSON");
+
+    assert_eq!(value["memory_mode"], "disabled");
+}
+
+#[test]
+fn stored_thread_memory_mode_from_value_reads_known_values() {
+    let value = serde_json::json!({ "memory_mode": "enabled" });
+
+    assert_eq!(
+        stored_thread_memory_mode_from_value(&value).expect("parse memory mode"),
+        Some(ThreadMemoryMode::Enabled)
+    );
+}
+
+#[test]
+fn stored_thread_memory_mode_from_value_rejects_unknown_values() {
+    let value = serde_json::json!({ "memory_mode": "mystery" });
+
+    let error =
+        stored_thread_memory_mode_from_value(&value).expect_err("unknown memory mode should fail");
+    assert!(matches!(
+        error,
+        ThreadStoreError::Internal { message }
+            if message.contains("unknown thread memory mode `mystery`")
+    ));
 }
 
 #[test]
@@ -224,5 +261,39 @@ impl Migrate for FakeMigrate {
         _migration: &'e Migration,
     ) -> TestFuture<'e, Result<Duration, MigrateError>> {
         Box::pin(async { panic!("revert should not run for empty migrator") })
+    }
+}
+
+fn sample_stored_thread() -> StoredThread {
+    let now = Utc::now();
+    StoredThread {
+        thread_id: ThreadId::default(),
+        extra_config: None,
+        rollout_path: None,
+        forked_from_id: None,
+        parent_thread_id: None,
+        preview: "preview".to_string(),
+        name: Some("name".to_string()),
+        model_provider: "openai".to_string(),
+        model: None,
+        reasoning_effort: None,
+        created_at: now,
+        updated_at: now,
+        recency_at: now,
+        archived_at: None,
+        cwd: std::path::PathBuf::from("/tmp"),
+        cli_version: "test".to_string(),
+        source: SessionSource::Cli,
+        history_mode: ThreadHistoryMode::Legacy,
+        thread_source: None,
+        agent_nickname: None,
+        agent_role: None,
+        agent_path: None,
+        git_info: None,
+        approval_mode: AskForApproval::OnRequest,
+        permission_profile: PermissionProfile::read_only(),
+        token_usage: None,
+        first_user_message: None,
+        history: None,
     }
 }
