@@ -30,6 +30,7 @@ jobs:
       CODEX_DEPLOY_NAMESPACE: codex-internal
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
       COPY_WORKSPACE_MIN_INTERACTIVE_THREADS: "8"
+      COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS: "120"
       COPY_WORKSPACE_RESUME_THREAD_ID: 019f1846-9419-7853-b035-f2ba0fad3d72
       HTTPS_PROXY: http://10.42.0.1:10809
       HTTP_PROXY: http://10.42.0.1:10809
@@ -83,5 +84,6 @@ jobs:
             --namespace "${CODEX_DEPLOY_NAMESPACE}" \
             --pod "${pod}" \
             --container "${CODEX_DEPLOY_CONTAINER}" \
+            --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
             --resume-thread-id "${resume_thread_id}" \
             --min-interactive-threads "${min_interactive_threads}"
