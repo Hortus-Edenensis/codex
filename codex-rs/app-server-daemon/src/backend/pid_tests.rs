@@ -23,7 +23,9 @@ async fn locked_empty_pid_file_is_treated_as_active_reservation() {
         .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().join("codex-home"),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     let reservation = tokio::fs::OpenOptions::new()
@@ -51,7 +53,9 @@ async fn unlocked_empty_pid_file_is_treated_as_stale_reservation() {
         .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().join("codex-home"),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
 
@@ -71,7 +75,9 @@ async fn stop_waits_for_live_reservation_to_resolve() {
         .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().join("codex-home"),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     let reservation = tokio::fs::OpenOptions::new()
@@ -103,7 +109,9 @@ async fn start_retries_stale_empty_pid_file_under_its_own_lock() {
         .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("missing-codex"),
+        temp_dir.path().join("codex-home"),
         pid_file,
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
 
@@ -120,7 +128,9 @@ async fn stale_record_cleanup_preserves_replacement_record() {
     let pid_file = temp_dir.path().join("app-server.pid");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().join("codex-home"),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     let stale = PidRecord {
@@ -151,14 +161,24 @@ async fn stale_record_cleanup_preserves_replacement_record() {
 fn update_loop_uses_hidden_app_server_subcommand() {
     let backend = PidBackend {
         codex_bin: "codex".into(),
+        codex_home: "/tmp/codex-home".into(),
         pid_file: "updater.pid".into(),
         lock_file: "updater.pid.lock".into(),
+        socket_path: None,
         command_kind: PidCommandKind::UpdateLoop,
     };
 
     assert_eq!(
         backend.command_args(),
-        vec!["app-server", "daemon", "pid-update-loop"]
+        vec![
+            "app-server".to_string(),
+            "daemon".to_string(),
+            "pid-update-loop".to_string()
+        ]
+    );
+    assert_eq!(
+        backend.command_env(),
+        vec![("CODEX_HOME", "/tmp/codex-home".to_string())]
     );
 }
 
@@ -166,13 +186,24 @@ fn update_loop_uses_hidden_app_server_subcommand() {
 fn app_server_remote_control_uses_runtime_flag() {
     let backend = PidBackend::new(
         "codex".into(),
+        "/tmp/codex-home".into(),
         "app-server.pid".into(),
+        "/tmp/codex-home/app-server-control/app-server-control.sock".into(),
         /*remote_control_enabled*/ true,
     );
 
     assert_eq!(
         backend.command_args(),
-        vec!["app-server", "--remote-control", "--listen", "unix://"]
+        vec![
+            "app-server".to_string(),
+            "--remote-control".to_string(),
+            "--listen".to_string(),
+            "unix:///tmp/codex-home/app-server-control/app-server-control.sock".to_string()
+        ]
+    );
+    assert_eq!(
+        backend.command_env(),
+        vec![("CODEX_HOME", "/tmp/codex-home".to_string())]
     );
 }
 
@@ -180,17 +211,26 @@ fn app_server_remote_control_uses_runtime_flag() {
 fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env() {
     let backend = PidBackend::new(
         "codex".into(),
+        "/tmp/codex-home".into(),
         "app-server.pid".into(),
+        "/tmp/codex-home/app-server-control/app-server-control.sock".into(),
         /*remote_control_enabled*/ false,
     );
 
     assert_eq!(
         backend.command_args(),
-        vec!["app-server", "--listen", "unix://"]
+        vec![
+            "app-server".to_string(),
+            "--listen".to_string(),
+            "unix:///tmp/codex-home/app-server-control/app-server-control.sock".to_string()
+        ]
     );
     assert_eq!(
         backend.command_env(),
-        Some((REMOTE_CONTROL_DISABLED_ENV_VAR, "1"))
+        vec![
+            ("CODEX_HOME", "/tmp/codex-home".to_string()),
+            (REMOTE_CONTROL_DISABLED_ENV_VAR, "1".to_string()),
+        ]
     );
 }
 

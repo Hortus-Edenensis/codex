@@ -528,6 +528,7 @@ mod tests {
                 pid: Some(42),
                 managed_codex_path: PathBuf::from("/opt/codex/bin/codex"),
                 managed_codex_version: Some("1.0.0".to_string()),
+                remote_sql_build_tag: None,
                 socket_path: PathBuf::from("/tmp/app-server-control.sock"),
                 cli_version: Some("1.0.0".to_string()),
                 app_server_version: Some("2.0.0".to_string()),

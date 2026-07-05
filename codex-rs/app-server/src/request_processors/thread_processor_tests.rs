@@ -991,6 +991,84 @@ mod thread_processor_behavior_tests {
         Ok(())
     }
 
+    #[test]
+    fn merge_stored_thread_resume_metadata_uses_stored_thread_values() {
+        let mut request_overrides = None;
+        let mut typesafe_overrides = ConfigOverrides::default();
+        let stored_thread = StoredThread {
+            thread_id: ThreadId::from_string("00000000-0000-0000-0000-000000000234")
+                .expect("valid thread"),
+            extra_config: None,
+            rollout_path: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            preview: "preview".to_string(),
+            name: None,
+            model_provider: "openai".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            recency_at: Utc::now(),
+            archived_at: None,
+            cwd: PathBuf::from("/tmp"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Cli,
+            history_mode: ThreadHistoryMode::Paginated,
+            thread_source: None,
+            agent_nickname: None,
+            agent_role: None,
+            agent_path: None,
+            git_info: None,
+            approval_mode: AskForApproval::OnRequest,
+            permission_profile: PermissionProfile::read_only(),
+            token_usage: None,
+            first_user_message: None,
+            history: None,
+        };
+
+        merge_stored_thread_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &stored_thread,
+        );
+
+        assert_eq!(typesafe_overrides.model, Some("gpt-5.4".to_string()));
+        assert_eq!(
+            typesafe_overrides.model_provider,
+            Some("openai".to_string())
+        );
+        assert_eq!(
+            request_overrides,
+            Some(HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                serde_json::Value::String("medium".to_string()),
+            )]))
+        );
+    }
+
+    #[test]
+    fn resolve_thread_list_model_providers_defaults_to_all_for_postgres() {
+        assert_eq!(
+            resolve_thread_list_model_providers(
+                /*requested_model_providers*/ None, /*relation_filter_present*/ false,
+                /*uses_postgres_thread_store*/ true, "openai",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_thread_list_model_providers_defaults_to_current_provider_for_local_store() {
+        assert_eq!(
+            resolve_thread_list_model_providers(
+                /*requested_model_providers*/ None, /*relation_filter_present*/ false,
+                /*uses_postgres_thread_store*/ false, "openai",
+            ),
+            Some(vec!["openai".to_string()])
+        );
+    }
+
     #[tokio::test]
     async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
         use codex_protocol::protocol::RolloutItem;

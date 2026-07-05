@@ -81,6 +81,14 @@ fn session_source_filter_keys_include_custom_display_fallback() {
 }
 
 #[test]
+fn generated_memory_history_mode_keys_include_legacy_and_paginated() {
+    assert_eq!(
+        generated_memory_history_mode_keys(),
+        vec!["legacy".to_string(), "paginated".to_string()]
+    );
+}
+
+#[test]
 fn stored_thread_json_with_memory_mode_sets_canonical_field() {
     let value = stored_thread_json_with_memory_mode_key(
         &sample_stored_thread(),

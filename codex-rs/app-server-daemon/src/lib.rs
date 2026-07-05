@@ -20,6 +20,8 @@ use codex_app_server_transport::app_server_control_socket_path;
 use codex_utils_home_dir::find_codex_home;
 use managed_install::managed_codex_bin;
 #[cfg(unix)]
+use managed_install::managed_codex_remote_sql_build_tag;
+#[cfg(unix)]
 use managed_install::managed_codex_version;
 use serde::Serialize;
 use settings::DaemonSettings;
@@ -63,6 +65,8 @@ pub struct LifecycleOutput {
     pub pid: Option<u32>,
     pub managed_codex_path: PathBuf,
     pub managed_codex_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_sql_build_tag: Option<String>,
     pub socket_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_version: Option<String>,
@@ -96,6 +100,8 @@ pub struct BootstrapOutput {
     pub remote_control_enabled: bool,
     pub managed_codex_path: PathBuf,
     pub managed_codex_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_sql_build_tag: Option<String>,
     pub socket_path: PathBuf,
     pub cli_version: String,
     pub app_server_version: String,
@@ -256,6 +262,7 @@ fn ensure_supported_platform() -> Result<()> {
 }
 
 struct Daemon {
+    codex_home: PathBuf,
     socket_path: PathBuf,
     pid_file: PathBuf,
     update_pid_file: PathBuf,
@@ -272,6 +279,7 @@ impl Daemon {
             .to_path_buf();
         let state_dir = codex_home.as_path().join(STATE_DIR_NAME);
         Ok(Self {
+            codex_home: codex_home.as_path().to_path_buf(),
             socket_path,
             pid_file: state_dir.join(PID_FILE_NAME),
             update_pid_file: state_dir.join(UPDATE_PID_FILE_NAME),
@@ -618,6 +626,7 @@ impl Daemon {
 
         let info = self.wait_until_ready().await?;
         let managed_codex_version = self.managed_codex_version_best_effort().await;
+        let remote_sql_build_tag = self.remote_sql_build_tag_best_effort().await;
         Ok(BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
@@ -625,6 +634,7 @@ impl Daemon {
             remote_control_enabled: settings.remote_control_enabled,
             managed_codex_path: self.managed_codex_bin.clone(),
             managed_codex_version,
+            remote_sql_build_tag,
             socket_path: self.socket_path.clone(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
             app_server_version: info.app_server_version,
@@ -689,8 +699,20 @@ impl Daemon {
         managed_codex_version(&self.managed_codex_bin).await.ok()
     }
 
+    #[cfg(unix)]
+    async fn remote_sql_build_tag_best_effort(&self) -> Option<String> {
+        managed_codex_remote_sql_build_tag(&self.managed_codex_bin)
+            .await
+            .ok()
+    }
+
     #[cfg(not(unix))]
     async fn managed_codex_version_best_effort(&self) -> Option<String> {
+        None
+    }
+
+    #[cfg(not(unix))]
+    async fn remote_sql_build_tag_best_effort(&self) -> Option<String> {
         None
     }
 
@@ -705,8 +727,10 @@ impl Daemon {
     ) -> BackendPaths {
         BackendPaths {
             codex_bin: managed_codex_bin.to_path_buf(),
+            codex_home: self.codex_home.clone(),
             pid_file: self.pid_file.clone(),
             update_pid_file: self.update_pid_file.clone(),
+            socket_path: self.socket_path.clone(),
             remote_control_enabled: settings.remote_control_enabled,
         }
     }
@@ -761,12 +785,14 @@ impl Daemon {
         app_server_version: Option<String>,
     ) -> LifecycleOutput {
         let managed_codex_version = self.managed_codex_version_best_effort().await;
+        let remote_sql_build_tag = self.remote_sql_build_tag_best_effort().await;
         LifecycleOutput {
             status,
             backend,
             pid,
             managed_codex_path: self.managed_codex_bin.clone(),
             managed_codex_version,
+            remote_sql_build_tag,
             socket_path: self.socket_path.clone(),
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             app_server_version,
@@ -955,6 +981,7 @@ mod tests {
             pid: None,
             managed_codex_path: "codex".into(),
             managed_codex_version: Some("1.2.3".to_string()),
+            remote_sql_build_tag: None,
             socket_path: "codex.sock".into(),
             cli_version: Some("1.2.3".to_string()),
             app_server_version: Some("1.2.4".to_string()),
@@ -985,6 +1012,7 @@ mod tests {
             remote_control_enabled: true,
             managed_codex_path: "codex".into(),
             managed_codex_version: Some("1.2.3".to_string()),
+            remote_sql_build_tag: None,
             socket_path: "codex.sock".into(),
             cli_version: "1.2.3".to_string(),
             app_server_version: "1.2.4".to_string(),

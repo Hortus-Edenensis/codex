@@ -16,6 +16,8 @@ use tokio::fs;
 #[cfg(unix)]
 use tokio::process::Command;
 
+const REMOTE_SQL_BUILD_TAG_FILE_NAME: &str = "REMOTE_SQL_BUILD_TAG";
+
 pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
     codex_home
         .join("packages")
@@ -64,6 +66,22 @@ pub(crate) async fn managed_codex_version(codex_bin: &Path) -> Result<String> {
 }
 
 #[cfg(unix)]
+pub(crate) async fn managed_codex_remote_sql_build_tag(codex_bin: &Path) -> Result<String> {
+    let tag_path = managed_codex_release_dir(codex_bin)?.join(REMOTE_SQL_BUILD_TAG_FILE_NAME);
+    let contents = fs::read_to_string(&tag_path)
+        .await
+        .with_context(|| format!("failed to read {}", tag_path.display()))?;
+    let tag = contents.trim();
+    if tag.is_empty() {
+        return Err(anyhow!(
+            "remote SQL build tag was empty in {}",
+            tag_path.display()
+        ));
+    }
+    Ok(tag.to_string())
+}
+
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecutableIdentity {
     digest: [u8; 32],
@@ -86,6 +104,20 @@ pub(crate) fn executable_identity_from_bytes(bytes: &[u8]) -> ExecutableIdentity
 
 fn managed_codex_file_name() -> &'static str {
     if cfg!(windows) { "codex.exe" } else { "codex" }
+}
+
+#[cfg(unix)]
+fn managed_codex_release_dir(codex_bin: &Path) -> Result<PathBuf> {
+    codex_bin
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow!(
+                "managed Codex binary path has no release directory: {}",
+                codex_bin.display()
+            )
+        })
 }
 
 #[cfg(unix)]
