@@ -82,9 +82,11 @@ fn session_source_filter_keys_include_custom_display_fallback() {
 
 #[test]
 fn stored_thread_json_with_memory_mode_sets_canonical_field() {
-    let value =
-        stored_thread_json_with_memory_mode(&sample_stored_thread(), ThreadMemoryMode::Disabled)
-            .expect("stored thread JSON");
+    let value = stored_thread_json_with_memory_mode_key(
+        &sample_stored_thread(),
+        thread_memory_mode_key(ThreadMemoryMode::Disabled),
+    )
+    .expect("stored thread JSON");
 
     assert_eq!(value["memory_mode"], "disabled");
 }
@@ -103,22 +105,19 @@ fn stored_thread_memory_mode_from_value_reads_known_values() {
     let value = serde_json::json!({ "memory_mode": "enabled" });
 
     assert_eq!(
-        stored_thread_memory_mode_from_value(&value).expect("parse memory mode"),
-        Some(ThreadMemoryMode::Enabled)
+        stored_thread_memory_mode_key_from_value(&value).expect("parse memory mode"),
+        Some("enabled".to_string())
     );
 }
 
 #[test]
-fn stored_thread_memory_mode_from_value_rejects_unknown_values() {
-    let value = serde_json::json!({ "memory_mode": "mystery" });
+fn stored_thread_memory_mode_from_value_preserves_unknown_values() {
+    let value = serde_json::json!({ "memory_mode": "polluted" });
 
-    let error =
-        stored_thread_memory_mode_from_value(&value).expect_err("unknown memory mode should fail");
-    assert!(matches!(
-        error,
-        ThreadStoreError::Internal { message }
-            if message.contains("unknown thread memory mode `mystery`")
-    ));
+    assert_eq!(
+        stored_thread_memory_mode_key_from_value(&value).expect("preserve memory mode"),
+        Some("polluted".to_string())
+    );
 }
 
 #[test]

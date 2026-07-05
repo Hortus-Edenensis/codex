@@ -28,7 +28,6 @@ use codex_extension_api::ToolCallOutcome;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::EventMsg;
-use codex_rollout::state_db;
 use codex_tools::ToolName;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
@@ -693,12 +692,11 @@ async fn handle_any_tool(
     if output.contains_external_context()
         && invocation.turn.config.memories.disable_on_external_context
     {
-        state_db::mark_thread_memory_mode_polluted(
-            invocation.session.services.state_db.as_deref(),
-            invocation.session.thread_id,
-            "tool_output",
-        )
-        .await;
+        if let Some(store) = invocation.session.services.generated_memory_store.as_ref() {
+            let _ = store
+                .mark_thread_memory_mode_polluted(invocation.session.thread_id)
+                .await;
+        }
     }
     let post_tool_use_payload =
         CoreToolRuntime::post_tool_use_payload(tool, &invocation, output.as_ref());

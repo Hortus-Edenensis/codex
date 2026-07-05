@@ -45,6 +45,7 @@ use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
+use crate::thread_state::GeneratedMemoryStoreHandle;
 use crate::thread_state::ThreadGoalStoreHandle;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
@@ -93,6 +94,7 @@ const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 struct ThreadStoreHandles {
     thread_store: Arc<dyn codex_thread_store::ThreadStore>,
     goal_store: Option<ThreadGoalStoreHandle>,
+    generated_memory_store: Option<GeneratedMemoryStoreHandle>,
     postgres_store: Option<Arc<codex_postgres_thread_store::PostgresThreadStore>>,
 }
 
@@ -220,6 +222,9 @@ fn thread_store_handles_from_config(
             goal_store: state_db
                 .as_ref()
                 .map(|state_db| Arc::new(state_db.thread_goals().clone()) as ThreadGoalStoreHandle),
+            generated_memory_store: state_db.as_ref().map(|state_db| {
+                Arc::new(state_db.memories().clone()) as GeneratedMemoryStoreHandle
+            }),
             postgres_store: None,
         },
         ThreadStoreConfig::Postgres {
@@ -240,12 +245,16 @@ fn thread_store_handles_from_config(
                 thread_store: Arc::clone(&postgres_store)
                     as Arc<dyn codex_thread_store::ThreadStore>,
                 goal_store: Some(Arc::clone(&postgres_store) as ThreadGoalStoreHandle),
+                generated_memory_store: Some(
+                    Arc::clone(&postgres_store) as GeneratedMemoryStoreHandle
+                ),
                 postgres_store: Some(postgres_store),
             }
         }
         ThreadStoreConfig::InMemory { .. } => ThreadStoreHandles {
             thread_store: codex_core::thread_store_from_config(config, state_db),
             goal_store: None,
+            generated_memory_store: None,
             postgres_store: None,
         },
     }
@@ -301,6 +310,7 @@ impl MessageProcessor {
         let ThreadStoreHandles {
             thread_store,
             goal_store,
+            generated_memory_store,
             postgres_store,
         } = thread_store_handles;
         let environment_manager_for_requests = Arc::clone(&environment_manager);
@@ -473,6 +483,7 @@ impl MessageProcessor {
             Arc::clone(&thread_list_state_permit),
             thread_goal_processor.clone(),
             state_db.clone(),
+            generated_memory_store,
             log_db,
             Arc::clone(&skills_watcher),
             config_warnings,
