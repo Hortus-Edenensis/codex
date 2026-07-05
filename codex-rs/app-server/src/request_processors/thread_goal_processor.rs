@@ -23,6 +23,28 @@ struct GoalStorageContext {
     reconcile_local_rollout: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveThreadGoalStoragePreference {
+    Postgres,
+    Local,
+}
+
+pub(crate) fn live_thread_goal_storage_preference(
+    config: &Config,
+    has_state_db: bool,
+) -> Option<LiveThreadGoalStoragePreference> {
+    if matches!(
+        config.experimental_thread_store,
+        codex_core::config::ThreadStoreConfig::Postgres { .. }
+    ) {
+        Some(LiveThreadGoalStoragePreference::Postgres)
+    } else if has_state_db {
+        Some(LiveThreadGoalStoragePreference::Local)
+    } else {
+        None
+    }
+}
+
 impl ThreadGoalRequestProcessor {
     pub(crate) fn new(
         thread_manager: Arc<ThreadManager>,
@@ -303,18 +325,16 @@ impl ThreadGoalRequestProcessor {
     }
 
     fn goal_storage_for_live_thread(&self, thread: &CodexThread) -> Option<GoalStorageContext> {
-        if let Some(state_db) = thread.state_db() {
-            return Some(self.local_goal_storage(state_db));
-        }
-        if matches!(
-            self.config.experimental_thread_store,
-            codex_core::config::ThreadStoreConfig::Postgres { .. }
-        ) {
-            return self
+        let state_db = thread.state_db();
+        match live_thread_goal_storage_preference(&self.config, state_db.is_some()) {
+            Some(LiveThreadGoalStoragePreference::Postgres) => self
                 .postgres_goal_storage(thread.session_configured().thread_id)
-                .ok();
+                .ok(),
+            Some(LiveThreadGoalStoragePreference::Local) => {
+                state_db.map(|state_db| self.local_goal_storage(state_db))
+            }
+            None => None,
         }
-        None
     }
 
     fn local_goal_storage(&self, state_db: StateDbHandle) -> GoalStorageContext {
