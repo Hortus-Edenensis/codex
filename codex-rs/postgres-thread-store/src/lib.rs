@@ -57,6 +57,7 @@ use sqlx::PgPool;
 use sqlx::Postgres;
 use sqlx::QueryBuilder;
 use sqlx::Row;
+use sqlx::migrate::Migrate;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::postgres::PgPoolOptions;
@@ -1907,7 +1908,7 @@ async fn ensure_shared_migrations(pool: PgPool, scope_key: u64) -> ThreadStoreRe
         if let Some(pool) = start_worker {
             let gate = Arc::clone(&gate);
             tokio::spawn(async move {
-                let result = MIGRATOR.run(&pool).await;
+                let result = run_shared_migrations(pool).await;
                 let mut state = gate
                     .state
                     .lock()
@@ -1923,6 +1924,45 @@ async fn ensure_shared_migrations(pool: PgPool, scope_key: u64) -> ThreadStoreRe
             });
         }
         notified.await;
+    }
+}
+
+fn locking_disabled_migrator(migrator: &Migrator) -> Migrator {
+    Migrator {
+        migrations: migrator.migrations.clone(),
+        ignore_missing: migrator.ignore_missing,
+        locking: false,
+        no_tx: migrator.no_tx,
+        table_name: migrator.table_name.clone(),
+        create_schemas: migrator.create_schemas.clone(),
+    }
+}
+
+async fn run_shared_migrations(pool: PgPool) -> ThreadStoreResult<()> {
+    let mut conn = pool.acquire().await.map_err(internal_error)?;
+    let migrator = locking_disabled_migrator(&MIGRATOR);
+    run_migrations_with_explicit_lock(&migrator, &mut *conn).await
+}
+
+async fn run_migrations_with_explicit_lock<C>(
+    migrator: &Migrator,
+    conn: &mut C,
+) -> ThreadStoreResult<()>
+where
+    C: Migrate,
+{
+    conn.lock().await.map_err(internal_error)?;
+    let migration_result = migrator.run_direct(None, conn, false).await;
+    let unlock_result = conn.unlock().await;
+    match (migration_result, unlock_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(unlock_err)) => Err(internal_error(format!(
+            "failed to release migration advisory lock: {unlock_err}"
+        ))),
+        (Err(migration_err), Ok(())) => Err(internal_error(migration_err)),
+        (Err(migration_err), Err(unlock_err)) => Err(internal_error(format!(
+            "{migration_err}; failed to release migration advisory lock: {unlock_err}"
+        ))),
     }
 }
 

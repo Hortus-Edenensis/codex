@@ -1,5 +1,11 @@
+use std::time::Duration;
+
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use sqlx::migrate::AppliedMigration;
+use sqlx::migrate::Migrate;
+use sqlx::migrate::MigrateError;
+use sqlx::migrate::Migration;
 
 use super::*;
 
@@ -69,6 +75,58 @@ fn session_source_filter_keys_include_custom_display_fallback() {
     );
 }
 
+#[test]
+fn locking_disabled_migrator_preserves_configuration() {
+    let migrator = locking_disabled_migrator(&MIGRATOR);
+
+    assert!(!migrator.locking);
+    assert_eq!(migrator.migrations, MIGRATOR.migrations);
+    assert_eq!(migrator.ignore_missing, MIGRATOR.ignore_missing);
+    assert_eq!(migrator.no_tx, MIGRATOR.no_tx);
+    assert_eq!(migrator.table_name, MIGRATOR.table_name);
+    assert_eq!(migrator.create_schemas, MIGRATOR.create_schemas);
+}
+
+#[tokio::test]
+async fn run_migrations_with_explicit_lock_releases_lock_after_success() {
+    let migrator = Migrator {
+        locking: false,
+        ..Migrator::DEFAULT
+    };
+    let mut conn = FakeMigrate::default();
+
+    run_migrations_with_explicit_lock(&migrator, &mut conn)
+        .await
+        .expect("migration should succeed");
+
+    assert_eq!(conn.lock_calls, 1);
+    assert_eq!(conn.unlock_calls, 1);
+}
+
+#[tokio::test]
+async fn run_migrations_with_explicit_lock_releases_lock_after_migration_error() {
+    let migrator = Migrator {
+        locking: false,
+        ..Migrator::DEFAULT
+    };
+    let mut conn = FakeMigrate {
+        dirty_version: Some(7),
+        ..FakeMigrate::default()
+    };
+
+    let error = run_migrations_with_explicit_lock(&migrator, &mut conn)
+        .await
+        .expect_err("dirty migration should fail");
+
+    assert!(matches!(
+        error,
+        ThreadStoreError::Internal { message }
+            if message.contains("migration 7 is partially applied")
+    ));
+    assert_eq!(conn.lock_calls, 1);
+    assert_eq!(conn.unlock_calls, 1);
+}
+
 #[tokio::test]
 async fn unconfigured_store_rejects_remote_control_persistence_requests() {
     let store = PostgresThreadStore::unconfigured("missing database url".to_string());
@@ -98,4 +156,73 @@ async fn unconfigured_store_rejects_remote_control_persistence_requests() {
         error,
         ThreadStoreError::InvalidRequest { message } if message == "missing database url"
     ));
+}
+
+#[derive(Default)]
+struct FakeMigrate {
+    dirty_version: Option<i64>,
+    lock_calls: usize,
+    unlock_calls: usize,
+}
+
+type TestFuture<'e, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'e>>;
+
+impl Migrate for FakeMigrate {
+    fn create_schema_if_not_exists<'e>(
+        &'e mut self,
+        _schema_name: &'e str,
+    ) -> TestFuture<'e, Result<(), MigrateError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn ensure_migrations_table<'e>(
+        &'e mut self,
+        _table_name: &'e str,
+    ) -> TestFuture<'e, Result<(), MigrateError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dirty_version<'e>(
+        &'e mut self,
+        _table_name: &'e str,
+    ) -> TestFuture<'e, Result<Option<i64>, MigrateError>> {
+        Box::pin(async move { Ok(self.dirty_version) })
+    }
+
+    fn list_applied_migrations<'e>(
+        &'e mut self,
+        _table_name: &'e str,
+    ) -> TestFuture<'e, Result<Vec<AppliedMigration>, MigrateError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn lock(&mut self) -> TestFuture<'_, Result<(), MigrateError>> {
+        Box::pin(async move {
+            self.lock_calls += 1;
+            Ok(())
+        })
+    }
+
+    fn unlock(&mut self) -> TestFuture<'_, Result<(), MigrateError>> {
+        Box::pin(async move {
+            self.unlock_calls += 1;
+            Ok(())
+        })
+    }
+
+    fn apply<'e>(
+        &'e mut self,
+        _table_name: &'e str,
+        _migration: &'e Migration,
+    ) -> TestFuture<'e, Result<Duration, MigrateError>> {
+        Box::pin(async { panic!("apply should not run for empty migrator") })
+    }
+
+    fn revert<'e>(
+        &'e mut self,
+        _table_name: &'e str,
+        _migration: &'e Migration,
+    ) -> TestFuture<'e, Result<Duration, MigrateError>> {
+        Box::pin(async { panic!("revert should not run for empty migrator") })
+    }
 }
