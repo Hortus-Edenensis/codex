@@ -90,6 +90,15 @@ fn stored_thread_json_with_memory_mode_sets_canonical_field() {
 }
 
 #[test]
+fn thread_history_mode_key_uses_canonical_lowercase_values() {
+    assert_eq!(thread_history_mode_key(ThreadHistoryMode::Legacy), "legacy");
+    assert_eq!(
+        thread_history_mode_key(ThreadHistoryMode::Paginated),
+        "paginated"
+    );
+}
+
+#[test]
 fn stored_thread_memory_mode_from_value_reads_known_values() {
     let value = serde_json::json!({ "memory_mode": "enabled" });
 
@@ -193,6 +202,16 @@ async fn unconfigured_store_rejects_remote_control_persistence_requests() {
         error,
         ThreadStoreError::InvalidRequest { message } if message == "missing database url"
     ));
+}
+
+#[test]
+fn postgres_store_defaults_to_paginated_history() {
+    let store = PostgresThreadStore::unconfigured("missing database url".to_string());
+
+    assert_eq!(
+        ThreadStore::default_history_mode(&store),
+        ThreadHistoryMode::Paginated
+    );
 }
 
 #[derive(Default)]

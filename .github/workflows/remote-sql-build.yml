@@ -117,8 +117,8 @@ jobs:
       CODEX_DEPLOY_CONTAINER: workspace
       CODEX_DEPLOY_NAMESPACE: codex-internal
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
-      CODEX_DEPLOY_RELEASE_NAME: remote-sql-e1b36e9caa-x86_64-unknown-linux-gnu
       CODEX_DEPLOY_RELEASE_TAG: ${{ needs.linux-cargo-build.outputs.release_version }}
+      CODEX_DEPLOY_TARGET_TRIPLE: x86_64-unknown-linux-gnu
       EXPECTED_CODEX_SHA256: ${{ needs.linux-cargo-build.outputs.codex_sha256 }}
       HTTPS_PROXY: http://10.42.0.1:10809
       HTTP_PROXY: http://10.42.0.1:10809
@@ -147,6 +147,8 @@ jobs:
             exit 1
           fi
 
+          release_name="${CODEX_DEPLOY_RELEASE_TAG//+/-}-${CODEX_DEPLOY_TARGET_TRIPLE}"
+
           pod="$(
             kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
               | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" { print $1; exit }'
@@ -159,7 +161,7 @@ jobs:
           pod_artifact="/tmp/codex-${EXPECTED_CODEX_SHA256}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp "${artifact}" "${pod}:${pod_artifact}" -c "${CODEX_DEPLOY_CONTAINER}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -s -- \
-            "${EXPECTED_CODEX_SHA256}" "${CODEX_DEPLOY_RELEASE_NAME}" "${pod_artifact}" "${CODEX_DEPLOY_RELEASE_TAG}" \
+            "${EXPECTED_CODEX_SHA256}" "${release_name}" "${pod_artifact}" "${CODEX_DEPLOY_RELEASE_TAG}" \
             "${GITHUB_SHA}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_REF_NAME}" <<'POD_SCRIPT'
           set -eu
 

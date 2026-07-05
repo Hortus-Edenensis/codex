@@ -25,6 +25,7 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::GitSha;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_state::ThreadGoalStore as _;
 use codex_thread_store::AppendThreadItemsParams;
@@ -476,6 +477,10 @@ impl ThreadStore for PostgresThreadStore {
         self
     }
 
+    fn default_history_mode(&self) -> ThreadHistoryMode {
+        ThreadHistoryMode::Paginated
+    }
+
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             self.ensure_migrated().await?;
@@ -555,7 +560,7 @@ INSERT INTO threads (
             .bind(params.session_id.to_string())
             .bind(stored.forked_from_id.map(|id| id.to_string()))
             .bind(stored.parent_thread_id.map(|id| id.to_string()))
-            .bind(format!("{:?}", stored.history_mode))
+            .bind(thread_history_mode_key(stored.history_mode))
             .bind(source_key)
             .bind(thread_source_key)
             .bind(stored.model_provider.as_str())
@@ -1886,6 +1891,10 @@ fn thread_memory_mode_key(memory_mode: ThreadMemoryMode) -> &'static str {
         ThreadMemoryMode::Enabled => "enabled",
         ThreadMemoryMode::Disabled => "disabled",
     }
+}
+
+fn thread_history_mode_key(history_mode: ThreadHistoryMode) -> &'static str {
+    history_mode.as_str()
 }
 
 fn stored_thread_from_row(row: &sqlx::postgres::PgRow) -> ThreadStoreResult<StoredThread> {
