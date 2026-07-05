@@ -115,28 +115,90 @@ jobs:
 
           sql_file="$(mktemp)"
           cat >"${sql_file}" <<SQL
-          WITH counts AS (
-              SELECT 'threads' AS metric, COUNT(*)::BIGINT AS value
-              FROM threads
-              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+          WITH params AS (
+              SELECT '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'::TEXT AS workspace_id
+          ),
+          schema_capabilities AS (
+              SELECT
+                  EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'threads'
+                        AND column_name = 'workspace_id'
+                  ) AS threads_has_workspace_id,
+                  EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'sessions'
+                        AND column_name = 'workspace_id'
+                  ) AS sessions_has_workspace_id
+          ),
+          counts AS (
+              SELECT
+                  'threads' AS metric,
+                  CASE
+                      WHEN schema_capabilities.threads_has_workspace_id THEN (
+                          SELECT COUNT(*)::BIGINT
+                          FROM threads, params
+                          WHERE threads.workspace_id = params.workspace_id
+                      )
+                      WHEN schema_capabilities.sessions_has_workspace_id THEN (
+                          SELECT COUNT(*)::BIGINT
+                          FROM threads
+                          JOIN sessions ON sessions.id = threads.session_id,
+                               params
+                          WHERE sessions.workspace_id = params.workspace_id
+                      )
+                      ELSE NULL::BIGINT
+                  END AS value
+              FROM schema_capabilities
               UNION ALL
-              SELECT 'thread_goals', COUNT(*)::BIGINT
-              FROM thread_goals
-              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+              SELECT
+                  'thread_goals',
+                  CASE
+                      WHEN schema_capabilities.threads_has_workspace_id THEN (
+                          SELECT COUNT(*)::BIGINT
+                          FROM thread_goals
+                          JOIN threads ON threads.id = thread_goals.thread_id,
+                               params
+                          WHERE threads.workspace_id = params.workspace_id
+                      )
+                      WHEN schema_capabilities.sessions_has_workspace_id THEN (
+                          SELECT COUNT(*)::BIGINT
+                          FROM thread_goals
+                          JOIN threads ON threads.id = thread_goals.thread_id
+                          JOIN sessions ON sessions.id = threads.session_id,
+                               params
+                          WHERE sessions.workspace_id = params.workspace_id
+                      )
+                      ELSE NULL::BIGINT
+                  END
+              FROM schema_capabilities
               UNION ALL
               SELECT 'memories', COUNT(*)::BIGINT
-              FROM memories
-              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+              FROM memories, params
+              WHERE memories.workspace_id = params.workspace_id
               UNION ALL
               SELECT 'memory_stage1_outputs', COUNT(*)::BIGINT
-              FROM memory_stage1_outputs
-              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+              FROM memory_stage1_outputs, params
+              WHERE memory_stage1_outputs.workspace_id = params.workspace_id
               UNION ALL
               SELECT 'memory_jobs', COUNT(*)::BIGINT
-              FROM memory_jobs
-              WHERE workspace_id = '${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}'
+              FROM memory_jobs, params
+              WHERE memory_jobs.workspace_id = params.workspace_id
+              UNION ALL
+              SELECT
+                  'threads_workspace_route',
+                  CASE
+                      WHEN schema_capabilities.threads_has_workspace_id THEN 1::BIGINT
+                      WHEN schema_capabilities.sessions_has_workspace_id THEN 2::BIGINT
+                      ELSE 0::BIGINT
+                  END
+              FROM schema_capabilities
           )
-          SELECT metric || '=' || value
+          SELECT metric || '=' || COALESCE(value::TEXT, 'null')
           FROM counts
           ORDER BY metric;
           SQL
@@ -172,6 +234,7 @@ jobs:
           memories=0
           memory_stage1_outputs=0
           memory_jobs=0
+          threads_workspace_route=0
           while IFS='=' read -r metric value; do
             case "${metric}" in
               threads) threads="${value}" ;;
@@ -179,8 +242,15 @@ jobs:
               memories) memories="${value}" ;;
               memory_stage1_outputs) memory_stage1_outputs="${value}" ;;
               memory_jobs) memory_jobs="${value}" ;;
+              threads_workspace_route) threads_workspace_route="${value}" ;;
             esac
           done <<< "${counts}"
+
+          case "${threads_workspace_route}" in
+            1) echo "Postgres probe filtered threads directly by threads.workspace_id" ;;
+            2) echo "Postgres probe filtered threads via sessions.workspace_id fallback" ;;
+            0) echo "::warning::Postgres probe could not detect a workspace_id column on threads or sessions" ;;
+          esac
 
           if [ "${threads}" -lt 100 ]; then
             echo "::error::Expected at least 100 Postgres threads for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got ${threads}"
