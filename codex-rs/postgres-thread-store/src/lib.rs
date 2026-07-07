@@ -494,8 +494,8 @@ impl ThreadStore for PostgresThreadStore {
                 preview: String::new(),
                 name: None,
                 model_provider: params.metadata.model_provider,
-                model: None,
-                reasoning_effort: None,
+                model: params.metadata.model,
+                reasoning_effort: params.metadata.reasoning_effort,
                 created_at: now,
                 updated_at: now,
                 recency_at: now,
@@ -548,12 +548,14 @@ ON CONFLICT (id) DO NOTHING
                 r#"
 INSERT INTO threads (
     id, workspace_id, session_id, forked_from_thread_id, parent_thread_id,
-    history_mode, source, thread_source, model_provider, memory_mode, cwd, title, preview,
-    created_at, updated_at, recency_at, stored_thread_json
+    history_mode, source, thread_source, model_provider, model, reasoning_effort,
+    memory_mode, cwd, title, preview, created_at, updated_at, recency_at,
+    stored_thread_json
 ) VALUES (
     $1, $2, $3, $4, $5,
-    $6, $7, $8, $9, $10, $11, $12, $13,
-    $14, $15, $16, $17
+    $6, $7, $8, $9, $10, $11,
+    $12, $13, $14, $15, $16, $17, $18,
+    $19
 )
                 "#,
             )
@@ -566,6 +568,13 @@ INSERT INTO threads (
             .bind(source_key)
             .bind(thread_source_key)
             .bind(stored.model_provider.as_str())
+            .bind(stored.model.as_deref())
+            .bind(
+                stored
+                    .reasoning_effort
+                    .as_ref()
+                    .map(|effort| effort.to_string()),
+            )
             .bind(thread_memory_mode_key(memory_mode))
             .bind(stored.cwd.to_string_lossy().to_string())
             .bind(stored.name.as_deref())

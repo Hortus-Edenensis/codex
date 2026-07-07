@@ -280,39 +280,21 @@ fn collect_resume_override_mismatches(
     mismatch_details
 }
 
-fn merge_persisted_resume_metadata(
-    request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &mut ConfigOverrides,
-    persisted_metadata: &ThreadMetadata,
-) {
-    if has_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
-        return;
-    }
-
-    typesafe_overrides.model = persisted_metadata.model.clone();
-    typesafe_overrides.model_provider = Some(persisted_metadata.model_provider.clone());
-
-    if let Some(reasoning_effort) = persisted_metadata.reasoning_effort.as_ref() {
-        request_overrides.get_or_insert_with(HashMap::new).insert(
-            "model_reasoning_effort".to_string(),
-            serde_json::Value::String(reasoning_effort.to_string()),
-        );
-    }
-}
-
 fn merge_stored_thread_resume_metadata(
     request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: &mut ConfigOverrides,
     stored_thread: &StoredThread,
 ) {
-    if has_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
+    if has_explicit_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
         return;
     }
 
     typesafe_overrides.model = stored_thread.model.clone();
     typesafe_overrides.model_provider = Some(stored_thread.model_provider.clone());
 
-    if let Some(reasoning_effort) = stored_thread.reasoning_effort.as_ref() {
+    if !has_reasoning_effort_resume_override(request_overrides.as_ref())
+        && let Some(reasoning_effort) = stored_thread.reasoning_effort.as_ref()
+    {
         request_overrides.get_or_insert_with(HashMap::new).insert(
             "model_reasoning_effort".to_string(),
             serde_json::Value::String(reasoning_effort.to_string()),
@@ -358,15 +340,129 @@ fn normalize_thread_list_cwd_filters(
     Ok(Some(normalized_cwds))
 }
 
-fn has_model_resume_override(
+#[derive(Clone, Debug, Default)]
+struct ResumeModelMetadata {
+    model: Option<String>,
+    model_provider: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl ResumeModelMetadata {
+    fn is_empty(&self) -> bool {
+        self.model.is_none() && self.model_provider.is_none() && self.reasoning_effort.is_none()
+    }
+}
+
+fn latest_resume_model_metadata_from_history(history: &InitialHistory) -> ResumeModelMetadata {
+    let mut metadata = ResumeModelMetadata::default();
+    let update_from_item = |metadata: &mut ResumeModelMetadata, item: &RolloutItem| match item {
+        RolloutItem::TurnContext(turn_context) => {
+            metadata.model = Some(turn_context.model.clone());
+            metadata.reasoning_effort = turn_context.effort.clone();
+        }
+        RolloutItem::EventMsg(EventMsg::SessionConfigured(event)) => {
+            metadata.model = Some(event.model.clone());
+            metadata.model_provider = Some(event.model_provider_id.clone());
+            metadata.reasoning_effort = event.reasoning_effort.clone();
+        }
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+            metadata.model = Some(event.thread_settings.model.clone());
+            metadata.model_provider = Some(event.thread_settings.model_provider_id.clone());
+            metadata.reasoning_effort = event.thread_settings.reasoning_effort.clone();
+        }
+        RolloutItem::SessionMeta(meta_line) => {
+            if let Some(model_provider) = meta_line.meta.model_provider.as_ref()
+                && !model_provider.is_empty()
+            {
+                metadata.model_provider = Some(model_provider.clone());
+            }
+        }
+        RolloutItem::ResponseItem(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::Compacted(_)
+        | RolloutItem::WorldState(_)
+        | RolloutItem::EventMsg(_) => {}
+    };
+    match history {
+        InitialHistory::Resumed(resumed) => {
+            for item in resumed.history.iter() {
+                update_from_item(&mut metadata, item);
+            }
+        }
+        InitialHistory::Forked(items) => {
+            for item in items {
+                update_from_item(&mut metadata, item);
+            }
+        }
+        InitialHistory::New | InitialHistory::Cleared => {}
+    }
+    metadata
+}
+
+fn apply_resume_model_metadata(
+    request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &mut ConfigOverrides,
+    metadata: &ResumeModelMetadata,
+) {
+    if has_explicit_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
+        return;
+    }
+    if let Some(model) = metadata.model.as_ref() {
+        typesafe_overrides.model = Some(model.clone());
+    }
+    if let Some(model_provider) = metadata.model_provider.as_ref() {
+        typesafe_overrides.model_provider = Some(model_provider.clone());
+    }
+    if !has_reasoning_effort_resume_override(request_overrides.as_ref())
+        && let Some(reasoning_effort) = metadata.reasoning_effort.as_ref()
+    {
+        request_overrides.get_or_insert_with(HashMap::new).insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String(reasoning_effort.to_string()),
+        );
+    }
+}
+
+fn resume_model_metadata_patch(
+    metadata: &ResumeModelMetadata,
+    current_model: Option<&str>,
+    current_model_provider: Option<&str>,
+    current_reasoning_effort: Option<&ReasoningEffort>,
+) -> Option<StoreThreadMetadataPatch> {
+    let mut patch = StoreThreadMetadataPatch::default();
+    if let Some(model) = metadata.model.as_ref()
+        && current_model != Some(model.as_str())
+    {
+        patch.model = Some(model.clone());
+    }
+    if let Some(model_provider) = metadata.model_provider.as_ref()
+        && current_model_provider != Some(model_provider.as_str())
+    {
+        patch.model_provider = Some(model_provider.clone());
+    }
+    if let Some(reasoning_effort) = metadata.reasoning_effort.as_ref()
+        && current_reasoning_effort != Some(reasoning_effort)
+    {
+        patch.reasoning_effort = Some(reasoning_effort.clone());
+    }
+    if patch.is_empty() { None } else { Some(patch) }
+}
+
+fn has_explicit_model_resume_override(
     request_overrides: Option<&HashMap<String, serde_json::Value>>,
     typesafe_overrides: &ConfigOverrides,
 ) -> bool {
     typesafe_overrides.model.is_some()
         || typesafe_overrides.model_provider.is_some()
         || request_overrides.is_some_and(|overrides| overrides.contains_key("model"))
-        || request_overrides
-            .is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
+        || request_overrides.is_some_and(|overrides| overrides.contains_key("model_provider"))
+}
+
+fn has_reasoning_effort_resume_override(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+) -> bool {
+    request_overrides.is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
 }
 
 fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
@@ -3013,6 +3109,16 @@ impl ThreadRequestProcessor {
                     /*has_live_in_progress_turn*/ false,
                 );
                 let config_snapshot = codex_thread.config_snapshot().await;
+                self.backfill_resume_model_metadata(
+                    thread_id,
+                    StoreThreadMetadataPatch {
+                        model_provider: Some(session_configured.model_provider_id.clone()),
+                        model: Some(session_configured.model.clone()),
+                        reasoning_effort: session_configured.reasoning_effort.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
                 let sandbox = thread_response_sandbox_policy(
                     &config_snapshot.permission_profile,
                     config_snapshot.cwd().as_path(),
@@ -3109,20 +3215,9 @@ impl ThreadRequestProcessor {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return;
         };
-        if let Some(state_db_ctx) = self.state_db.clone()
-            && let Some(persisted_metadata) = state_db_ctx
-                .get_thread(resumed_history.conversation_id)
-                .await
-                .ok()
-                .flatten()
-        {
-            merge_persisted_resume_metadata(
-                request_overrides,
-                typesafe_overrides,
-                &persisted_metadata,
-            );
-            return;
-        }
+        let history_metadata = latest_resume_model_metadata_from_history(thread_history);
+        let explicit_model_override =
+            has_explicit_model_resume_override(request_overrides.as_ref(), typesafe_overrides);
 
         if let Some(stored_thread) = resume_source_thread {
             merge_stored_thread_resume_metadata(
@@ -3130,6 +3225,45 @@ impl ThreadRequestProcessor {
                 typesafe_overrides,
                 stored_thread,
             );
+            if !explicit_model_override && !history_metadata.is_empty() {
+                apply_resume_model_metadata(
+                    request_overrides,
+                    typesafe_overrides,
+                    &history_metadata,
+                );
+                if let Some(patch) = resume_model_metadata_patch(
+                    &history_metadata,
+                    stored_thread.model.as_deref(),
+                    Some(stored_thread.model_provider.as_str()),
+                    stored_thread.reasoning_effort.as_ref(),
+                ) {
+                    self.backfill_resume_model_metadata(stored_thread.thread_id, patch)
+                        .await;
+                }
+            }
+        } else if !explicit_model_override && !history_metadata.is_empty() {
+            apply_resume_model_metadata(request_overrides, typesafe_overrides, &history_metadata);
+            if let Some(patch) = resume_model_metadata_patch(&history_metadata, None, None, None) {
+                self.backfill_resume_model_metadata(resumed_history.conversation_id, patch)
+                    .await;
+            }
+        }
+    }
+
+    async fn backfill_resume_model_metadata(
+        &self,
+        thread_id: ThreadId,
+        patch: StoreThreadMetadataPatch,
+    ) {
+        if patch.is_empty() {
+            return;
+        }
+        if let Err(err) = self
+            .thread_manager
+            .update_thread_metadata(thread_id, patch, /*include_archived*/ true)
+            .await
+        {
+            warn!("failed to backfill resume model metadata for thread {thread_id}: {err}");
         }
     }
 

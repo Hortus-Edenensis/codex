@@ -22,10 +22,10 @@ use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ExtraConfig;
 use crate::ItemPage;
-use crate::ListThreadsParams;
-use crate::LoadThreadHistoryParams;
 use crate::ListItemsParams;
+use crate::ListThreadsParams;
 use crate::ListTurnsParams;
+use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
@@ -175,10 +175,7 @@ impl ThreadStore for RecordingThreadStore {
         })
     }
 
-    fn unarchive_thread(
-        &self,
-        params: ArchiveThreadParams,
-    ) -> ThreadStoreFuture<'_, StoredThread> {
+    fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
         Box::pin(async move { Ok(sample_stored_thread(params.thread_id)) })
     }
 
@@ -205,7 +202,10 @@ async fn live_thread_appends_only_persisted_rollout_items() {
         .await
         .expect("append items");
 
-    assert_eq!(store.appended_items(), vec![vec![persisted_message("keep me")]]);
+    assert_eq!(
+        store.appended_items(),
+        vec![vec![persisted_message("keep me")]]
+    );
     assert_eq!(store.metadata_update_count(), 1);
 }
 
@@ -228,6 +228,8 @@ fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         metadata: crate::ThreadPersistenceMetadata {
             cwd: Some(PathBuf::from("/workspace/repo")),
             model_provider: "openai".to_string(),
+            model: None,
+            reasoning_effort: None,
             memory_mode: ThreadMemoryMode::Enabled,
         },
     }

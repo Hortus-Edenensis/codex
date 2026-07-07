@@ -702,6 +702,8 @@ mod tests {
                 metadata: ThreadPersistenceMetadata {
                     cwd: Some(home.path().to_path_buf()),
                     model_provider: "different-provider".to_string(),
+                    model: None,
+                    reasoning_effort: None,
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             },
@@ -756,6 +758,8 @@ mod tests {
                 metadata: ThreadPersistenceMetadata {
                     cwd: Some(home.path().to_path_buf()),
                     model_provider: "different-provider".to_string(),
+                    model: None,
+                    reasoning_effort: None,
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             },
@@ -967,6 +971,8 @@ mod tests {
                 metadata: ThreadPersistenceMetadata {
                     cwd: None,
                     model_provider: "test-provider".to_string(),
+                    model: None,
+                    reasoning_effort: None,
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             })
@@ -1299,6 +1305,8 @@ mod tests {
         ThreadPersistenceMetadata {
             cwd: Some(std::env::current_dir().expect("cwd")),
             model_provider: "test-provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             memory_mode: ThreadMemoryMode::Enabled,
         }
     }

@@ -320,6 +320,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pod", required=True)
     parser.add_argument("--container", required=True)
     parser.add_argument("--resume-thread-id")
+    parser.add_argument("--expected-model", default="gpt-5.5")
+    parser.add_argument("--expected-model-provider", default="openai")
+    parser.add_argument("--expected-reasoning-effort")
     parser.add_argument("--min-interactive-threads", type=int, default=8)
     parser.add_argument("--request-timeout-seconds", type=float, default=REQUEST_TIMEOUT_SECONDS)
     parser.add_argument("--keep-smoke-thread", action="store_true")
@@ -327,6 +330,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delete-only-thread-id")
     parser.add_argument("--unarchive-only-thread-id")
     return parser.parse_args()
+
+
+def assert_model_response(
+    label: str,
+    response: Dict[str, Any],
+    expected_model: Optional[str],
+    expected_model_provider: Optional[str],
+    expected_reasoning_effort: Optional[str],
+) -> None:
+    actual_model = response.get("model")
+    actual_provider = response.get("modelProvider")
+    actual_effort = response.get("reasoningEffort")
+    if expected_model is not None and actual_model != expected_model:
+        raise SmokeError(
+            f"{label} returned model={actual_model!r}, expected {expected_model!r}"
+        )
+    if expected_model_provider is not None and actual_provider != expected_model_provider:
+        raise SmokeError(
+            f"{label} returned modelProvider={actual_provider!r}, "
+            f"expected {expected_model_provider!r}"
+        )
+    if expected_reasoning_effort is not None and actual_effort != expected_reasoning_effort:
+        raise SmokeError(
+            f"{label} returned reasoningEffort={actual_effort!r}, "
+            f"expected {expected_reasoning_effort!r}"
+        )
 
 
 def proxy_command(args: argparse.Namespace) -> List[str]:
@@ -415,6 +444,13 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
                 "thread/resume",
                 {"threadId": args.resume_thread_id, "excludeTurns": True},
             )
+            assert_model_response(
+                "thread/resume known thread",
+                resumed,
+                args.expected_model,
+                args.expected_model_provider,
+                args.expected_reasoning_effort,
+            )
             resumed_thread = resumed.get("thread")
             if (
                 not isinstance(resumed_thread, dict)
@@ -424,7 +460,10 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             print(
                 "step: thread/resume ok "
                 f"threadId={args.resume_thread_id} "
-                f"status={resumed_thread.get('status')}",
+                f"status={resumed_thread.get('status')} "
+                f"model={resumed.get('model')} "
+                f"modelProvider={resumed.get('modelProvider')} "
+                f"reasoningEffort={resumed.get('reasoningEffort')}",
                 flush=True,
             )
 
@@ -435,14 +474,33 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
                 raise SmokeError("thread/goal/get response for known thread omitted `goal`")
             print("step: thread/goal/get known thread ok", flush=True)
 
-            started = client.request("thread/start", {"personality": "none"})
+            start_params: Dict[str, Any] = {
+                "personality": "none",
+                "model": args.expected_model,
+                "modelProvider": args.expected_model_provider,
+            }
+            started = client.request("thread/start", start_params)
+            assert_model_response(
+                "thread/start smoke thread",
+                started,
+                args.expected_model,
+                args.expected_model_provider,
+                args.expected_reasoning_effort,
+            )
             started_thread = started.get("thread")
             if not isinstance(started_thread, dict):
                 raise SmokeError("thread/start did not return a thread object")
             smoke_thread_id = started_thread.get("id")
             if not isinstance(smoke_thread_id, str) or not smoke_thread_id:
                 raise SmokeError("thread/start returned an invalid smoke thread id")
-            print(f"step: thread/start ok threadId={smoke_thread_id}", flush=True)
+            print(
+                "step: thread/start ok "
+                f"threadId={smoke_thread_id} "
+                f"model={started.get('model')} "
+                f"modelProvider={started.get('modelProvider')} "
+                f"reasoningEffort={started.get('reasoningEffort')}",
+                flush=True,
+            )
 
             client.request(
                 "thread/name/set",
@@ -488,6 +546,25 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             if goal.get("tokenBudget") != 1234:
                 raise SmokeError("persisted thread goal budget did not survive reconnect")
             print(f"step: reconnect goal/get ok threadId={smoke_thread_id}", flush=True)
+            resumed_smoke = client.request(
+                "thread/resume",
+                {"threadId": smoke_thread_id, "excludeTurns": True},
+            )
+            assert_model_response(
+                "thread/resume smoke thread",
+                resumed_smoke,
+                args.expected_model,
+                args.expected_model_provider,
+                args.expected_reasoning_effort,
+            )
+            print(
+                "step: reconnect thread/resume ok "
+                f"threadId={smoke_thread_id} "
+                f"model={resumed_smoke.get('model')} "
+                f"modelProvider={resumed_smoke.get('modelProvider')} "
+                f"reasoningEffort={resumed_smoke.get('reasoningEffort')}",
+                flush=True,
+            )
             if args.keep_smoke_thread:
                 retain_smoke_thread = True
                 print(f"step: retained smoke thread threadId={smoke_thread_id}", flush=True)
