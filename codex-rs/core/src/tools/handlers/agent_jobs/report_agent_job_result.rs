@@ -65,7 +65,7 @@ pub async fn handle(
             "result must be a JSON object".to_string(),
         ));
     }
-    let db = required_state_db(&session)?;
+    let db = required_agent_job_store(&session)?;
     let reporting_thread_id = session.thread_id.to_string();
     let accepted = db
         .report_agent_job_item_result(

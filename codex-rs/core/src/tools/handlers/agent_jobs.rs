@@ -97,12 +97,143 @@ struct ActiveJobItem {
     status_rx: Option<Receiver<AgentStatus>>,
 }
 
-fn required_state_db(
+#[derive(Clone)]
+struct AgentJobStore {
+    postgres: Arc<codex_postgres_thread_store::PostgresThreadStore>,
+}
+
+impl AgentJobStore {
+    async fn create_agent_job(
+        &self,
+        params: &codex_state::AgentJobCreateParams,
+        items: &[codex_state::AgentJobItemCreateParams],
+    ) -> anyhow::Result<codex_state::AgentJob> {
+        self.postgres.create_agent_job(params, items).await
+    }
+
+    async fn get_agent_job(&self, job_id: &str) -> anyhow::Result<Option<codex_state::AgentJob>> {
+        self.postgres.get_agent_job(job_id).await
+    }
+
+    async fn list_agent_job_items(
+        &self,
+        job_id: &str,
+        status: Option<codex_state::AgentJobItemStatus>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<codex_state::AgentJobItem>> {
+        self.postgres
+            .list_agent_job_items(job_id, status, limit)
+            .await
+    }
+
+    async fn mark_agent_job_running(&self, job_id: &str) -> anyhow::Result<()> {
+        self.postgres.mark_agent_job_running(job_id).await
+    }
+
+    async fn mark_agent_job_completed(&self, job_id: &str) -> anyhow::Result<()> {
+        self.postgres.mark_agent_job_completed(job_id).await
+    }
+
+    async fn mark_agent_job_failed(&self, job_id: &str, error_message: &str) -> anyhow::Result<()> {
+        self.postgres
+            .mark_agent_job_failed(job_id, error_message)
+            .await
+    }
+
+    async fn mark_agent_job_cancelled(&self, job_id: &str, reason: &str) -> anyhow::Result<bool> {
+        self.postgres.mark_agent_job_cancelled(job_id, reason).await
+    }
+
+    async fn is_agent_job_cancelled(&self, job_id: &str) -> anyhow::Result<bool> {
+        self.postgres.is_agent_job_cancelled(job_id).await
+    }
+
+    async fn mark_agent_job_item_running_with_thread(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        thread_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.postgres
+            .mark_agent_job_item_running_with_thread(job_id, item_id, thread_id)
+            .await
+    }
+
+    async fn mark_agent_job_item_pending(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        error_message: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        self.postgres
+            .mark_agent_job_item_pending(job_id, item_id, error_message)
+            .await
+    }
+
+    async fn mark_agent_job_item_completed(
+        &self,
+        job_id: &str,
+        item_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.postgres
+            .mark_agent_job_item_completed(job_id, item_id)
+            .await
+    }
+
+    async fn mark_agent_job_item_failed(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        error_message: &str,
+    ) -> anyhow::Result<bool> {
+        self.postgres
+            .mark_agent_job_item_failed(job_id, item_id, error_message)
+            .await
+    }
+
+    async fn get_agent_job_item(
+        &self,
+        job_id: &str,
+        item_id: &str,
+    ) -> anyhow::Result<Option<codex_state::AgentJobItem>> {
+        self.postgres.get_agent_job_item(job_id, item_id).await
+    }
+
+    async fn get_agent_job_progress(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<codex_state::AgentJobProgress> {
+        self.postgres.get_agent_job_progress(job_id).await
+    }
+
+    async fn report_agent_job_item_result(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        reporting_thread_id: &str,
+        result_json: &Value,
+    ) -> anyhow::Result<bool> {
+        self.postgres
+            .report_agent_job_item_result(job_id, item_id, reporting_thread_id, result_json)
+            .await
+    }
+}
+
+fn required_agent_job_store(
     session: &Arc<Session>,
-) -> Result<Arc<codex_state::StateRuntime>, FunctionCallError> {
-    session.state_db().ok_or_else(|| {
-        FunctionCallError::Fatal("sqlite state db is unavailable for this session".to_string())
-    })
+) -> Result<Arc<AgentJobStore>, FunctionCallError> {
+    let thread_store = session.thread_store();
+    if let Some(store) = thread_store
+        .as_any()
+        .downcast_ref::<codex_postgres_thread_store::PostgresThreadStore>()
+    {
+        return Ok(Arc::new(AgentJobStore {
+            postgres: Arc::new(store.clone()),
+        }));
+    }
+    Err(FunctionCallError::Fatal(
+        "agent job store is unavailable for this session".to_string(),
+    ))
 }
 
 async fn build_runner_options(
@@ -156,7 +287,7 @@ fn normalize_max_runtime_seconds(requested: Option<u64>) -> Result<Option<u64>, 
 async fn run_agent_job_loop(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
-    db: Arc<codex_state::StateRuntime>,
+    db: Arc<AgentJobStore>,
     job_id: String,
     options: JobRunnerOptions,
 ) -> anyhow::Result<()> {
@@ -328,7 +459,7 @@ async fn run_agent_job_loop(
 }
 
 async fn export_job_csv_snapshot(
-    db: Arc<codex_state::StateRuntime>,
+    db: Arc<AgentJobStore>,
     job: &codex_state::AgentJob,
 ) -> anyhow::Result<()> {
     let items = db
@@ -346,7 +477,7 @@ async fn export_job_csv_snapshot(
 
 async fn recover_running_items(
     session: Arc<Session>,
-    db: Arc<codex_state::StateRuntime>,
+    db: Arc<AgentJobStore>,
     job_id: &str,
     active_items: &mut HashMap<ThreadId, ActiveJobItem>,
     runtime_timeout: Duration,
@@ -470,7 +601,7 @@ async fn wait_for_status_change(active_items: &HashMap<ThreadId, ActiveJobItem>)
 
 async fn reap_stale_active_items(
     session: Arc<Session>,
-    db: Arc<codex_state::StateRuntime>,
+    db: Arc<AgentJobStore>,
     job_id: &str,
     active_items: &mut HashMap<ThreadId, ActiveJobItem>,
     runtime_timeout: Duration,
@@ -500,7 +631,7 @@ async fn reap_stale_active_items(
 
 async fn finalize_finished_item(
     session: Arc<Session>,
-    db: Arc<codex_state::StateRuntime>,
+    db: Arc<AgentJobStore>,
     job_id: &str,
     item_id: &str,
     thread_id: ThreadId,

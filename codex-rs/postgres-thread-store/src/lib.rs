@@ -65,6 +65,7 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::Notify;
 
+mod agent_jobs;
 mod generated_memories;
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");

@@ -545,7 +545,9 @@ pub async fn run_main_with_transport_options(
         )
     })?;
     codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
-    codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
+    if matches!(config.experimental_thread_store, ThreadStoreConfig::Local) {
+        codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
+    }
     let remote_control_policy = if config
         .config_layer_stack
         .requirements()

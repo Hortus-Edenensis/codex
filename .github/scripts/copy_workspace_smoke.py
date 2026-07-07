@@ -379,6 +379,67 @@ def proxy_command(args: argparse.Namespace) -> List[str]:
     ]
 
 
+def run_diagnostic_command(label: str, command: List[str]) -> None:
+    print(f"== diagnostic: {label} ==", file=sys.stderr, flush=True)
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+        )
+    except Exception as exc:
+        print(f"diagnostic warning: {label} failed to run: {exc}", file=sys.stderr)
+        return
+    if result.stdout:
+        print(result.stdout.rstrip(), file=sys.stderr)
+    if result.returncode != 0:
+        print(
+            f"diagnostic warning: {label} exited with {result.returncode}",
+            file=sys.stderr,
+        )
+
+
+def dump_failure_diagnostics(args: argparse.Namespace) -> None:
+    run_diagnostic_command(
+        "copy workspace pod state",
+        [
+            "kubectl",
+            "-n",
+            args.namespace,
+            "exec",
+            args.pod,
+            "-c",
+            args.container,
+            "--",
+            "sh",
+            "-lc",
+            (
+                'echo "release_tag:"; '
+                'cat /home/codex/.codex/packages/standalone/current/REMOTE_SQL_BUILD_TAG 2>/dev/null || true; '
+                'echo "processes:"; '
+                'ps -eo pid,ppid,etime,stat,comm,args 2>/dev/null '
+                '| grep -E "codex|app-server" | grep -v grep | tail -40 || true'
+            ),
+        ],
+    )
+    run_diagnostic_command(
+        "copy workspace pod logs",
+        [
+            "kubectl",
+            "-n",
+            args.namespace,
+            "logs",
+            args.pod,
+            "-c",
+            args.container,
+            "--tail=240",
+        ],
+    )
+
+
 def delete_thread(args: argparse.Namespace, thread_id: str) -> None:
     command = proxy_command(args)
     with ProxyWebSocketClient(command, args.request_timeout_seconds) as client:
@@ -580,6 +641,7 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             codex_home=codex_home,
         )
     except Exception:
+        dump_failure_diagnostics(args)
         if smoke_thread_id is not None and not retain_smoke_thread:
             try:
                 delete_thread(args, smoke_thread_id)

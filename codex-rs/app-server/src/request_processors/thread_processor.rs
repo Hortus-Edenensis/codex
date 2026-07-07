@@ -2957,7 +2957,7 @@ impl ThreadRequestProcessor {
             approvals_reviewer,
             sandbox,
             permissions,
-            config: mut request_overrides,
+            config: request_overrides,
             base_instructions,
             developer_instructions,
             personality,
@@ -2965,6 +2965,41 @@ impl ThreadRequestProcessor {
             initial_turns_page,
         } = params;
         let include_turns = !exclude_turns;
+
+        let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
+        let mut typesafe_overrides = self.build_thread_config_overrides(
+            model,
+            model_provider,
+            service_tier,
+            cwd,
+            runtime_workspace_roots,
+            approval_policy,
+            approvals_reviewer,
+            sandbox,
+            permissions,
+            base_instructions,
+            developer_instructions,
+            personality,
+        );
+        let mut request_overrides = request_overrides;
+        let mut stored_thread_from_running_probe = stored_thread_from_running_probe;
+        if !include_turns
+            && initial_turns_page.is_none()
+            && self.uses_postgres_thread_store()
+            && let Some(stored_thread) = stored_thread_from_running_probe.take()
+        {
+            if stored_thread.history.is_none() {
+                self.respond_to_lightweight_postgres_resume(
+                    request_id,
+                    *stored_thread,
+                    request_overrides,
+                    typesafe_overrides,
+                )
+                .await?;
+                return Ok(());
+            }
+            stored_thread_from_running_probe = Some(stored_thread);
+        }
 
         let resume_result = if let Some(history) = history {
             self.resume_thread_from_history(history.as_slice())
@@ -2988,21 +3023,6 @@ impl ThreadRequestProcessor {
         };
 
         let history_cwd = thread_history.session_cwd();
-        let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
-        let mut typesafe_overrides = self.build_thread_config_overrides(
-            model,
-            model_provider,
-            service_tier,
-            cwd,
-            runtime_workspace_roots,
-            approval_policy,
-            approvals_reviewer,
-            sandbox,
-            permissions,
-            base_instructions,
-            developer_instructions,
-            personality,
-        );
         self.load_and_apply_persisted_resume_metadata(
             &thread_history,
             &mut request_overrides,
@@ -3205,6 +3225,109 @@ impl ThreadRequestProcessor {
         Ok(())
     }
 
+    fn uses_postgres_thread_store(&self) -> bool {
+        matches!(
+            self.config.experimental_thread_store,
+            codex_core::config::ThreadStoreConfig::Postgres { .. }
+        )
+    }
+
+    async fn respond_to_lightweight_postgres_resume(
+        &self,
+        request_id: ConnectionRequestId,
+        stored_thread: StoredThread,
+        mut request_overrides: Option<HashMap<String, serde_json::Value>>,
+        mut typesafe_overrides: ConfigOverrides,
+    ) -> Result<(), JSONRPCErrorError> {
+        let thread_id = stored_thread.thread_id;
+        let stored_model = stored_thread.model.clone();
+        let stored_model_provider = stored_thread.model_provider.clone();
+        let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
+        merge_stored_thread_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &stored_thread,
+        );
+        let history_cwd = Some(stored_thread.cwd.clone());
+        let config = match self
+            .config_manager
+            .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
+            .await
+        {
+            Ok(config) => config,
+            Err(err) => {
+                self.outgoing
+                    .send_error(request_id, config_load_error(&err))
+                    .await;
+                return Ok(());
+            }
+        };
+        let Some(model) = config
+            .model
+            .clone()
+            .filter(|model| !model.trim().is_empty())
+            .or_else(|| {
+                stored_model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+            })
+        else {
+            self.outgoing
+                .send_error(
+                    request_id,
+                    internal_error(format!(
+                        "thread {thread_id} has no persisted model for lightweight resume"
+                    )),
+                )
+                .await;
+            return Ok(());
+        };
+        let model_provider = config.model_provider_id.clone();
+        let reasoning_effort = config
+            .model_reasoning_effort
+            .clone()
+            .or(stored_reasoning_effort.clone());
+        let mut thread =
+            self.stored_thread_to_api_thread(stored_thread, model_provider.as_str(), false);
+        thread.status = ThreadStatus::NotLoaded;
+        let permission_profile = config.permissions.effective_permission_profile();
+        let sandbox = thread_response_sandbox_policy(&permission_profile, config.cwd.as_path());
+        let active_permission_profile = thread_response_active_permission_profile(
+            config.permissions.active_permission_profile(),
+        );
+        let metadata = ResumeModelMetadata {
+            model: Some(model.clone()),
+            model_provider: Some(model_provider.clone()),
+            reasoning_effort: reasoning_effort.clone(),
+        };
+        if let Some(patch) = resume_model_metadata_patch(
+            &metadata,
+            stored_model.as_deref(),
+            Some(stored_model_provider.as_str()),
+            stored_reasoning_effort.as_ref(),
+        ) {
+            self.backfill_resume_model_metadata(thread_id, patch).await;
+        }
+        let response = ThreadResumeResponse {
+            thread,
+            model,
+            model_provider,
+            service_tier: config.service_tier.clone(),
+            cwd: config.cwd.clone(),
+            runtime_workspace_roots: config.effective_workspace_roots(),
+            instruction_sources: Vec::new(),
+            approval_policy: config.permissions.approval_policy.value().into(),
+            approvals_reviewer: config.approvals_reviewer.into(),
+            sandbox,
+            active_permission_profile,
+            reasoning_effort,
+            multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
+            initial_turns_page: None,
+        };
+        self.outgoing.send_response(request_id, response).await;
+        Ok(())
+    }
+
     async fn load_and_apply_persisted_resume_metadata(
         &self,
         thread_history: &InitialHistory,
@@ -3291,20 +3414,22 @@ impl ThreadRequestProcessor {
         } else if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
             && let Ok(existing_thread) = self.thread_manager.get_thread(existing_thread_id).await
         {
+            let include_history = !self.should_use_lightweight_postgres_resume(params);
             let source_thread = self
                 .read_stored_thread_for_resume(
                     &params.thread_id,
                     /*path*/ None,
-                    /*include_history*/ true,
+                    include_history,
                 )
                 .await?;
             Some((existing_thread_id, existing_thread, source_thread))
         } else {
+            let include_history = !self.should_use_lightweight_postgres_resume(params);
             let source_thread = self
                 .read_stored_thread_for_resume(
                     &params.thread_id,
                     params.path.as_ref(),
-                    /*include_history*/ true,
+                    include_history,
                 )
                 .await?;
             let existing_thread_id = source_thread.thread_id;
@@ -3382,6 +3507,7 @@ impl ThreadRequestProcessor {
                 .history
                 .take()
                 .map(|history| history.items)
+                .or_else(|| params.exclude_turns.then(Vec::new))
                 .ok_or_else(|| {
                     internal_error(format!(
                         "thread {existing_thread_id} did not include persisted history"
@@ -3450,6 +3576,13 @@ impl ThreadRequestProcessor {
             return Ok(RunningThreadResumeResult::Handled);
         }
         Ok(RunningThreadResumeResult::NotRunning(None))
+    }
+
+    fn should_use_lightweight_postgres_resume(&self, params: &ThreadResumeParams) -> bool {
+        self.uses_postgres_thread_store()
+            && params.exclude_turns
+            && params.history.is_none()
+            && params.initial_turns_page.is_none()
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
