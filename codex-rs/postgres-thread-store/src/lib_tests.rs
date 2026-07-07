@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -97,6 +98,24 @@ fn stored_thread_json_with_memory_mode_sets_canonical_field() {
     .expect("stored thread JSON");
 
     assert_eq!(value["memory_mode"], "disabled");
+}
+
+#[test]
+fn stored_thread_json_preserves_model_metadata() {
+    let stored = StoredThread {
+        model: Some("gpt-5.5".to_string()),
+        reasoning_effort: Some(ReasoningEffort::XHigh),
+        ..sample_stored_thread()
+    };
+
+    let value = stored_thread_json_with_memory_mode_key(
+        &stored,
+        thread_memory_mode_key(ThreadMemoryMode::Enabled),
+    )
+    .expect("stored thread JSON");
+
+    assert_eq!(value["model"], "gpt-5.5");
+    assert_eq!(value["reasoning_effort"], "xhigh");
 }
 
 #[test]

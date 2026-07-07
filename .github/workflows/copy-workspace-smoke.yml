@@ -26,6 +26,16 @@ on:
         required: false
         type: string
         default: "8"
+      expected_model:
+        description: Expected model for copy workspace start/resume smoke.
+        required: false
+        type: string
+        default: gpt-5.5
+      expected_model_provider:
+        description: Expected model provider for copy workspace start/resume smoke.
+        required: false
+        type: string
+        default: openai
 
 permissions:
   contents: read
@@ -42,6 +52,8 @@ jobs:
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
       COPY_WORKSPACE_CANONICAL_WORKSPACE_ID: codex-workspace
       COPY_WORKSPACE_MIN_INTERACTIVE_THREADS: "8"
+      COPY_WORKSPACE_EXPECTED_MODEL: gpt-5.5
+      COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER: openai
       COPY_WORKSPACE_PG_PROBE_IMAGE: dockerhub.aiebk.cn/library/postgres:16-alpine
       COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS: "120"
       COPY_WORKSPACE_RESUME_THREAD_ID: 019f1846-9419-7853-b035-f2ba0fad3d72
@@ -73,6 +85,14 @@ jobs:
           min_interactive_threads="${{ github.event.inputs.min_interactive_threads }}"
           if [ -z "${min_interactive_threads}" ]; then
             min_interactive_threads="${COPY_WORKSPACE_MIN_INTERACTIVE_THREADS}"
+          fi
+          expected_model="${{ github.event.inputs.expected_model }}"
+          if [ -z "${expected_model}" ]; then
+            expected_model="${COPY_WORKSPACE_EXPECTED_MODEL}"
+          fi
+          expected_model_provider="${{ github.event.inputs.expected_model_provider }}"
+          if [ -z "${expected_model_provider}" ]; then
+            expected_model_provider="${COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER}"
           fi
 
           smoke_script="/tmp/copy_workspace_smoke.py"
@@ -141,6 +161,8 @@ jobs:
             --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
             --resume-thread-id "${resume_thread_id}" \
             --min-interactive-threads "${min_interactive_threads}" \
+            --expected-model "${expected_model}" \
+            --expected-model-provider "${expected_model_provider}" \
             --keep-smoke-thread \
             --summary-json-path "${summary_path}"
 
@@ -187,6 +209,18 @@ jobs:
             echo "::error::Missing smoke thread outputs from control plane step"
             exit 1
           fi
+          resume_thread_id="${{ github.event.inputs.resume_thread_id }}"
+          if [ -z "${resume_thread_id}" ]; then
+            resume_thread_id="${COPY_WORKSPACE_RESUME_THREAD_ID}"
+          fi
+          expected_model="${{ github.event.inputs.expected_model }}"
+          if [ -z "${expected_model}" ]; then
+            expected_model="${COPY_WORKSPACE_EXPECTED_MODEL}"
+          fi
+          expected_model_provider="${{ github.event.inputs.expected_model_provider }}"
+          if [ -z "${expected_model_provider}" ]; then
+            expected_model_provider="${COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER}"
+          fi
 
           sql_file="$(mktemp)"
           cat >"${sql_file}" <<'SQL'
@@ -198,6 +232,10 @@ jobs:
           DO $probe$
           DECLARE
               workspace TEXT := '__WORKSPACE_ID__';
+              known_thread_id TEXT := '__KNOWN_THREAD_ID__';
+              smoke_thread_id TEXT := '__SMOKE_THREAD_ID__';
+              expected_model TEXT := '__EXPECTED_MODEL__';
+              expected_provider TEXT := '__EXPECTED_PROVIDER__';
               value_count BIGINT := 0;
               route TEXT := 'none';
           BEGIN
@@ -362,6 +400,54 @@ jobs:
               INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_goal_objective_match', value_count::TEXT);
 
               value_count := 0;
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.threads
+                       WHERE id = $1
+                         AND model = $2'
+                      INTO value_count
+                      USING known_thread_id, expected_model;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('known_thread_model_match', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.threads
+                       WHERE id = $1
+                         AND model_provider = $2'
+                      INTO value_count
+                      USING known_thread_id, expected_provider;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('known_thread_provider_match', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.threads
+                       WHERE id = $1
+                         AND model = $2'
+                      INTO value_count
+                      USING smoke_thread_id, expected_model;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_model_match', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.threads
+                       WHERE id = $1
+                         AND model_provider = $2'
+                      INTO value_count
+                      USING smoke_thread_id, expected_provider;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_provider_match', value_count::TEXT);
+
+              value_count := 0;
               route := 'none';
               IF to_regclass('public.memories') IS NOT NULL THEN
                   IF EXISTS (
@@ -480,8 +566,11 @@ jobs:
           ORDER BY metric;
           SQL
           sed -i.bak "s/__WORKSPACE_ID__/${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}/g" "${sql_file}"
+          sed -i.bak "s/__KNOWN_THREAD_ID__/${resume_thread_id}/g" "${sql_file}"
           sed -i.bak "s/__SMOKE_THREAD_ID__/${smoke_thread_id}/g" "${sql_file}"
           sed -i.bak "s/__SMOKE_GOAL_OBJECTIVE__/${smoke_goal_objective}/g" "${sql_file}"
+          sed -i.bak "s/__EXPECTED_MODEL__/${expected_model}/g" "${sql_file}"
+          sed -i.bak "s/__EXPECTED_PROVIDER__/${expected_model_provider}/g" "${sql_file}"
           rm -f "${sql_file}.bak"
 
           probe_name="copy-workspace-pg-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -517,6 +606,10 @@ jobs:
           memory_jobs=0
           smoke_thread_goal_count=0
           smoke_thread_goal_objective_match=0
+          known_thread_model_match=0
+          known_thread_provider_match=0
+          smoke_thread_model_match=0
+          smoke_thread_provider_match=0
           threads_workspace_route=none
           while IFS='=' read -r metric value; do
             case "${metric}" in
@@ -527,6 +620,10 @@ jobs:
               memory_jobs) memory_jobs="${value}" ;;
               smoke_thread_goal_count) smoke_thread_goal_count="${value}" ;;
               smoke_thread_goal_objective_match) smoke_thread_goal_objective_match="${value}" ;;
+              known_thread_model_match) known_thread_model_match="${value}" ;;
+              known_thread_provider_match) known_thread_provider_match="${value}" ;;
+              smoke_thread_model_match) smoke_thread_model_match="${value}" ;;
+              smoke_thread_provider_match) smoke_thread_provider_match="${value}" ;;
               threads_workspace_route) threads_workspace_route="${value}" ;;
             esac
           done <<< "${counts}"
@@ -548,6 +645,14 @@ jobs:
           fi
           if [ "${smoke_thread_goal_objective_match}" -lt 1 ]; then
             echo "::error::Expected PostgreSQL smoke thread goal objective to match ${smoke_goal_objective}"
+            exit 1
+          fi
+          if [ "${known_thread_model_match}" -lt 1 ] || [ "${known_thread_provider_match}" -lt 1 ]; then
+            echo "::error::Expected known thread ${resume_thread_id} to have model=${expected_model} provider=${expected_model_provider} in PostgreSQL"
+            exit 1
+          fi
+          if [ "${smoke_thread_model_match}" -lt 1 ] || [ "${smoke_thread_provider_match}" -lt 1 ]; then
+            echo "::error::Expected smoke thread ${smoke_thread_id} to have model=${expected_model} provider=${expected_model_provider} in PostgreSQL"
             exit 1
           fi
           if [ "${memories}" -lt 1 ] && [ "${memory_stage1_outputs}" -lt 1 ]; then

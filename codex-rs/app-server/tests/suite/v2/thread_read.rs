@@ -1548,6 +1548,8 @@ async fn seed_pathless_store_thread(
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
+                model: None,
+                reasoning_effort: None,
                 memory_mode: ThreadMemoryMode::Disabled,
             },
         })

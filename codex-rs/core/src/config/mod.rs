@@ -2273,7 +2273,7 @@ fn resolve_tool_suggest_config_from_config(
 
 fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConfig {
     match thread_store {
-        Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
+        Some(ThreadStoreToml::Local {}) => default_thread_store_config(None),
         Some(ThreadStoreToml::Postgres {
             database_url_env,
             default_workspace_id,
@@ -2284,11 +2284,19 @@ fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConf
             redis_url_env,
         },
         Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
-        None => ThreadStoreConfig::Postgres {
-            database_url_env: codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV.to_string(),
-            default_workspace_id: codex_postgres_thread_store::DEFAULT_WORKSPACE_ID.to_string(),
-            redis_url_env: Some("CODEX_REDIS_URL".to_string()),
-        },
+        None => default_thread_store_config(
+            std::env::var(codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV)
+                .ok()
+                .as_deref(),
+        ),
+    }
+}
+
+fn default_thread_store_config(_database_url: Option<&str>) -> ThreadStoreConfig {
+    ThreadStoreConfig::Postgres {
+        database_url_env: codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV.to_string(),
+        default_workspace_id: codex_postgres_thread_store::DEFAULT_WORKSPACE_ID.to_string(),
+        redis_url_env: Some("CODEX_REDIS_URL".to_string()),
     }
 }
 

@@ -61,6 +61,8 @@ impl ThreadMetadataSync {
         };
         let update = ThreadMetadataPatch {
             model_provider: Some(params.metadata.model_provider.clone()),
+            model: params.metadata.model.clone(),
+            reasoning_effort: params.metadata.reasoning_effort.clone(),
             created_at: Some(created_at),
             updated_at: Some(created_at),
             source: Some(params.source.clone()),
@@ -105,6 +107,14 @@ impl ThreadMetadataSync {
             defer_create_update_until_history_exists: false,
             defer_resume_update_until_append: false,
         };
+        sync.merge_pending_update(Some(ThreadMetadataPatch {
+            model_provider: Some(params.metadata.model_provider.clone()),
+            model: params.metadata.model.clone(),
+            reasoning_effort: params.metadata.reasoning_effort.clone(),
+            cwd: params.metadata.cwd.clone(),
+            memory_mode: Some(params.metadata.memory_mode),
+            ..Default::default()
+        }));
         if let Some(history) = params.history.as_deref() {
             sync.record_resume_history(history);
         }
@@ -244,6 +254,29 @@ impl ThreadMetadataSync {
                     update.approval_mode = Some(turn_ctx.approval_policy);
                     update.permission_profile = Some(turn_ctx.permission_profile());
                 }
+                RolloutItem::EventMsg(EventMsg::SessionConfigured(event)) => {
+                    update.model = Some(event.model.clone());
+                    update.model_provider = Some(event.model_provider_id.clone());
+                    update.reasoning_effort = event.reasoning_effort.clone();
+                    if !self.cwd_seen {
+                        self.cwd_seen = true;
+                        update.cwd = Some(event.cwd.clone().into_path_buf());
+                    }
+                    update.approval_mode = Some(event.approval_policy);
+                    update.permission_profile = Some(event.permission_profile.clone());
+                }
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                    let settings = &event.thread_settings;
+                    update.model = Some(settings.model.clone());
+                    update.model_provider = Some(settings.model_provider_id.clone());
+                    update.reasoning_effort = settings.reasoning_effort.clone();
+                    if !self.cwd_seen {
+                        self.cwd_seen = true;
+                        update.cwd = Some(settings.cwd.clone().into_path_buf());
+                    }
+                    update.approval_mode = Some(settings.approval_policy);
+                    update.permission_profile = Some(settings.permission_profile.clone());
+                }
                 RolloutItem::EventMsg(EventMsg::UserMessage(user)) => {
                     self.observe_user_message(user, &mut update);
                 }
@@ -374,7 +407,11 @@ fn git_info_patch_from_observation(git_info: GitInfo) -> GitInfoPatch {
 mod tests {
     use std::sync::Arc;
 
+    use codex_protocol::SessionId;
+    use codex_protocol::dynamic_tools::DynamicToolSpec;
     use codex_protocol::items::UserMessageItem;
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::SessionMeta;
@@ -383,6 +420,7 @@ mod tests {
     use codex_protocol::protocol::ThreadGoal;
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
+    use codex_protocol::protocol::ThreadHistoryMode;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::UserInput;
@@ -390,6 +428,41 @@ mod tests {
 
     use super::*;
     use crate::ThreadPersistenceMetadata;
+
+    #[tokio::test]
+    async fn create_metadata_includes_effective_model_immediately() {
+        let thread_id = ThreadId::new();
+        let sync = ThreadMetadataSync::for_create(&CreateThreadParams {
+            session_id: SessionId::new(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test-originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::<DynamicToolSpec>::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Paginated,
+            initial_window_id: "test-window".to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: None,
+                model_provider: "openai".to_string(),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffort::XHigh),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await;
+
+        let update = sync.take_pending_update().expect("pending create metadata");
+
+        assert_eq!(update.patch.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(update.patch.reasoning_effort, Some(ReasoningEffort::XHigh));
+        assert_eq!(update.patch.model_provider.as_deref(), Some("openai"));
+    }
 
     #[test]
     fn resume_history_keeps_derived_metadata_pending_until_applied() {
@@ -584,6 +657,8 @@ mod tests {
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
+                model: None,
+                reasoning_effort: None,
                 memory_mode: ThreadMemoryMode::Enabled,
             },
         }
