@@ -21,6 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -128,13 +129,10 @@ jobs:
       HTTP_PROXY: http://10.42.0.1:10809
       NO_PROXY: 127.0.0.1,localhost,10.0.0.0/8,10.42.0.0/16,202.189.11.100
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: codex-linux-glibc235
-          path: codex-artifact
-
       - name: Deploy artifact from self-hosted runner
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -142,6 +140,57 @@ jobs:
             echo "::error::Missing build sha256 output"
             exit 1
           fi
+
+          rm -rf codex-artifact
+          mkdir -p codex-artifact
+          artifact_zip="${RUNNER_TEMP:-/tmp}/codex-linux-glibc235-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.zip"
+          artifact_url="$(
+            curl -fsSL \
+              --retry 5 \
+              --connect-timeout 15 \
+              --max-time 60 \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+              | python3 -c '
+          import json
+          import sys
+
+          payload = json.load(sys.stdin)
+          for artifact in payload.get("artifacts", []):
+              if artifact.get("name") == "codex-linux-glibc235" and not artifact.get("expired"):
+                  print(
+                      "artifact id={} size={}".format(
+                          artifact.get("id"), artifact.get("size_in_bytes")
+                      ),
+                      file=sys.stderr,
+                  )
+                  print(artifact["archive_download_url"])
+                  break
+          else:
+              raise SystemExit("codex-linux-glibc235 artifact was not found")
+          '
+          )"
+          echo "Downloading ${artifact_url}"
+          curl -fL \
+            --retry 5 \
+            --connect-timeout 15 \
+            --max-time 420 \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${artifact_url}" \
+            -o "${artifact_zip}"
+          python3 - "${artifact_zip}" codex-artifact <<'PY'
+          import sys
+          import zipfile
+
+          artifact_zip, output_dir = sys.argv[1:]
+          with zipfile.ZipFile(artifact_zip) as archive:
+              archive.extractall(output_dir)
+              for info in archive.infolist():
+                  print(f"extracted {info.filename} {info.file_size}")
+          PY
+          ls -lh codex-artifact
 
           artifact="codex-artifact/codex"
           test -f "${artifact}"
