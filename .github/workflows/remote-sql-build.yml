@@ -322,19 +322,16 @@ jobs:
       HTTP_PROXY: http://10.42.0.1:10809
       NO_PROXY: 127.0.0.1,localhost,10.0.0.0/8,10.42.0.0/16,202.189.11.100
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
       - name: Smoke test copy workspace control plane
         shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          smoke_script="/tmp/copy_workspace_smoke.py"
-          curl -fsSL \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github.raw" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.github/scripts/copy_workspace_smoke.py?ref=${GITHUB_SHA}" \
-            -o "${smoke_script}"
+          smoke_script="${GITHUB_WORKSPACE}/.github/scripts/copy_workspace_smoke.py"
           chmod 0755 "${smoke_script}"
 
           pod="$(
