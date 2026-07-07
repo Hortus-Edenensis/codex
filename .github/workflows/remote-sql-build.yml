@@ -190,6 +190,7 @@ jobs:
 
           ts="$(date +%Y%m%d%H%M%S)"
           for dest in \
+            "/home/codex/.codex/packages/standalone/current/bin/codex" \
             "/home/codex/.codex/packages/standalone/releases/${release_name}/bin/codex" \
             "/workspace/shared-state/.git/codex-persist/codex-standalone/releases/${release_name}/bin/codex"
           do
@@ -234,6 +235,9 @@ jobs:
             CODEX_REMOTE_SQL_URL="${CODEX_REMOTE_SQL_URL:-}" \
             CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \
             su -m codex -c "${codex_bin} app-server daemon stop" || true
+          pkill -TERM -u codex -f "codex app-server" || true
+          sleep 2
+          pkill -KILL -u codex -f "codex app-server" || true
           env HOME=/home/codex USER=codex LOGNAME=codex \
             CODEX_REMOTE_SQL_URL="${CODEX_REMOTE_SQL_URL:-}" \
             CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \
