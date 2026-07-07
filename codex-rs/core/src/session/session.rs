@@ -1311,11 +1311,11 @@ fn generated_memory_store_for_session(
     if ephemeral {
         return None;
     }
+    if let Some(store) = thread_store.as_any().downcast_ref::<PostgresThreadStore>() {
+        return Some(Arc::new(store.clone()) as Arc<dyn GeneratedMemoryStore>);
+    }
     if let Some(state_db) = state_db {
         return Some(Arc::new(state_db.memories().clone()) as Arc<dyn GeneratedMemoryStore>);
     }
-    thread_store
-        .as_any()
-        .downcast_ref::<PostgresThreadStore>()
-        .map(|store| Arc::new(store.clone()) as Arc<dyn GeneratedMemoryStore>)
+    None
 }

@@ -60,14 +60,22 @@ where
         goal_service,
         environment_manager,
         executor_skill_provider,
-        thread_store: _thread_store,
+        thread_store,
     } = dependencies;
     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(event_sink);
     if let Some(goal_store) = goal_store {
+        let preview_state_db = if thread_store
+            .as_any()
+            .is::<codex_postgres_thread_store::PostgresThreadStore>()
+        {
+            None
+        } else {
+            state_db
+        };
         codex_goal_extension::install_with_goal_store(
             &mut builder,
             goal_store,
-            state_db,
+            preview_state_db,
             analytics_events_client,
             codex_otel::global(),
             thread_manager,

@@ -79,7 +79,7 @@ pub async fn handle(
     }
 
     let cwd = single_local_environment_cwd(&turn)?;
-    let db = required_state_db(&session)?;
+    let db = required_agent_job_store(&session)?;
     let input_path = cwd.join(args.csv_path);
     let input_path_display = input_path.display().to_string();
     let csv_content = tokio::fs::read_to_string(&input_path)
