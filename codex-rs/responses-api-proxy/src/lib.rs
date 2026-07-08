@@ -290,12 +290,14 @@ fn forward_request(
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let should_fold = candidate_continue_thinking
-        && status.is_success()
-        && content_type.contains("text/event-stream");
+    let fold_body_json = body_json.filter(|_| {
+        candidate_continue_thinking
+            && status.is_success()
+            && content_type.contains("text/event-stream")
+    });
+    let should_fold = fold_body_json.is_some();
 
-    let response_body: Box<dyn Read + Send> = if should_fold {
-        let body_json = body_json.expect("checked above");
+    let response_body: Box<dyn Read + Send> = if let Some(body_json) = fold_body_json {
         let folded_body = create_folded_body(
             upstream_resp,
             client.clone(),
