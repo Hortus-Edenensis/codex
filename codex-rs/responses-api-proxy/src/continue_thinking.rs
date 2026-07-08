@@ -341,9 +341,9 @@ mod tests {
             json!({
                 "input_tokens": 10,
                 "input_tokens_details": {"cached_tokens": 3},
-                "output_tokens": 536,
+                "output_tokens": 556,
                 "output_tokens_details": {"reasoning_tokens": 536},
-                "total_tokens": 546
+                "total_tokens": 566
             })
         );
         assert_eq!(reasoning_tokens_from_usage(Some(&second_usage)), Some(20));
