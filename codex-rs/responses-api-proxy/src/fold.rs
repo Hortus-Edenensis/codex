@@ -439,13 +439,21 @@ mod tests {
 
         let events = collect_output(rx);
         assert_eq!(events[0]["type"], json!("response.created"));
+        assert_eq!(events[1]["type"], json!("response.output_item.added"));
         assert_eq!(events[1]["item"]["id"], json!("r1"));
-        assert_eq!(events[2]["item"]["id"], json!("r2"));
-        assert_eq!(events[3]["item"]["id"], json!("m2"));
+        assert_eq!(events[2]["type"], json!("response.output_item.done"));
+        assert_eq!(events[2]["item"]["id"], json!("r1"));
+        assert_eq!(events[3]["type"], json!("response.output_item.added"));
+        assert_eq!(events[3]["item"]["id"], json!("r2"));
+        assert_eq!(events[4]["type"], json!("response.output_item.done"));
+        assert_eq!(events[4]["item"]["id"], json!("r2"));
+        assert_eq!(events[5]["type"], json!("response.output_item.added"));
+        assert_eq!(events[5]["item"]["id"], json!("m2"));
         assert_eq!(
-            events[5]["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            events[8]["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
             json!(536)
         );
+        assert_eq!(events[8]["response"]["usage"]["output_tokens"], json!(556));
         assert_eq!(
             events
                 .iter()
@@ -493,8 +501,13 @@ mod tests {
         drop(tx);
 
         let events = collect_output(rx);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["type"], json!("response.output_item.added"));
         assert_eq!(events[0]["item"]["id"], json!("m1"));
-        assert_eq!(events[2]["response"]["id"], json!("resp-1"));
+        assert_eq!(events[2]["type"], json!("response.output_item.done"));
+        assert_eq!(events[2]["item"]["id"], json!("m1"));
+        assert_eq!(events[3]["type"], json!("response.completed"));
+        assert_eq!(events[3]["response"]["id"], json!("resp-1"));
     }
 
     #[test]
@@ -531,8 +544,16 @@ mod tests {
         drop(tx);
 
         let events = collect_output(rx);
+        assert_eq!(events.len(), 6);
+        assert_eq!(events[0]["type"], json!("response.output_item.added"));
         assert_eq!(events[0]["item"]["id"], json!("r1"));
-        assert_eq!(events[1]["item"]["id"], json!("m1"));
-        assert_eq!(events[3]["response"]["id"], json!("resp-1"));
+        assert_eq!(events[1]["type"], json!("response.output_item.done"));
+        assert_eq!(events[1]["item"]["id"], json!("r1"));
+        assert_eq!(events[2]["type"], json!("response.output_item.added"));
+        assert_eq!(events[2]["item"]["id"], json!("m1"));
+        assert_eq!(events[4]["type"], json!("response.output_item.done"));
+        assert_eq!(events[4]["item"]["id"], json!("m1"));
+        assert_eq!(events[5]["type"], json!("response.completed"));
+        assert_eq!(events[5]["response"]["id"], json!("resp-1"));
     }
 }
