@@ -106,11 +106,22 @@ jobs:
           fi
 
           smoke_script="/tmp/copy_workspace_smoke.py"
-          curl -fsSL \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github.raw" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.github/scripts/copy_workspace_smoke.py?ref=${GITHUB_SHA}" \
-            -o "${smoke_script}"
+          for attempt in 1 2 3; do
+            rm -f "${smoke_script}"
+            if curl -fsSL \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.github/scripts/copy_workspace_smoke.py?ref=${GITHUB_SHA}" \
+              -o "${smoke_script}"; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::Failed to download copy-workspace smoke script after ${attempt} attempts"
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
+          test -s "${smoke_script}"
           chmod 0755 "${smoke_script}"
 
           pod="$(
