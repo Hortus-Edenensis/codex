@@ -205,7 +205,7 @@ jobs:
 
           pod="$(
             kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
-              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" { print $1; exit }'
+              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" && !printed { print $1; printed = 1 }'
           )"
           if [ -z "${pod}" ]; then
             echo "::error::No running ${CODEX_DEPLOY_POD_PREFIX} pod found"
@@ -337,7 +337,7 @@ jobs:
 
           pod="$(
             kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
-              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" { print $1; exit }'
+              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" && !printed { print $1; printed = 1 }'
           )"
           if [ -z "${pod}" ]; then
             echo "::error::No running ${CODEX_DEPLOY_POD_PREFIX} pod found"
