@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: gpt-5.5
+      expected_resume_model:
+        description: Expected persisted model for the known thread used by thread/read and thread/resume.
+        required: false
+        type: string
+        default: gpt-5.4
       expected_model_provider:
         description: Expected model provider for copy workspace start/resume smoke.
         required: false
@@ -53,6 +58,7 @@ jobs:
       COPY_WORKSPACE_CANONICAL_WORKSPACE_ID: codex-workspace
       COPY_WORKSPACE_MIN_INTERACTIVE_THREADS: "8"
       COPY_WORKSPACE_EXPECTED_MODEL: gpt-5.5
+      COPY_WORKSPACE_EXPECTED_RESUME_MODEL: gpt-5.4
       COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER: openai
       COPY_WORKSPACE_PG_PROBE_IMAGE: dockerhub.aiebk.cn/library/postgres:16-alpine
       COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS: "120"
@@ -89,6 +95,10 @@ jobs:
           expected_model="${{ github.event.inputs.expected_model }}"
           if [ -z "${expected_model}" ]; then
             expected_model="${COPY_WORKSPACE_EXPECTED_MODEL}"
+          fi
+          expected_resume_model="${{ github.event.inputs.expected_resume_model }}"
+          if [ -z "${expected_resume_model}" ]; then
+            expected_resume_model="${COPY_WORKSPACE_EXPECTED_RESUME_MODEL}"
           fi
           expected_model_provider="${{ github.event.inputs.expected_model_provider }}"
           if [ -z "${expected_model_provider}" ]; then
@@ -162,6 +172,7 @@ jobs:
             --resume-thread-id "${resume_thread_id}" \
             --min-interactive-threads "${min_interactive_threads}" \
             --expected-model "${expected_model}" \
+            --expected-resume-model "${expected_resume_model}" \
             --expected-model-provider "${expected_model_provider}" \
             --keep-smoke-thread \
             --summary-json-path "${summary_path}"
@@ -217,6 +228,10 @@ jobs:
           if [ -z "${expected_model}" ]; then
             expected_model="${COPY_WORKSPACE_EXPECTED_MODEL}"
           fi
+          expected_resume_model="${{ github.event.inputs.expected_resume_model }}"
+          if [ -z "${expected_resume_model}" ]; then
+            expected_resume_model="${COPY_WORKSPACE_EXPECTED_RESUME_MODEL}"
+          fi
           expected_model_provider="${{ github.event.inputs.expected_model_provider }}"
           if [ -z "${expected_model_provider}" ]; then
             expected_model_provider="${COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER}"
@@ -235,6 +250,7 @@ jobs:
               known_thread_id TEXT := '__KNOWN_THREAD_ID__';
               smoke_thread_id TEXT := '__SMOKE_THREAD_ID__';
               expected_model TEXT := '__EXPECTED_MODEL__';
+              expected_resume_model TEXT := '__EXPECTED_RESUME_MODEL__';
               expected_provider TEXT := '__EXPECTED_PROVIDER__';
               value_count BIGINT := 0;
               route TEXT := 'none';
@@ -407,7 +423,7 @@ jobs:
                        WHERE id = $1
                          AND model = $2'
                       INTO value_count
-                      USING known_thread_id, expected_model;
+                      USING known_thread_id, expected_resume_model;
               END IF;
               INSERT INTO probe_results (metric, value) VALUES ('known_thread_model_match', value_count::TEXT);
 
@@ -570,6 +586,7 @@ jobs:
           sed -i.bak "s/__SMOKE_THREAD_ID__/${smoke_thread_id}/g" "${sql_file}"
           sed -i.bak "s/__SMOKE_GOAL_OBJECTIVE__/${smoke_goal_objective}/g" "${sql_file}"
           sed -i.bak "s/__EXPECTED_MODEL__/${expected_model}/g" "${sql_file}"
+          sed -i.bak "s/__EXPECTED_RESUME_MODEL__/${expected_resume_model}/g" "${sql_file}"
           sed -i.bak "s/__EXPECTED_PROVIDER__/${expected_model_provider}/g" "${sql_file}"
           rm -f "${sql_file}.bak"
 
@@ -648,7 +665,7 @@ jobs:
             exit 1
           fi
           if [ "${known_thread_model_match}" -lt 1 ] || [ "${known_thread_provider_match}" -lt 1 ]; then
-            echo "::error::Expected known thread ${resume_thread_id} to have model=${expected_model} provider=${expected_model_provider} in PostgreSQL"
+            echo "::error::Expected known thread ${resume_thread_id} to have model=${expected_resume_model} provider=${expected_model_provider} in PostgreSQL"
             exit 1
           fi
           if [ "${smoke_thread_model_match}" -lt 1 ] || [ "${smoke_thread_provider_match}" -lt 1 ]; then

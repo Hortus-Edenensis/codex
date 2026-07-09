@@ -321,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--container", required=True)
     parser.add_argument("--resume-thread-id")
     parser.add_argument("--expected-model", default="gpt-5.5")
+    parser.add_argument("--expected-resume-model")
     parser.add_argument("--expected-model-provider", default="openai")
     parser.add_argument("--expected-reasoning-effort")
     parser.add_argument("--min-interactive-threads", type=int, default=8)
@@ -508,7 +509,7 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             assert_model_response(
                 "thread/resume known thread",
                 resumed,
-                args.expected_model,
+                args.expected_resume_model or args.expected_model,
                 args.expected_model_provider,
                 args.expected_reasoning_effort,
             )
