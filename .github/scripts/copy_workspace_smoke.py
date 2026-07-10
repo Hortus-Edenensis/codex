@@ -475,7 +475,16 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
 
             listed = client.request(
                 "thread/list",
-                {"limit": 100, "sourceKinds": ["cli", "vscode", "exec", "appServer"]},
+                {
+                    "cwd": "/workspace/repo",
+                    "limit": 100,
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc",
+                    "archived": False,
+                    "modelProviders": None,
+                    "sourceKinds": ["cli", "vscode", "exec", "appServer"],
+                    "useStateDbOnly": False,
+                },
             )
             interactive_threads = listed.get("data")
             if not isinstance(interactive_threads, list):
