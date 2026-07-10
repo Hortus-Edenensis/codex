@@ -473,7 +473,7 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
             codex_home = initialize.get("codexHome")
             print("step: initialize ok", flush=True)
 
-            listed = client.request("thread/list", {"limit": 100, "sourceKinds": []})
+            listed = client.request("thread/list", {"limit": 100})
             interactive_threads = listed.get("data")
             if not isinstance(interactive_threads, list):
                 raise SmokeError("thread/list returned a non-list data payload")
