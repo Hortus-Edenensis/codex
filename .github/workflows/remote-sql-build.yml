@@ -278,6 +278,7 @@ jobs:
           model = "gpt-5.5"
           model_provider = "openai"
           model_reasoning_effort = "xhigh"
+          experimental_thread_store = { type = "postgres", database_url_env = "CODEX_REMOTE_SQL_URL", default_workspace_id = "codex-workspace", redis_url_env = "CODEX_REDIS_URL" }
           COPY_CODEX_CONFIG
           chown codex:codex "${config_tmp}"
           mv -f "${config_tmp}" /home/codex/.codex/config.toml
