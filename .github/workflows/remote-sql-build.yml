@@ -113,7 +113,7 @@ jobs:
   deploy-copy-workspace:
     name: Deploy remote SQL artifact to copy workspace
     runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
-    timeout-minutes: 20
+    timeout-minutes: 45
     needs: linux-cargo-build
     if: ${{ github.event_name == 'push' || inputs.deploy == true }}
     env:
@@ -174,8 +174,9 @@ jobs:
           echo "Downloading ${artifact_url}"
           curl -fL \
             --retry 5 \
+            --retry-all-errors \
             --connect-timeout 15 \
-            --max-time 420 \
+            --max-time 1800 \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "${artifact_url}" \
