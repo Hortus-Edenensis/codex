@@ -2587,6 +2587,9 @@ impl ThreadRequestProcessor {
             thread_status,
             has_live_in_progress_turn,
         );
+        if include_turns {
+            compact_thread_history_image_payloads(&mut thread.turns);
+        }
         Ok(thread)
     }
 
@@ -2722,7 +2725,7 @@ impl ThreadRequestProcessor {
         } else {
             None
         };
-        build_thread_turns_page_response(
+        let mut response = build_thread_turns_page_response(
             &items,
             self.thread_watch_manager
                 .loaded_status_for_thread(&thread_uuid.to_string())
@@ -2735,7 +2738,9 @@ impl ThreadRequestProcessor {
                 sort_direction: sort_direction.unwrap_or(SortDirection::Desc),
                 items_view: items_view.unwrap_or(TurnItemsView::Summary),
             },
-        )
+        )?;
+        compact_thread_history_image_payloads(&mut response.data);
+        Ok(response)
     }
 
     async fn thread_items_list_response_inner(

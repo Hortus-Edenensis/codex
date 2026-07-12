@@ -276,9 +276,9 @@ jobs:
           mkdir -p /home/codex/.codex
           config_tmp="/home/codex/.codex/config.toml.new-gh-deploy.${ts}"
           cat > "${config_tmp}" <<'COPY_CODEX_CONFIG'
-          model = "gpt-5.5"
+          model = "gpt-5.6-sol"
           model_provider = "openai"
-          model_reasoning_effort = "xhigh"
+          model_reasoning_effort = "medium"
           experimental_thread_store = { type = "postgres", database_url_env = "CODEX_REMOTE_SQL_URL", default_workspace_id = "codex-workspace", redis_url_env = "CODEX_REDIS_URL" }
           COPY_CODEX_CONFIG
           chown codex:codex "${config_tmp}"
@@ -316,7 +316,7 @@ jobs:
       CODEX_DEPLOY_CONTAINER: workspace
       CODEX_DEPLOY_NAMESPACE: codex-internal
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
-      COPY_WORKSPACE_EXPECTED_MODEL: gpt-5.5
+      COPY_WORKSPACE_EXPECTED_MODEL: gpt-5.6-sol
       COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER: openai
       COPY_WORKSPACE_MIN_INTERACTIVE_THREADS: "8"
       COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS: "120"
