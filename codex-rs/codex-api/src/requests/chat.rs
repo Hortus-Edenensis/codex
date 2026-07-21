@@ -26,6 +26,8 @@ pub struct ChatRequestBuilder<'a> {
     tools: &'a [Value],
     parallel_tool_calls: bool,
     reasoning_effort: Option<String>,
+    output_schema: Option<&'a Value>,
+    output_schema_strict: bool,
     session_id: Option<String>,
     thread_id: Option<String>,
     session_source: Option<SessionSource>,
@@ -45,6 +47,8 @@ impl<'a> ChatRequestBuilder<'a> {
             tools,
             parallel_tool_calls: false,
             reasoning_effort: None,
+            output_schema: None,
+            output_schema_strict: true,
             session_id: None,
             thread_id: None,
             session_source: None,
@@ -58,6 +62,12 @@ impl<'a> ChatRequestBuilder<'a> {
 
     pub fn reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    pub fn output_schema(mut self, schema: Option<&'a Value>, strict: bool) -> Self {
+        self.output_schema = schema;
+        self.output_schema_strict = strict;
         self
     }
 
@@ -242,6 +252,16 @@ impl<'a> ChatRequestBuilder<'a> {
         });
         if let Some(reasoning_effort) = self.reasoning_effort {
             payload["reasoning_effort"] = json!(reasoning_effort);
+        }
+        if let Some(output_schema) = self.output_schema {
+            payload["response_format"] = json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "codex_output_schema",
+                    "schema": output_schema,
+                    "strict": self.output_schema_strict,
+                },
+            });
         }
         if !self.tools.is_empty() {
             payload["tools"] = json!(self.tools);
@@ -450,5 +470,34 @@ mod tests {
 
         assert_eq!(request.body["messages"][0]["role"], "system");
         assert_eq!(request.body["messages"][0]["content"], "follow this policy");
+    }
+
+    #[test]
+    fn maps_output_schema_to_chat_response_format() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"approved": {"type": "boolean"}},
+            "required": ["approved"],
+            "additionalProperties": false,
+        });
+
+        let request = ChatRequestBuilder::new("kimi-k3", "", &[], &[])
+            .output_schema(Some(&schema), true)
+            .build(&provider())
+            .expect("request");
+
+        assert_eq!(request.body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            request.body["response_format"]["json_schema"]["name"],
+            "codex_output_schema"
+        );
+        assert_eq!(
+            request.body["response_format"]["json_schema"]["schema"],
+            schema
+        );
+        assert_eq!(
+            request.body["response_format"]["json_schema"]["strict"],
+            true
+        );
     }
 }

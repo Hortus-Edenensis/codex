@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codex_api::AgentIdentityTelemetry;
+use codex_api::CompatibleModelInfo;
 use codex_api::ModelsClient;
 use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
@@ -21,12 +22,16 @@ use codex_login::CodexAuth;
 use codex_login::collect_auth_env_telemetry;
 use codex_login::default_client::build_default_reqwest_client_for_route_async;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CoreResult;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_response_debug_context::extract_response_debug_context;
 use codex_response_debug_context::telemetry_transport_error_message;
 use http::HeaderMap;
@@ -105,10 +110,25 @@ impl OpenAiModelsEndpoint {
                 .await?;
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
-            client
-                .list_models(request_url, HeaderMap::new())
-                .await
-                .map_err(map_api_error)
+            if self.provider_info.wire_api == WireApi::Chat {
+                let (models, etag) = client
+                    .list_compatible_models(request_url, HeaderMap::new())
+                    .await
+                    .map_err(map_api_error)?;
+                Ok((
+                    models
+                        .into_iter()
+                        .enumerate()
+                        .map(|(priority, model)| compatible_model_info(model, priority))
+                        .collect(),
+                    etag,
+                ))
+            } else {
+                client
+                    .list_models(request_url, HeaderMap::new())
+                    .await
+                    .map_err(map_api_error)
+            }
         })
         .await
         .map_err(|_| CodexErr::Timeout)?
@@ -121,6 +141,37 @@ impl OpenAiModelsEndpoint {
             .is_some_and(|auth_manager| auth_manager.codex_api_key_env_enabled());
         collect_auth_env_telemetry(&self.provider_info, codex_api_key_env_enabled)
     }
+}
+
+fn compatible_model_info(model: CompatibleModelInfo, priority: usize) -> ModelInfo {
+    let model_id = model.id.clone();
+    let mut info = codex_models_manager::model_info::compatible_model_info_from_slug(&model.id);
+    info.visibility = ModelVisibility::List;
+    info.priority = i32::try_from(priority).unwrap_or(i32::MAX);
+    info.context_window = model.context_length;
+    info.max_context_window = model.context_length;
+    info.supports_parallel_tool_calls = model.supports_dynamic_tools;
+    info.auto_review_model_override = Some(model_id);
+    if model.supports_image_in {
+        info.input_modalities = vec![InputModality::Text, InputModality::Image];
+    } else {
+        info.input_modalities = vec![InputModality::Text];
+    }
+    if model.supports_reasoning
+        && let Some(efforts) = model.reasoning_efforts
+        && efforts.support
+    {
+        info.default_reasoning_level = efforts.default_effort;
+        info.supported_reasoning_levels = efforts
+            .valid_efforts
+            .into_iter()
+            .map(|effort| ReasoningEffortPreset {
+                description: effort.to_string(),
+                effort,
+            })
+            .collect();
+    }
+    info
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
@@ -393,5 +444,39 @@ mod tests {
                 format!("{}/models?client_version=0.0.0", server.uri()),
             ))
         );
+    }
+
+    #[test]
+    fn compatible_model_metadata_preserves_kimi_capabilities() {
+        let model = compatible_model_info(
+            CompatibleModelInfo {
+                id: "kimi-k3".to_string(),
+                context_length: Some(1_048_576),
+                supports_image_in: true,
+                supports_reasoning: true,
+                supports_dynamic_tools: true,
+                reasoning_efforts: Some(codex_api::CompatibleReasoningEfforts {
+                    support: true,
+                    valid_efforts: vec![
+                        codex_protocol::openai_models::ReasoningEffort::Low,
+                        codex_protocol::openai_models::ReasoningEffort::High,
+                        codex_protocol::openai_models::ReasoningEffort::Max,
+                    ],
+                    default_effort: Some(codex_protocol::openai_models::ReasoningEffort::Max),
+                }),
+            },
+            0,
+        );
+
+        assert_eq!(model.slug, "kimi-k3");
+        assert_eq!(model.visibility, ModelVisibility::List);
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(
+            model.default_reasoning_level,
+            Some(codex_protocol::openai_models::ReasoningEffort::Max)
+        );
+        assert_eq!(model.supported_reasoning_levels.len(), 3);
+        assert!(model.supports_parallel_tool_calls);
+        assert!(!model.used_fallback_model_metadata);
     }
 }

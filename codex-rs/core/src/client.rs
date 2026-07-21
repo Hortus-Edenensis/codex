@@ -1541,7 +1541,7 @@ impl ModelClientSession {
     /// Streams a turn through the OpenAI-compatible Chat Completions API.
     ///
     /// This compatibility path is selected explicitly by a provider configured with
-    /// `wire_api = "chat"`. Structured output schemas remain Responses-only.
+    /// `wire_api = "chat"`. Provider differences are translated at the wire boundary.
     #[allow(clippy::too_many_arguments)]
     #[instrument(
         name = "model_client.stream_chat_completions",
@@ -1565,12 +1565,6 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
-        if prompt.output_schema.is_some() {
-            return Err(CodexErr::UnsupportedOperation(
-                "output_schema is not supported for Chat Completions API".to_string(),
-            ));
-        }
-
         let tools = create_tools_json_for_chat_completions_api(&prompt.tools)?;
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
@@ -1602,6 +1596,7 @@ impl ModelClientSession {
             )
             .parallel_tool_calls(prompt.parallel_tool_calls)
             .reasoning_effort(chat_reasoning_effort(&model_info.slug, effort.as_ref()))
+            .output_schema(prompt.output_schema.as_ref(), prompt.output_schema_strict)
             .session_id(Some(responses_metadata.session_id.clone()))
             .thread_id(Some(responses_metadata.thread_id.clone()))
             .session_source(Some(self.client.state.session_source.clone()))

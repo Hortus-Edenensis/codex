@@ -14,6 +14,8 @@ pub use chat::ChatClient;
 pub use compact::CompactClient;
 pub use images::ImagesClient;
 pub use memories::MemoriesClient;
+pub use models::CompatibleModelInfo;
+pub use models::CompatibleReasoningEfforts;
 pub use models::ModelsClient;
 pub use realtime_call::RealtimeCallClient;
 pub use realtime_call::RealtimeCallResponse;
