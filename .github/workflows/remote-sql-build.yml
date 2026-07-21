@@ -129,6 +129,9 @@ jobs:
       HTTP_PROXY: http://10.42.0.1:10809
       NO_PROXY: 127.0.0.1,localhost,10.0.0.0/8,10.42.0.0/16,202.189.11.100
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Deploy artifact from self-hosted runner
         shell: bash
         env:
@@ -214,11 +217,16 @@ jobs:
           fi
 
           pod_artifact="/tmp/codex-${EXPECTED_CODEX_SHA256}"
+          pod_configurator="/tmp/configure-kimi-provider-${GITHUB_SHA}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp "${artifact}" "${pod}:${pod_artifact}" -c "${CODEX_DEPLOY_CONTAINER}"
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp \
+            ".github/scripts/configure_kimi_provider.py" \
+            "${pod}:${pod_configurator}" -c "${CODEX_DEPLOY_CONTAINER}"
           kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -s -- \
             "${EXPECTED_CODEX_SHA256}" "${release_name}" "${pod_artifact}" "${CODEX_DEPLOY_RELEASE_TAG}" \
             "${GITHUB_SHA}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_REF_NAME}" \
-            "${CODEX_DEPLOY_CHANNEL}" <<'POD_SCRIPT'
+            "${CODEX_DEPLOY_CHANNEL}" "${pod_configurator}" \
+            "https://api.moonshot.cn/v1" "kimi-k3" <<'POD_SCRIPT'
           set -eu
 
           expected_sha256="$1"
@@ -230,6 +238,9 @@ jobs:
           github_run_attempt="$7"
           github_ref_name="$8"
           deploy_channel="$9"
+          configurator="${10}"
+          kimi_base_url="${11}"
+          kimi_model="${12}"
 
           actual_line="$(sha256sum "${src}")"
           actual_sha256="${actual_line%% *}"
@@ -274,15 +285,15 @@ jobs:
 
           codex_bin=/home/codex/.codex/packages/standalone/current/bin/codex
           mkdir -p /home/codex/.codex
-          config_tmp="/home/codex/.codex/config.toml.new-gh-deploy.${ts}"
-          cat > "${config_tmp}" <<'COPY_CODEX_CONFIG'
-          model = "gpt-5.6-sol"
-          model_provider = "openai"
-          model_reasoning_effort = "medium"
-          experimental_thread_store = { type = "postgres", database_url_env = "CODEX_REMOTE_SQL_URL", default_workspace_id = "codex-workspace", redis_url_env = "CODEX_REDIS_URL" }
-          COPY_CODEX_CONFIG
-          chown codex:codex "${config_tmp}"
-          mv -f "${config_tmp}" /home/codex/.codex/config.toml
+          config_file=/home/codex/.codex/config.toml
+          if [ -f "${config_file}" ]; then
+            cp "${config_file}" "${config_file}.before-gh-deploy.${ts}"
+          fi
+          python3 "${configurator}" "${config_file}" \
+            --base-url "${kimi_base_url}" \
+            --model "${kimi_model}" \
+            --env-key KIMI_API_KEY
+          chown codex:codex "${config_file}"
           env HOME=/home/codex USER=codex LOGNAME=codex \
             CODEX_REMOTE_SQL_URL="${CODEX_REMOTE_SQL_URL:-}" \
             CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \
@@ -303,7 +314,7 @@ jobs:
             CODEX_REDIS_URL="${CODEX_REDIS_URL:-}" \
             su -s /bin/bash -m codex -c "${codex_bin} app-server daemon version"
           sha256sum "${codex_bin}"
-          rm -f "${src}"
+          rm -f "${src}" "${configurator}"
           POD_SCRIPT
 
   smoke-copy-workspace:
@@ -316,8 +327,8 @@ jobs:
       CODEX_DEPLOY_CONTAINER: workspace
       CODEX_DEPLOY_NAMESPACE: codex-internal
       CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
-      COPY_WORKSPACE_EXPECTED_MODEL: gpt-5.6-sol
-      COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER: openai
+      COPY_WORKSPACE_EXPECTED_MODEL: kimi-k3
+      COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER: kimi
       COPY_WORKSPACE_MIN_INTERACTIVE_THREADS: "8"
       COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS: "120"
       COPY_WORKSPACE_RESUME_THREAD_ID: 019f1846-9419-7853-b035-f2ba0fad3d72
