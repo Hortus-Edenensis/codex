@@ -86,6 +86,10 @@ impl<'a> ChatRequestBuilder<'a> {
         for (index, item) in self.input.iter().enumerate() {
             match item {
                 ResponseItem::Message { role, content, .. } => {
+                    // Chat Completions providers such as Kimi do not accept
+                    // OpenAI's newer `developer` role. Preserve its instruction
+                    // priority by sending it as another system message.
+                    let chat_role = if role == "developer" { "system" } else { role };
                     let mut text = String::new();
                     let mut parts = Vec::new();
                     let mut has_image = false;
@@ -111,7 +115,7 @@ impl<'a> ChatRequestBuilder<'a> {
                     } else {
                         json!(parts)
                     };
-                    let mut message = json!({"role": role, "content": content});
+                    let mut message = json!({"role": chat_role, "content": content});
                     attach_reasoning_content(
                         &mut message,
                         reasoning_by_anchor_index.get(&index).map(String::as_str),
@@ -426,5 +430,25 @@ mod tests {
         assert_eq!(messages[2]["tool_calls"][0]["id"], "call-a");
         assert_eq!(messages[3]["tool_call_id"], "call-a");
         assert_eq!(messages[3]["content"], "A");
+    }
+
+    #[test]
+    fn maps_developer_messages_to_system_for_chat_providers() {
+        let input = vec![ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "follow this policy".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }];
+
+        let request = ChatRequestBuilder::new("kimi-k3", "", &input, &[])
+            .build(&provider())
+            .expect("request");
+
+        assert_eq!(request.body["messages"][0]["role"], "system");
+        assert_eq!(request.body["messages"][0]["content"], "follow this policy");
     }
 }
