@@ -182,7 +182,12 @@ fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffor
     }
 }
 
-fn chat_reasoning_effort(model: &str, effort: Option<&ReasoningEffortConfig>) -> Option<String> {
+fn chat_reasoning_effort(
+    model: &str,
+    effort: Option<&ReasoningEffortConfig>,
+    default_effort: Option<&ReasoningEffortConfig>,
+) -> Option<String> {
+    let effort = effort.or(default_effort);
     if model == "kimi-k3" {
         return Some(
             match effort {
@@ -1595,7 +1600,11 @@ impl ModelClientSession {
                 &tools,
             )
             .parallel_tool_calls(prompt.parallel_tool_calls)
-            .reasoning_effort(chat_reasoning_effort(&model_info.slug, effort.as_ref()))
+            .reasoning_effort(chat_reasoning_effort(
+                &model_info.slug,
+                effort.as_ref(),
+                model_info.default_reasoning_level.as_ref(),
+            ))
             .output_schema(prompt.output_schema.as_ref(), prompt.output_schema_strict)
             .session_id(Some(responses_metadata.session_id.clone()))
             .thread_id(Some(responses_metadata.thread_id.clone()))

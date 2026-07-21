@@ -31,6 +31,7 @@ use codex_protocol::error::Result as CoreResult;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_response_debug_context::extract_response_debug_context;
 use codex_response_debug_context::telemetry_transport_error_message;
@@ -41,7 +42,9 @@ use crate::auth::agent_identity_telemetry;
 use crate::auth::resolve_provider_auth;
 
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const COMPATIBLE_MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 const MODELS_ENDPOINT: &str = "/models";
+const KIMI_CODEX_BEHAVIOR_PROFILE: &str = "gpt-5.5";
 
 /// Provider-owned OpenAI-compatible `/models` endpoint.
 #[derive(Debug)]
@@ -103,7 +106,7 @@ impl OpenAiModelsEndpoint {
             agent_identity_telemetry,
             auth_env: self.auth_env(),
         });
-        timeout(MODELS_REFRESH_TIMEOUT, async {
+        timeout(models_refresh_timeout(&self.provider_info), async {
             let transport = self
                 .transport_builder
                 .build(http_client_factory, request_url.clone())
@@ -111,6 +114,7 @@ impl OpenAiModelsEndpoint {
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
             if self.provider_info.wire_api == WireApi::Chat {
+                let behavior_profile = kimi_codex_behavior_profile(&self.provider_info);
                 let (models, etag) = client
                     .list_compatible_models(request_url, HeaderMap::new())
                     .await
@@ -119,7 +123,9 @@ impl OpenAiModelsEndpoint {
                     models
                         .into_iter()
                         .enumerate()
-                        .map(|(priority, model)| compatible_model_info(model, priority))
+                        .map(|(priority, model)| {
+                            compatible_model_info(model, priority, behavior_profile.as_ref())
+                        })
                         .collect(),
                     etag,
                 ))
@@ -143,9 +149,28 @@ impl OpenAiModelsEndpoint {
     }
 }
 
-fn compatible_model_info(model: CompatibleModelInfo, priority: usize) -> ModelInfo {
+fn models_refresh_timeout(provider_info: &ModelProviderInfo) -> Duration {
+    if provider_info.wire_api == WireApi::Chat {
+        COMPATIBLE_MODELS_REFRESH_TIMEOUT
+    } else {
+        MODELS_REFRESH_TIMEOUT
+    }
+}
+
+fn compatible_model_info(
+    model: CompatibleModelInfo,
+    priority: usize,
+    behavior_profile: Option<&ModelInfo>,
+) -> ModelInfo {
     let model_id = model.id.clone();
     let mut info = codex_models_manager::model_info::compatible_model_info_from_slug(&model.id);
+    if let Some(behavior_profile) = behavior_profile {
+        info.base_instructions
+            .clone_from(&behavior_profile.base_instructions);
+        info.model_messages
+            .clone_from(&behavior_profile.model_messages);
+        info.include_skills_usage_instructions = behavior_profile.include_skills_usage_instructions;
+    }
     info.visibility = ModelVisibility::List;
     info.priority = i32::try_from(priority).unwrap_or(i32::MAX);
     info.context_window = model.context_length;
@@ -157,6 +182,9 @@ fn compatible_model_info(model: CompatibleModelInfo, priority: usize) -> ModelIn
     } else {
         info.input_modalities = vec![InputModality::Text];
     }
+    info.default_reasoning_level = None;
+    info.supported_reasoning_levels.clear();
+    info.supports_reasoning_summaries = model.supports_reasoning;
     if model.supports_reasoning
         && let Some(efforts) = model.reasoning_efforts
         && efforts.support
@@ -170,8 +198,40 @@ fn compatible_model_info(model: CompatibleModelInfo, priority: usize) -> ModelIn
                 effort,
             })
             .collect();
+    } else if model.supports_reasoning {
+        info.default_reasoning_level = Some(ReasoningEffort::High);
+        info.supported_reasoning_levels = [
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ]
+        .into_iter()
+        .map(|effort| ReasoningEffortPreset {
+            description: effort.to_string(),
+            effort,
+        })
+        .collect();
     }
     info
+}
+
+fn kimi_codex_behavior_profile(provider_info: &ModelProviderInfo) -> Option<ModelInfo> {
+    if !is_kimi_provider(provider_info) {
+        return None;
+    }
+    codex_models_manager::bundled_models_response()
+        .ok()?
+        .models
+        .into_iter()
+        .find(|model| model.slug == KIMI_CODEX_BEHAVIOR_PROFILE)
+}
+
+fn is_kimi_provider(provider_info: &ModelProviderInfo) -> bool {
+    provider_info.name.eq_ignore_ascii_case("kimi")
+        || provider_info
+            .base_url
+            .as_deref()
+            .is_some_and(|base_url| base_url.to_ascii_lowercase().contains("moonshot.cn"))
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
@@ -466,6 +526,7 @@ mod tests {
                 }),
             },
             0,
+            None,
         );
 
         assert_eq!(model.slug, "kimi-k3");
@@ -478,5 +539,79 @@ mod tests {
         assert_eq!(model.supported_reasoning_levels.len(), 3);
         assert!(model.supports_parallel_tool_calls);
         assert!(!model.used_fallback_model_metadata);
+    }
+
+    #[test]
+    fn kimi_models_inherit_native_codex_behavior_without_tool_metadata() {
+        let provider_info = ModelProviderInfo {
+            name: "Kimi".to_string(),
+            base_url: Some("https://api.moonshot.cn/v1".to_string()),
+            ..ModelProviderInfo::create_openai_provider(None)
+        };
+        let behavior_profile =
+            kimi_codex_behavior_profile(&provider_info).expect("Kimi behavior profile");
+        let model = compatible_model_info(
+            CompatibleModelInfo {
+                id: "kimi-k3".to_string(),
+                context_length: Some(1_048_576),
+                supports_image_in: false,
+                supports_reasoning: true,
+                supports_dynamic_tools: true,
+                reasoning_efforts: None,
+            },
+            0,
+            Some(&behavior_profile),
+        );
+
+        assert_eq!(model.base_instructions, behavior_profile.base_instructions);
+        assert_eq!(model.model_messages, behavior_profile.model_messages);
+        assert_eq!(model.apply_patch_tool_type, None);
+        assert_eq!(model.context_window, Some(1_048_576));
+    }
+
+    #[test]
+    fn compatible_model_refresh_allows_provider_startup_latency() {
+        let mut provider_info = ModelProviderInfo::create_openai_provider(None);
+        assert_eq!(
+            models_refresh_timeout(&provider_info),
+            MODELS_REFRESH_TIMEOUT
+        );
+
+        provider_info.wire_api = WireApi::Chat;
+        assert_eq!(
+            models_refresh_timeout(&provider_info),
+            COMPATIBLE_MODELS_REFRESH_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn kimi_reasoning_models_without_effort_metadata_default_to_thinking() {
+        let model = compatible_model_info(
+            CompatibleModelInfo {
+                id: "kimi-k2.7-code".to_string(),
+                context_length: Some(262_144),
+                supports_image_in: false,
+                supports_reasoning: true,
+                supports_dynamic_tools: false,
+                reasoning_efforts: None,
+            },
+            0,
+            None,
+        );
+
+        assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::High));
+        assert_eq!(
+            model
+                .supported_reasoning_levels
+                .iter()
+                .map(|preset| preset.effort.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ]
+        );
+        assert!(model.supports_reasoning_summaries);
     }
 }

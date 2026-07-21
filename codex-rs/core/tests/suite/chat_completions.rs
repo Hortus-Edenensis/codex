@@ -71,6 +71,7 @@ async fn chat_provider_uses_native_endpoint_and_kimi_k3_effort() {
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("request JSON");
     assert_eq!(body["model"], "kimi-k3");
     assert_eq!(body["reasoning_effort"], "max");
+    assert_eq!(body["thinking"]["type"], "enabled");
     assert!(body["messages"].as_array().is_some_and(|messages| {
         messages
             .iter()

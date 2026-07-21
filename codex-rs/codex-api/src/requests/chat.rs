@@ -86,7 +86,7 @@ impl<'a> ChatRequestBuilder<'a> {
         self
     }
 
-    pub fn build(self, _provider: &Provider) -> Result<ChatRequest, ApiError> {
+    pub fn build(self, provider: &Provider) -> Result<ChatRequest, ApiError> {
         let mut messages = Vec::new();
         if !self.instructions.trim().is_empty() {
             messages.push(json!({"role": "system", "content": self.instructions}));
@@ -250,8 +250,12 @@ impl<'a> ChatRequestBuilder<'a> {
             "messages": messages,
             "stream": true,
         });
+        let reasoning_enabled = self.reasoning_effort.is_some();
         if let Some(reasoning_effort) = self.reasoning_effort {
             payload["reasoning_effort"] = json!(reasoning_effort);
+        }
+        if reasoning_enabled && uses_kimi_thinking_parameter(provider) {
+            payload["thinking"] = json!({"type": "enabled"});
         }
         if let Some(output_schema) = self.output_schema {
             payload["response_format"] = json!({
@@ -278,6 +282,14 @@ impl<'a> ChatRequestBuilder<'a> {
             headers,
         })
     }
+}
+
+fn uses_kimi_thinking_parameter(provider: &Provider) -> bool {
+    provider.name.eq_ignore_ascii_case("kimi")
+        || provider
+            .base_url
+            .to_ascii_lowercase()
+            .contains("moonshot.cn")
 }
 
 fn collect_reasoning_by_anchor(input: &[ResponseItem]) -> HashMap<usize, String> {
@@ -446,6 +458,7 @@ mod tests {
 
         assert!(request.body.get("max_tokens").is_none());
         assert_eq!(request.body["reasoning_effort"], "max");
+        assert_eq!(request.body["thinking"]["type"], "enabled");
         assert_eq!(messages[2]["reasoning_content"], "need the file");
         assert_eq!(messages[2]["tool_calls"][0]["id"], "call-a");
         assert_eq!(messages[3]["tool_call_id"], "call-a");
@@ -499,5 +512,20 @@ mod tests {
             request.body["response_format"]["json_schema"]["strict"],
             true
         );
+    }
+
+    #[test]
+    fn does_not_add_kimi_thinking_parameter_for_other_chat_providers() {
+        let mut generic_provider = provider();
+        generic_provider.name = "Compatible".to_string();
+        generic_provider.base_url = "https://example.com/v1".to_string();
+
+        let request = ChatRequestBuilder::new("reasoning-model", "", &[], &[])
+            .reasoning_effort(Some("high".to_string()))
+            .build(&generic_provider)
+            .expect("request");
+
+        assert_eq!(request.body["reasoning_effort"], "high");
+        assert!(request.body.get("thinking").is_none());
     }
 }
