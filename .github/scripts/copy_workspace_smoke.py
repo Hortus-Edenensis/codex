@@ -518,13 +518,18 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
                 "thread/resume",
                 {"threadId": args.resume_thread_id, "excludeTurns": True},
             )
-            assert_model_response(
-                "thread/resume known thread",
-                resumed,
-                args.expected_resume_model or args.expected_model,
-                args.expected_model_provider,
-                args.expected_reasoning_effort,
-            )
+            # A persisted thread keeps the model/provider it was created with.
+            # Only assert its model when the caller supplied a historical
+            # expectation explicitly; the current defaults are checked below
+            # with a newly started thread.
+            if args.expected_resume_model is not None:
+                assert_model_response(
+                    "thread/resume known thread",
+                    resumed,
+                    args.expected_resume_model,
+                    None,
+                    None,
+                )
             resumed_thread = resumed.get("thread")
             if (
                 not isinstance(resumed_thread, dict)
@@ -548,11 +553,7 @@ def run_smoke(args: argparse.Namespace) -> SmokeSummary:
                 raise SmokeError("thread/goal/get response for known thread omitted `goal`")
             print("step: thread/goal/get known thread ok", flush=True)
 
-            start_params: Dict[str, Any] = {
-                "personality": "none",
-                "model": args.expected_model,
-                "modelProvider": args.expected_model_provider,
-            }
+            start_params: Dict[str, Any] = {"personality": "none"}
             started = client.request("thread/start", start_params)
             assert_model_response(
                 "thread/start smoke thread",
