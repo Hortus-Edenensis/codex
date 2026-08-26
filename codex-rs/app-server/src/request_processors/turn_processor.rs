@@ -15,6 +15,8 @@ use codex_skills::system_cache_root_dir;
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
 
+const CODEX_DESKTOP_CLIENT_NAME: &str = "codex_desktop";
+
 pub(super) fn validate_user_input_image_urls(
     input: &[V2UserInput],
 ) -> Result<(), JSONRPCErrorError> {
@@ -507,6 +509,7 @@ impl TurnRequestProcessor {
                 .inspect_err(|error| {
                     self.track_error_response(&request_id, error, /*error_type*/ None);
                 })?;
+        let is_codex_desktop = app_server_client_name.as_deref() == Some(CODEX_DESKTOP_CLIENT_NAME);
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
         if let Err(error) = Self::validate_v2_input_limit(&params.input) {
@@ -531,6 +534,24 @@ impl TurnRequestProcessor {
             .map(resolve_runtime_workspace_roots);
         let environment_selections =
             resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
+        let implicit_empty_continuation = params.input.is_empty()
+            && params
+                .turn_trigger
+                .as_deref()
+                .is_none_or(|trigger| trigger.trim().is_empty());
+        if is_codex_desktop
+            && implicit_empty_continuation
+            && self
+                .thread_state_manager
+                .has_completed_resume_turn(thread_id, request_id.connection_id)
+                .await
+        {
+            let error = invalid_request(
+                "resumed completed turn requires an explicit turnTrigger".to_string(),
+            );
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            return Err(error);
+        }
 
         // Map v2 input items to core input items.
         let mapped_items: Vec<CoreInputItem> = params
@@ -605,6 +626,10 @@ impl TurnRequestProcessor {
                 return Err(error);
             }
         };
+
+        self.thread_state_manager
+            .clear_completed_resume_turn(thread_id, request_id.connection_id)
+            .await;
 
         if turn_has_input && started {
             let config_snapshot = thread.config_snapshot().await;

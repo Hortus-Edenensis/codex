@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::DISABLE_PLUGIN_STARTUP_TASKS_ARG;
+use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
 use base64::Engine;
@@ -17,8 +18,14 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::UserInput;
 use codex_core::config::set_project_trust_level;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientBuilder;
@@ -102,6 +109,135 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
     assert_eq!(ws2_config.id, RequestId::Integer(77));
     assert!(ws1_config.result.get("config").is_some());
     assert!(ws2_config.result.get("config").is_some());
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_resume_fence_isolated_across_websocket_connections() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut owner = connect_websocket(bind_addr).await?;
+    let mut desktop = connect_websocket(bind_addr).await?;
+    let request_timeout = Duration::from_secs(10);
+
+    send_initialize_request(&mut owner, /*id*/ 1, "thread_owner").await?;
+    timeout(request_timeout, read_response_for_id(&mut owner, /*id*/ 1))
+        .await
+        .context("timed out initializing the thread owner")??;
+    send_initialize_request(&mut desktop, /*id*/ 1, "codex_desktop").await?;
+    timeout(
+        request_timeout,
+        read_response_for_id(&mut desktop, /*id*/ 1),
+    )
+    .await
+    .context("timed out initializing Codex Desktop")??;
+
+    let thread_id = timeout(request_timeout, start_thread(&mut owner, /*id*/ 2))
+        .await
+        .context("timed out starting the shared thread")??;
+
+    send_request(
+        &mut owner,
+        "turn/start",
+        /*id*/ 3,
+        Some(serde_json::to_value(TurnStartParams {
+            thread_id: thread_id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "materialize completed turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    let (first_turn_response, _) = timeout(
+        request_timeout,
+        read_response_and_notification_for_method(&mut owner, /*id*/ 3, "turn/completed"),
+    )
+    .await
+    .context("timed out materializing the completed turn")??;
+    let _: TurnStartResponse = to_response(first_turn_response)?;
+
+    send_request(
+        &mut desktop,
+        "thread/resume",
+        /*id*/ 4,
+        Some(serde_json::to_value(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    let resume_response = timeout(
+        request_timeout,
+        read_response_for_id(&mut desktop, /*id*/ 4),
+    )
+    .await
+    .context("timed out resuming the completed thread from Codex Desktop")??;
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = to_response(resume_response)?;
+    assert_eq!(
+        resumed.turns.last().map(|turn| &turn.status),
+        Some(&TurnStatus::Completed)
+    );
+
+    send_request(
+        &mut owner,
+        "turn/start",
+        /*id*/ 5,
+        Some(serde_json::to_value(TurnStartParams {
+            thread_id: thread_id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "valid turn from the other connection".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    let (other_turn_response, _) = timeout(
+        request_timeout,
+        read_response_and_notification_for_method(&mut owner, /*id*/ 5, "turn/completed"),
+    )
+    .await
+    .context("timed out completing the other connection turn")??;
+    let _: TurnStartResponse = to_response(other_turn_response)?;
+
+    send_request(
+        &mut desktop,
+        "turn/start",
+        /*id*/ 6,
+        Some(serde_json::to_value(TurnStartParams {
+            thread_id,
+            client_user_message_id: None,
+            input: Vec::new(),
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    let stale_continuation_error =
+        timeout(request_timeout, read_error_for_id(&mut desktop, /*id*/ 6))
+            .await
+            .context("timed out waiting for the stale continuation rejection")??;
+    assert!(
+        stale_continuation_error
+            .error
+            .message
+            .contains("resumed completed turn requires an explicit turnTrigger"),
+        "the other connection must not clear the Desktop resume fence: {}",
+        stale_continuation_error.error.message
+    );
 
     process
         .kill()

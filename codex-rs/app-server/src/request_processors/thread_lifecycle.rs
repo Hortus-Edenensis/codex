@@ -725,6 +725,17 @@ pub(super) async fn handle_pending_thread_resume_request(
             redact_thread_resume_payloads(&mut initial_turns_page.data);
         }
     }
+    let completed_resume_turn_id =
+        if !has_live_in_progress_turn && matches!(thread.status, ThreadStatus::Idle) {
+            pending
+                .latest_persisted_turn
+                .as_ref()
+                .or_else(|| thread.turns.last())
+                .filter(|turn| matches!(turn.status, TurnStatus::Completed))
+                .map(|turn| turn.id.clone())
+        } else {
+            None
+        };
 
     {
         let pending_thread_unloads = pending_thread_unloads.lock().await;
@@ -752,6 +763,9 @@ pub(super) async fn handle_pending_thread_resume_request(
             return;
         }
     }
+    thread_state_manager
+        .note_completed_resume_turn(conversation_id, connection_id, completed_resume_turn_id)
+        .await;
 
     let (turns_backwards_cursor, items_backwards_cursor) = if let Some(thread_store) =
         pending.resume_cursor_store.as_ref()

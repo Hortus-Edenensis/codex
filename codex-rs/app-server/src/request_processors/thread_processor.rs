@@ -4318,6 +4318,30 @@ impl ThreadRequestProcessor {
             } else {
                 None
             };
+            let latest_persisted_turn =
+                if paginated_resume && (include_turns || params.initial_turns_page.is_some()) {
+                    if let Some(turn) = paginated_turns
+                        .as_ref()
+                        .and_then(|turns| turns.last())
+                        .cloned()
+                    {
+                        Some(turn)
+                    } else {
+                        self.paginated_thread_turns_list_response(
+                            existing_thread_id,
+                            /*cursor*/ None,
+                            Some(1),
+                            Some(SortDirection::Desc),
+                            Some(TurnItemsView::NotLoaded),
+                        )
+                        .await?
+                        .data
+                        .into_iter()
+                        .next()
+                    }
+                } else {
+                    None
+                };
             let resume_cursor_store = paginated_resume.then(|| Arc::clone(&self.thread_store));
 
             let command = crate::thread_state::ThreadListenerCommand::SendThreadResumeResponse(
@@ -4335,6 +4359,7 @@ impl ThreadRequestProcessor {
                     paginated_turns,
                     paginated_initial_turns_page,
                     paginated_initial_turns_page_with_active_slot,
+                    latest_persisted_turn,
                     resume_cursor_store,
                     redact_resume_payloads,
                 }),
