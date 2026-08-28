@@ -168,6 +168,8 @@ async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) 
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(std::env::current_dir().expect("cwd")),
                 model_provider: "test-provider".to_string(),
+                model: None,
+                reasoning_effort: None,
                 memory_mode: ThreadMemoryMode::Enabled,
             },
         })

@@ -8,6 +8,7 @@ cd path/to/codex/codex-rs
 cargo build
 echo $OPENAI_API_KEY | ./target/debug/codex-responses-api-proxy \
     --port 60001 \
+    --continue-thinking \
     --dump-dir /tmp/proxy
 
 
@@ -62,6 +63,7 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 - Formats the header value as `Bearer <key>` and attempts to `mlock(2)` the memory holding that header so it is not swapped to disk.
 - Listens on the provided port or an ephemeral port if `--port` is not specified.
 - Accepts exactly `POST /v1/responses` (no query string). The request body is forwarded to `https://api.openai.com/v1/responses` with `Authorization: Bearer <key>` set. All original request headers (except any incoming `Authorization`) are forwarded upstream, with `Host` overridden to `api.openai.com`. For other requests, it responds with `403`.
+- Optional `--continue-thinking` enables a streaming workaround for the reasoning-token plateau discussed in [openai/codex#30364](https://github.com/openai/codex/issues/30364). For eligible streaming requests, the proxy detects the `518 * n - 2` reasoning-token fingerprint, hides tentative final output, appends a commentary follow-up plus prior encrypted reasoning items, and silently opens another upstream Responses round. The downstream client still sees one logical SSE stream.
 - Optionally writes a single-line JSON file with server info, currently `{ "port": <u16>, "pid": <u32> }`.
 - Optionally writes request/response JSON dumps to a directory. Each accepted request gets a pair of files that share a sequence/timestamp prefix, for example `000001-1846179912345-request.json` and `000001-1846179912345-response.json`. Header values are dumped in full except `Authorization` and any header whose name includes `cookie`, which are redacted. Bodies are written as parsed JSON when possible, otherwise as UTF-8 text.
 - Optional `--http-shutdown` enables `GET /shutdown` to terminate the process with exit code `0`. This allows one user (e.g., `root`) to start the proxy and another unprivileged user on the host to shut it down.
@@ -69,7 +71,7 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 ## CLI
 
 ```
-codex-responses-api-proxy [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>]
+codex-responses-api-proxy [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>] [--continue-thinking] [--continue-thinking-message <TEXT>] [--continue-thinking-max-rounds <N>]
 ```
 
 - `--port <PORT>`: Port to bind on `127.0.0.1`. If omitted, an ephemeral port is chosen.
@@ -77,6 +79,9 @@ codex-responses-api-proxy [--port <PORT>] [--server-info <FILE>] [--http-shutdow
 - `--http-shutdown`: If set, enables `GET /shutdown` to exit the process with code `0`.
 - `--upstream-url <URL>`: Absolute URL to forward requests to. Defaults to `https://api.openai.com/v1/responses`.
 - `--dump-dir <DIR>`: If set, writes one request JSON file and one response JSON file per accepted proxy call under this directory. Filenames use a shared sequence/timestamp prefix so each pair is easy to correlate.
+- `--continue-thinking`: If set, the proxy inspects streaming Responses completions for the `518 * n - 2` reasoning-token fingerprint and may silently open hidden continuation rounds before releasing the final answer downstream.
+- `--continue-thinking-message <TEXT>`: Commentary text appended to the hidden continuation round. Defaults to `Continue thinking.`.
+- `--continue-thinking-max-rounds <N>`: Maximum number of hidden continuation rounds to attempt after the first truncated round. Defaults to `3`.
 - Authentication is fixed to `Authorization: Bearer <key>` to match the Codex CLI expectations.
 
 For Azure, for example (ensure your deployment accepts `Authorization: Bearer <key>`):
@@ -92,6 +97,7 @@ printenv AZURE_OPENAI_API_KEY | env -u AZURE_OPENAI_API_KEY codex-responses-api-
 
 - Only `POST /v1/responses` is permitted. No query strings are allowed.
 - All request headers are forwarded to the upstream call (aside from overriding `Authorization` and `Host`). Response status and content-type are mirrored from upstream.
+- `--continue-thinking` only applies to streaming requests whose `input` is already in array form and whose reasoning is enabled. If a hidden continuation attempt fails, the proxy falls back to the original upstream round rather than dropping the response.
 
 ## Hardening Details
 

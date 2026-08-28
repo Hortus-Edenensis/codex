@@ -19,6 +19,7 @@ use codex_http_client::ClientRouteClass;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::SharedModelProvider;
+use codex_postgres_thread_store::PostgresThreadStore;
 use codex_protocol::SessionId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
@@ -32,6 +33,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_skills::SkillError;
+use codex_state::GeneratedMemoryStore;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
@@ -856,6 +858,17 @@ impl Session {
                             metadata: ThreadPersistenceMetadata {
                                 cwd: Some(config.cwd.to_path_buf()),
                                 model_provider: config.model_provider_id.clone(),
+                                model: Some(
+                                    session_configuration
+                                        .step_settings
+                                        .collaboration_mode
+                                        .model()
+                                        .to_string(),
+                                ),
+                                reasoning_effort: session_configuration
+                                    .step_settings
+                                    .collaboration_mode
+                                    .reasoning_effort(),
                                 memory_mode: if config.memories.generate_memories {
                                     ThreadMemoryMode::Enabled
                                 } else {
@@ -886,6 +899,17 @@ impl Session {
                             metadata: ThreadPersistenceMetadata {
                                 cwd: Some(config.cwd.to_path_buf()),
                                 model_provider: config.model_provider_id.clone(),
+                                model: Some(
+                                    session_configuration
+                                        .step_settings
+                                        .collaboration_mode
+                                        .model()
+                                        .to_string(),
+                                ),
+                                reasoning_effort: session_configuration
+                                    .step_settings
+                                    .collaboration_mode
+                                    .reasoning_effort(),
                                 memory_mode: if config.memories.generate_memories {
                                     ThreadMemoryMode::Enabled
                                 } else {
@@ -980,6 +1004,11 @@ impl Session {
         // Join all independent futures.
         let (thread_persistence_result, state_db_ctx, (auth, mcp_projection)) =
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
+        let generated_memory_store = generated_memory_store_for_session(
+            config.ephemeral,
+            state_db_ctx.as_ref(),
+            &thread_store,
+        );
 
         let mut live_thread_init =
             LiveThreadInitGuard::new(thread_persistence_result.map_err(|e| {
@@ -1419,6 +1448,7 @@ impl Session {
                 managed_network_requirements_configured,
                 network_approval: Arc::clone(&network_approval),
                 state_db: state_db_ctx.clone(),
+                generated_memory_store,
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
                 attestation_provider: attestation_provider.clone(),
@@ -1610,4 +1640,18 @@ impl Session {
             }
         }
     }
+}
+
+fn generated_memory_store_for_session(
+    ephemeral: bool,
+    state_db: Option<&state_db::StateDbHandle>,
+    thread_store: &Arc<dyn ThreadStore>,
+) -> Option<Arc<dyn GeneratedMemoryStore>> {
+    if ephemeral {
+        return None;
+    }
+    if let Some(store) = thread_store.as_any().downcast_ref::<PostgresThreadStore>() {
+        return Some(Arc::new(store.clone()));
+    }
+    state_db.map(|state_db| Arc::new(state_db.memories().clone()) as Arc<dyn GeneratedMemoryStore>)
 }

@@ -31,6 +31,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::user_message_preview;
 use serde_json::Value;
 
@@ -58,6 +59,8 @@ pub struct ThreadItem {
     pub first_user_message: Option<String>,
     /// Best available user-facing preview for discovery and list display.
     pub preview: Option<String>,
+    /// Source thread id when this thread was forked from another thread.
+    pub forked_from_id: Option<ThreadId>,
     /// The user-selected section in SQLite-owned metadata.
     pub section: Option<codex_state::ThreadSection>,
     /// Canonical project assignment in SQLite-owned metadata.
@@ -74,6 +77,8 @@ pub struct ThreadItem {
     pub source: Option<SessionSource>,
     /// Persisted thread history contract selected when this thread was created.
     pub history_mode: ThreadHistoryMode,
+    /// Optional analytics source classification for this thread.
+    pub thread_source: Option<ThreadSource>,
     /// Immediate control/spawn parent thread id from session metadata.
     pub parent_thread_id: Option<ThreadId>,
     /// Random unique nickname from session metadata for AgentControl-spawned sub-agents.
@@ -106,12 +111,14 @@ struct HeadTailSummary {
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
     preview: Option<String>,
+    forked_from_id: Option<ThreadId>,
     cwd: Option<PathBuf>,
     git_branch: Option<String>,
     git_sha: Option<String>,
     git_origin_url: Option<SanitizedGitUrl>,
     source: Option<SessionSource>,
     history_mode: ThreadHistoryMode,
+    thread_source: Option<ThreadSource>,
     parent_thread_id: Option<ThreadId>,
     agent_nickname: Option<String>,
     agent_role: Option<String>,
@@ -814,12 +821,14 @@ async fn build_thread_item(
             thread_id,
             first_user_message,
             preview,
+            forked_from_id,
             cwd,
             git_branch,
             git_sha,
             git_origin_url,
             source,
             history_mode,
+            thread_source,
             parent_thread_id,
             agent_nickname,
             agent_role,
@@ -837,6 +846,7 @@ async fn build_thread_item(
             thread_id,
             first_user_message,
             preview,
+            forked_from_id,
             section: None,
             project_id: None,
             cwd,
@@ -845,6 +855,7 @@ async fn build_thread_item(
             git_origin_url,
             source,
             history_mode,
+            thread_source,
             parent_thread_id,
             agent_nickname,
             agent_role,
@@ -1142,6 +1153,8 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                 if !summary.saw_session_meta {
                     summary.source = Some(session_meta_line.meta.source.clone());
                     summary.history_mode = session_meta_line.meta.history_mode;
+                    summary.forked_from_id = session_meta_line.meta.forked_from_id;
+                    summary.thread_source = session_meta_line.meta.thread_source.clone();
                     summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
                     summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
                     summary.agent_role = session_meta_line.meta.agent_role.clone();

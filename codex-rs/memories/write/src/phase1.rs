@@ -7,7 +7,6 @@ use crate::runtime::MemoryStartupContext;
 use crate::runtime::StageOneRequestContext;
 use codex_config::types::MemoriesConfig;
 use codex_core::Prompt;
-use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
@@ -110,10 +109,9 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
 
 /// Prune old un-used "dead" raw memories.
 pub async fn prune(context: &MemoryStartupContext, config: &Config) {
-    if let Some(db) = context.state_db() {
+    if let Some(store) = context.generated_memory_store() {
         let max_unused_days = config.memories.max_unused_days;
-        match db
-            .memories()
+        match store
             .prune_stage1_outputs_for_retention(max_unused_days, crate::stage_one::PRUNE_BATCH_SIZE)
             .await
         {
@@ -151,9 +149,8 @@ async fn claim_startup_jobs(
     context: &MemoryStartupContext,
     memories_config: &MemoriesConfig,
 ) -> Option<Vec<codex_state::Stage1JobClaim>> {
-    let Some(state_db) = context.state_db() else {
-        // This should not happen.
-        warn!("state db unavailable while claiming phase-1 startup jobs; skipping");
+    let Some(store) = context.generated_memory_store() else {
+        warn!("generated memory store unavailable while claiming phase-1 startup jobs; skipping");
         return None;
     };
 
@@ -162,8 +159,7 @@ async fn claim_startup_jobs(
         .map(ToString::to_string)
         .collect::<Vec<_>>();
 
-    match state_db
-        .memories()
+    match store
         .claim_stage1_jobs_for_startup(
             context.thread_id(),
             codex_state::Stage1StartupClaimParams {
@@ -235,6 +231,7 @@ mod job {
         let (stage_one_output, token_usage) = match sample(
             context,
             config,
+            claimed_thread.id,
             &claimed_thread.rollout_path,
             &claimed_thread.cwd,
             stage_one_context,
@@ -284,12 +281,13 @@ mod job {
     async fn sample(
         context: &MemoryStartupContext,
         config: &Config,
+        thread_id: codex_protocol::ThreadId,
         rollout_path: &Path,
         rollout_cwd: &Path,
         stage_one_context: &StageOneRequestContext,
     ) -> anyhow::Result<(StageOneOutput, Option<TokenUsage>)> {
-        let (rollout_items, _, _) = RolloutRecorder::load_rollout_items(rollout_path).await?;
-        let rollout_contents = serialize_filtered_rollout_response_items(&rollout_items)?;
+        let rollout_history = context.load_thread_history(thread_id).await?;
+        let rollout_contents = serialize_filtered_rollout_response_items(&rollout_history.items)?;
 
         let mut prompt = Prompt::default();
         prompt.input = vec![ResponseItem::Message {
@@ -335,9 +333,8 @@ mod job {
             reason: &str,
         ) {
             tracing::warn!("Phase 1 job failed for thread {thread_id}: {reason}");
-            if let Some(state_db) = context.state_db() {
-                let _ = state_db
-                    .memories()
+            if let Some(store) = context.generated_memory_store() {
+                let _ = store
                     .mark_stage1_job_failed(
                         thread_id,
                         ownership_token,
@@ -353,12 +350,11 @@ mod job {
             thread_id: codex_protocol::ThreadId,
             ownership_token: &str,
         ) -> JobOutcome {
-            let Some(state_db) = context.state_db() else {
+            let Some(store) = context.generated_memory_store() else {
                 return JobOutcome::Failed;
             };
 
-            if state_db
-                .memories()
+            if store
                 .mark_stage1_job_succeeded_no_output(thread_id, ownership_token)
                 .await
                 .unwrap_or(false)
@@ -378,12 +374,11 @@ mod job {
             rollout_summary: &str,
             rollout_slug: Option<&str>,
         ) -> JobOutcome {
-            let Some(state_db) = context.state_db() else {
+            let Some(store) = context.generated_memory_store() else {
                 return JobOutcome::Failed;
             };
 
-            if state_db
-                .memories()
+            if store
                 .mark_stage1_job_succeeded(
                     thread_id,
                     ownership_token,

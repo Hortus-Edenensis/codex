@@ -52,6 +52,8 @@ use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
+use crate::thread_state::GeneratedMemoryStoreHandle;
+use crate::thread_state::ThreadGoalStoreHandle;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
@@ -100,6 +102,61 @@ use tracing::Instrument;
 use crate::models_refresh_worker::ModelsRefreshWorker;
 
 const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
+
+struct ThreadStoreHandles {
+    thread_store: Arc<dyn codex_thread_store::ThreadStore>,
+    goal_store: Option<ThreadGoalStoreHandle>,
+    generated_memory_store: Option<GeneratedMemoryStoreHandle>,
+    postgres_store: Option<Arc<codex_postgres_thread_store::PostgresThreadStore>>,
+}
+
+fn thread_store_handles_from_config(
+    config: &Config,
+    state_db: Option<StateDbHandle>,
+) -> ThreadStoreHandles {
+    match &config.experimental_thread_store {
+        ThreadStoreConfig::Local => ThreadStoreHandles {
+            thread_store: codex_core::thread_store_from_config(config, state_db.clone()),
+            goal_store: state_db
+                .as_ref()
+                .map(|state_db| Arc::new(state_db.thread_goals().clone()) as ThreadGoalStoreHandle),
+            generated_memory_store: state_db.as_ref().map(|state_db| {
+                Arc::new(state_db.memories().clone()) as GeneratedMemoryStoreHandle
+            }),
+            postgres_store: None,
+        },
+        ThreadStoreConfig::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        } => {
+            let postgres_store = Arc::new(
+                codex_postgres_thread_store::PostgresThreadStore::from_env_or_unconfigured(
+                    codex_postgres_thread_store::PostgresThreadStoreConfig {
+                        database_url_env: database_url_env.clone(),
+                        default_workspace_id: default_workspace_id.clone(),
+                        redis_url_env: redis_url_env.clone(),
+                    },
+                ),
+            );
+            ThreadStoreHandles {
+                thread_store: Arc::clone(&postgres_store)
+                    as Arc<dyn codex_thread_store::ThreadStore>,
+                goal_store: Some(Arc::clone(&postgres_store) as ThreadGoalStoreHandle),
+                generated_memory_store: Some(
+                    Arc::clone(&postgres_store) as GeneratedMemoryStoreHandle
+                ),
+                postgres_store: Some(postgres_store),
+            }
+        }
+        ThreadStoreConfig::InMemory { .. } => ThreadStoreHandles {
+            thread_store: codex_core::thread_store_from_config(config, state_db),
+            goal_store: None,
+            generated_memory_store: None,
+            postgres_store: None,
+        },
+    }
+}
 
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
     reject_obsolete_request_fields(&request)?;
@@ -288,14 +345,19 @@ impl MessageProcessor {
         // The thread store is intentionally process-scoped. Config reloads can
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
-        let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
+        let ThreadStoreHandles {
+            thread_store,
+            goal_store,
+            generated_memory_store,
+            postgres_store,
+        } = thread_store_handles_from_config(config.as_ref(), state_db.clone());
         // Queue persistence requires SQLite, so in-memory thread stores and
         // app servers without a state database do not have a queue backend.
         let queue_store: Option<Arc<dyn QueueStore>> = match &config.experimental_thread_store {
             ThreadStoreConfig::Local => state_db.as_ref().map(|state_db| {
                 Arc::new(LocalQueueStore::new(Arc::clone(state_db))) as Arc<dyn QueueStore>
             }),
-            ThreadStoreConfig::InMemory { .. } => None,
+            ThreadStoreConfig::Postgres { .. } | ThreadStoreConfig::InMemory { .. } => None,
         };
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);
@@ -331,6 +393,7 @@ impl MessageProcessor {
                         event_sink: Arc::clone(&extension_event_sink),
                         auth_manager: auth_manager.clone(),
                         state_db: state_db.clone(),
+                        goal_store: goal_store.clone(),
                         analytics_events_client: analytics_events_client.clone(),
                         thread_manager: thread_manager.clone(),
                         goal_service: Arc::clone(&goal_service),
@@ -339,6 +402,7 @@ impl MessageProcessor {
                         git_attribution_base_url: config.chatgpt_base_url.clone(),
                         http_client_factory: config.http_client_factory(),
                         queue_service: queue_service.clone(),
+                        thread_store: Arc::clone(&thread_store),
                     },
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
@@ -346,7 +410,15 @@ impl MessageProcessor {
                 )),
                 Some(analytics_events_client.clone()),
                 Arc::clone(&thread_store),
-                codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
+                postgres_store
+                    .as_ref()
+                    .map(|store| Arc::clone(store) as _)
+                    .or_else(|| {
+                        codex_core::agent_graph_store_from_config(
+                            config.as_ref(),
+                            state_db.as_ref(),
+                        )
+                    }),
                 installation_id,
                 Some(app_server_attestation_provider(
                     outgoing.clone(),
@@ -468,10 +540,12 @@ impl MessageProcessor {
         let search_processor = SearchRequestProcessor::new(outgoing.clone());
         let thread_goal_processor = ThreadGoalRequestProcessor::new(
             Arc::clone(&thread_manager),
+            Arc::clone(&thread_store),
             outgoing.clone(),
             Arc::clone(&config),
             thread_state_manager.clone(),
             state_db.clone(),
+            goal_store,
             Arc::clone(&goal_service),
         );
         let thread_queue_processor = ThreadQueueRequestProcessor::new(
@@ -499,6 +573,7 @@ impl MessageProcessor {
             Arc::clone(&thread_list_state_permit),
             thread_goal_processor.clone(),
             state_db.clone(),
+            generated_memory_store,
             log_db,
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
@@ -1049,7 +1124,7 @@ impl MessageProcessor {
                 .clients_revoke(params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ConfigRequirementsRead { params: _, .. } => self
+            ClientRequest::ConfigRequirementsRead { .. } => self
                 .config_processor
                 .config_requirements_read()
                 .await
@@ -1108,7 +1183,7 @@ impl MessageProcessor {
                 .unwatch(connection_id, params)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ModelProviderCapabilitiesRead { params: _, .. } => self
+            ClientRequest::ModelProviderCapabilitiesRead { .. } => self
                 .config_processor
                 .model_provider_capabilities_read()
                 .await
@@ -1493,7 +1568,7 @@ impl MessageProcessor {
             ClientRequest::ThreadTimelineList { params, .. } => {
                 self.thread_processor.thread_timeline_list(params).await
             }
-            ClientRequest::ThreadRealtimeListVoices { params: _, .. } => {
+            ClientRequest::ThreadRealtimeListVoices { .. } => {
                 self.turn_processor.thread_realtime_list_voices().await
             }
             ClientRequest::ReviewStart { params, .. } => {

@@ -3561,6 +3561,35 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "database_url_env": {
+              "default": "CODEX_REMOTE_SQL_URL",
+              "description": "Environment variable containing the PostgreSQL connection URL.",
+              "type": "string"
+            },
+            "default_workspace_id": {
+              "default": "default",
+              "description": "Workspace used before app-server exposes explicit workspace routing.",
+              "type": "string"
+            },
+            "redis_url_env": {
+              "default": null,
+              "description": "Optional environment variable containing the Redis URL for realtime state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "postgres"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -5594,6 +5623,13 @@
           "description": "The Responses API exposed by OpenAI at `/v1/responses`.",
           "enum": [
             "responses"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "OpenAI-compatible Chat Completions exposed at `/v1/chat/completions`.",
+          "enum": [
+            "chat"
           ],
           "type": "string"
         }

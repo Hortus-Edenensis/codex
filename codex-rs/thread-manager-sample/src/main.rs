@@ -58,6 +58,7 @@ use codex_core_api::TurnInputRequest;
 use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
 use codex_core_api::WebSearchMode;
+use codex_core_api::agent_graph_store_from_config;
 use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::build_models_manager;
 use codex_core_api::built_in_model_providers;
@@ -65,7 +66,6 @@ use codex_core_api::find_codex_home;
 use codex_core_api::init_state_db;
 use codex_core_api::install_image_generation_extension;
 use codex_core_api::item_event_to_server_notification;
-use codex_core_api::local_agent_graph_store_from_state_db;
 use codex_core_api::resolve_installation_id;
 use codex_core_api::set_default_originator;
 use codex_core_api::thread_store_from_config;
@@ -150,7 +150,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         user_instructions_provider,
         /*analytics_events_client*/ None,
         Arc::clone(&thread_store),
-        local_agent_graph_store_from_state_db(state_db.as_ref()),
+        agent_graph_store_from_config(&config, state_db.as_ref()),
         installation_id,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,

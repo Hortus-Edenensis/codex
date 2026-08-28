@@ -1,3 +1,5 @@
+use super::GeneratedMemoryStore;
+use super::GeneratedMemoryStoreFuture;
 use super::threads::ThreadFilterOptions;
 use super::threads::push_thread_filters;
 use super::*;
@@ -1377,6 +1379,173 @@ WHERE kind = ? AND job_key = ?
         .rows_affected();
 
         Ok(rows_affected > 0)
+    }
+}
+
+impl GeneratedMemoryStore for MemoryStore {
+    fn clear_memory_data(&self) -> GeneratedMemoryStoreFuture<'_, ()> {
+        Box::pin(async move { self.clear_memory_data().await })
+    }
+
+    fn record_stage1_output_usage<'a>(
+        &'a self,
+        thread_ids: &'a [ThreadId],
+    ) -> GeneratedMemoryStoreFuture<'a, usize> {
+        Box::pin(async move { self.record_stage1_output_usage(thread_ids).await })
+    }
+
+    fn claim_stage1_jobs_for_startup<'a>(
+        &'a self,
+        current_thread_id: ThreadId,
+        params: Stage1StartupClaimParams<'a>,
+    ) -> GeneratedMemoryStoreFuture<'a, Vec<Stage1JobClaim>> {
+        Box::pin(async move {
+            self.claim_stage1_jobs_for_startup(current_thread_id, params)
+                .await
+        })
+    }
+
+    fn prune_stage1_outputs_for_retention(
+        &self,
+        max_unused_days: i64,
+        limit: usize,
+    ) -> GeneratedMemoryStoreFuture<'_, usize> {
+        Box::pin(async move {
+            self.prune_stage1_outputs_for_retention(max_unused_days, limit)
+                .await
+        })
+    }
+
+    fn get_phase2_input_selection(
+        &self,
+        n: usize,
+        max_unused_days: i64,
+    ) -> GeneratedMemoryStoreFuture<'_, Vec<Stage1Output>> {
+        Box::pin(async move { self.get_phase2_input_selection(n, max_unused_days).await })
+    }
+
+    fn mark_thread_memory_mode_polluted(
+        &self,
+        thread_id: ThreadId,
+    ) -> GeneratedMemoryStoreFuture<'_, bool> {
+        Box::pin(async move { self.mark_thread_memory_mode_polluted(thread_id).await })
+    }
+
+    fn mark_stage1_job_succeeded<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        ownership_token: &'a str,
+        source_updated_at: i64,
+        raw_memory: &'a str,
+        rollout_summary: &'a str,
+        rollout_slug: Option<&'a str>,
+    ) -> GeneratedMemoryStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.mark_stage1_job_succeeded(
+                thread_id,
+                ownership_token,
+                source_updated_at,
+                raw_memory,
+                rollout_summary,
+                rollout_slug,
+            )
+            .await
+        })
+    }
+
+    fn mark_stage1_job_succeeded_no_output<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        ownership_token: &'a str,
+    ) -> GeneratedMemoryStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.mark_stage1_job_succeeded_no_output(thread_id, ownership_token)
+                .await
+        })
+    }
+
+    fn mark_stage1_job_failed<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        ownership_token: &'a str,
+        failure_reason: &'a str,
+        retry_delay_seconds: i64,
+    ) -> GeneratedMemoryStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.mark_stage1_job_failed(
+                thread_id,
+                ownership_token,
+                failure_reason,
+                retry_delay_seconds,
+            )
+            .await
+        })
+    }
+
+    fn try_claim_global_phase2_job(
+        &self,
+        worker_id: ThreadId,
+        lease_seconds: i64,
+    ) -> GeneratedMemoryStoreFuture<'_, Phase2JobClaimOutcome> {
+        Box::pin(async move {
+            self.try_claim_global_phase2_job(worker_id, lease_seconds)
+                .await
+        })
+    }
+
+    fn heartbeat_global_phase2_job<'a>(
+        &'a self,
+        ownership_token: &'a str,
+        lease_seconds: i64,
+    ) -> GeneratedMemoryStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.heartbeat_global_phase2_job(ownership_token, lease_seconds)
+                .await
+        })
+    }
+
+    fn mark_global_phase2_job_succeeded<'a>(
+        &'a self,
+        ownership_token: &'a str,
+        completed_watermark: i64,
+        selected_outputs: &'a [Stage1Output],
+    ) -> GeneratedMemoryStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.mark_global_phase2_job_succeeded(
+                ownership_token,
+                completed_watermark,
+                selected_outputs,
+            )
+            .await
+        })
+    }
+
+    fn mark_global_phase2_job_failed<'a>(
+        &'a self,
+        ownership_token: &'a str,
+        failure_reason: &'a str,
+        retry_delay_seconds: i64,
+    ) -> GeneratedMemoryStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.mark_global_phase2_job_failed(ownership_token, failure_reason, retry_delay_seconds)
+                .await
+        })
+    }
+
+    fn mark_global_phase2_job_failed_if_unowned<'a>(
+        &'a self,
+        ownership_token: &'a str,
+        failure_reason: &'a str,
+        retry_delay_seconds: i64,
+    ) -> GeneratedMemoryStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.mark_global_phase2_job_failed_if_unowned(
+                ownership_token,
+                failure_reason,
+                retry_delay_seconds,
+            )
+            .await
+        })
     }
 }
 

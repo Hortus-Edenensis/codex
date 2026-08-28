@@ -337,6 +337,8 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(codex_home.path().to_path_buf()),
                 model_provider: "mock_provider".to_string(),
+                model: None,
+                reasoning_effort: None,
                 memory_mode: ThreadMemoryMode::Enabled,
             },
         })
@@ -430,9 +432,7 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
 
     let client = start_in_process_client(config, loader_overrides).await?;
     let reads_before_resume = thread_store.calls().await.read_thread_with_history;
-    // The in-memory store is pathless, so resume currently fails later while
-    // assembling the response. The history-bearing probe must still be reused.
-    let _resume_result = client
+    let resume_result = client
         .request(ClientRequest::ThreadResume {
             request_id: RequestId::Integer(3),
             params: ThreadResumeParams {
@@ -440,7 +440,12 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
                 ..Default::default()
             },
         })
-        .await?;
+        .await?
+        .expect("pathless thread/resume should succeed");
+    let resumed: codex_app_server_protocol::ThreadResumeResponse =
+        serde_json::from_value(resume_result)?;
+    assert_eq!(resumed.thread.id, thread.id);
+    assert_eq!(resumed.thread.path, None);
 
     assert_eq!(
         thread_store.calls().await.read_thread_with_history,

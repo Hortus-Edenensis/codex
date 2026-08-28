@@ -31,7 +31,8 @@ use crate::spec::create_update_goal_tool;
 pub(crate) struct GoalToolExecutor {
     kind: GoalToolKind,
     thread_id: ThreadId,
-    state_db: Arc<codex_state::StateRuntime>,
+    goal_store: Arc<dyn codex_state::ThreadGoalStore>,
+    preview_state_db: Option<Arc<codex_state::StateRuntime>>,
     accounting_state: Arc<GoalAccountingState>,
     analytics: GoalAnalytics,
     event_emitter: GoalEventEmitter,
@@ -76,7 +77,8 @@ enum CompletionBudgetReport {
 impl GoalToolExecutor {
     pub(crate) fn get(
         thread_id: ThreadId,
-        state_db: Arc<codex_state::StateRuntime>,
+        goal_store: Arc<dyn codex_state::ThreadGoalStore>,
+        preview_state_db: Option<Arc<codex_state::StateRuntime>>,
         accounting_state: Arc<GoalAccountingState>,
         analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
@@ -85,7 +87,8 @@ impl GoalToolExecutor {
         Self {
             kind: GoalToolKind::Get,
             thread_id,
-            state_db,
+            goal_store,
+            preview_state_db,
             accounting_state,
             analytics,
             event_emitter,
@@ -96,7 +99,8 @@ impl GoalToolExecutor {
 
     pub(crate) fn create(
         thread_id: ThreadId,
-        state_db: Arc<codex_state::StateRuntime>,
+        goal_store: Arc<dyn codex_state::ThreadGoalStore>,
+        preview_state_db: Option<Arc<codex_state::StateRuntime>>,
         accounting_state: Arc<GoalAccountingState>,
         analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
@@ -106,7 +110,8 @@ impl GoalToolExecutor {
         Self {
             kind: GoalToolKind::Create,
             thread_id,
-            state_db,
+            goal_store,
+            preview_state_db,
             accounting_state,
             analytics,
             event_emitter,
@@ -117,7 +122,8 @@ impl GoalToolExecutor {
 
     pub(crate) fn update(
         thread_id: ThreadId,
-        state_db: Arc<codex_state::StateRuntime>,
+        goal_store: Arc<dyn codex_state::ThreadGoalStore>,
+        preview_state_db: Option<Arc<codex_state::StateRuntime>>,
         accounting_state: Arc<GoalAccountingState>,
         analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
@@ -126,7 +132,8 @@ impl GoalToolExecutor {
         Self {
             kind: GoalToolKind::Update,
             thread_id,
-            state_db,
+            goal_store,
+            preview_state_db,
             accounting_state,
             analytics,
             event_emitter,
@@ -177,8 +184,7 @@ impl GoalToolExecutor {
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let _ = invocation.function_arguments()?;
         let goal = self
-            .state_db
-            .thread_goals()
+            .goal_store
             .get_thread_goal(self.thread_id)
             .await
             .map(|goal| goal.map(protocol_goal_from_state))
@@ -201,11 +207,10 @@ impl GoalToolExecutor {
             .map_err(FunctionCallError::RespondToModel)?;
 
         let goal = self
-            .state_db
-            .thread_goals()
+            .goal_store
             .insert_thread_goal(
                 self.thread_id,
-                request.objective.as_str(),
+                request.objective.clone(),
                 codex_state::ThreadGoalStatus::Active,
                 request.token_budget,
             )
@@ -217,7 +222,12 @@ impl GoalToolExecutor {
                         .to_string(),
                 )
             })?;
-        fill_empty_thread_preview_if_possible(self.state_db.as_ref(), self.thread_id, &goal).await;
+        fill_empty_thread_preview_if_possible(
+            self.preview_state_db.as_deref(),
+            self.thread_id,
+            &goal,
+        )
+        .await;
         let turn_id = self
             .accounting_state
             .mark_current_turn_goal_active(goal.goal_id.clone());
@@ -263,8 +273,7 @@ impl GoalToolExecutor {
             .current_goal_status_for_metrics(/*expected_goal_id*/ None)
             .await?;
         let goal = self
-            .state_db
-            .thread_goals()
+            .goal_store
             .update_thread_goal(
                 self.thread_id,
                 codex_state::GoalUpdate {
@@ -338,14 +347,13 @@ impl GoalToolExecutor {
             .current_goal_status_for_metrics(Some(snapshot.expected_goal_id.as_str()))
             .await?;
         let outcome = self
-            .state_db
-            .thread_goals()
+            .goal_store
             .account_thread_goal_usage(
                 self.thread_id,
                 snapshot.time_delta_seconds,
                 snapshot.token_delta,
                 mode,
-                Some(snapshot.expected_goal_id.as_str()),
+                Some(snapshot.expected_goal_id.clone()),
             )
             .await
             .map_err(|err| {
@@ -385,8 +393,7 @@ impl GoalToolExecutor {
         expected_goal_id: Option<&str>,
     ) -> Result<Option<codex_state::ThreadGoalStatus>, FunctionCallError> {
         let goal = self
-            .state_db
-            .thread_goals()
+            .goal_store
             .get_thread_goal(self.thread_id)
             .await
             .map_err(|err| {
@@ -461,10 +468,13 @@ impl GoalToolResponse {
 }
 
 pub(crate) async fn fill_empty_thread_preview_if_possible(
-    state_db: &codex_state::StateRuntime,
+    state_db: Option<&codex_state::StateRuntime>,
     thread_id: ThreadId,
     goal: &codex_state::ThreadGoal,
 ) {
+    let Some(state_db) = state_db else {
+        return;
+    };
     if let Err(err) = state_db
         .set_thread_preview_if_empty(thread_id, goal.objective.as_str())
         .await

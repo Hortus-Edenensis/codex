@@ -28,9 +28,14 @@ use tiny_http::Response;
 use tiny_http::Server;
 use tiny_http::StatusCode;
 
+mod continue_thinking;
 mod dump;
+mod fold;
 mod read_api_key;
+mod sse;
+use continue_thinking::ContinueThinkingConfig;
 use dump::ExchangeDumper;
+use fold::create_folded_body;
 use read_api_key::read_auth_header_from_stdin;
 
 /// CLI arguments for the proxy.
@@ -56,6 +61,20 @@ pub struct Args {
     /// Directory where request/response dumps should be written as JSON.
     #[arg(long, value_name = "DIR")]
     pub dump_dir: Option<PathBuf>,
+
+    /// Detect the 518*n-2 reasoning-token plateau and silently open hidden
+    /// continuation rounds with a commentary follow-up prompt.
+    #[arg(long)]
+    pub continue_thinking: bool,
+
+    /// Commentary text appended to hidden continuation rounds.
+    #[arg(long, default_value = "Continue thinking.")]
+    pub continue_thinking_message: String,
+
+    /// Maximum number of hidden continuation rounds to open after the initial
+    /// truncated round.
+    #[arg(long, default_value_t = 3)]
+    pub continue_thinking_max_rounds: usize,
 }
 
 #[derive(Serialize)]
@@ -67,6 +86,7 @@ struct ServerInfo {
 struct ForwardConfig {
     upstream_url: Url,
     host_header: HeaderValue,
+    continue_thinking: ContinueThinkingConfig,
 }
 
 /// Entry point for the library main, for parity with other crates.
@@ -85,6 +105,11 @@ pub fn run_main(args: Args) -> Result<()> {
     let forward_config = Arc::new(ForwardConfig {
         upstream_url,
         host_header,
+        continue_thinking: ContinueThinkingConfig {
+            enabled: args.continue_thinking,
+            message: args.continue_thinking_message,
+            max_extra_rounds: args.continue_thinking_max_rounds,
+        },
     });
     let dump_dir = args
         .dump_dir
@@ -220,9 +245,14 @@ fn forward_request(
 
     headers.insert(HOST, config.host_header.clone());
 
+    let body_json = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let candidate_continue_thinking = body_json
+        .as_ref()
+        .is_some_and(|body_json| config.continue_thinking.is_candidate_request(body_json));
+
     let upstream_resp = client
         .post(config.upstream_url.clone())
-        .headers(headers)
+        .headers(headers.clone())
         .body(body)
         .send()
         .context("forwarding request to upstream")?;
@@ -255,21 +285,65 @@ fn forward_request(
         }
     });
 
-    let response_body: Box<dyn Read + Send> = if let Some(exchange_dump) = exchange_dump {
+    let content_type = upstream_resp
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let fold_body_json = body_json.filter(|_| {
+        candidate_continue_thinking
+            && status.is_success()
+            && content_type.contains("text/event-stream")
+    });
+    let should_fold = fold_body_json.is_some();
+
+    let response_body: Box<dyn Read + Send> = if let Some(body_json) = fold_body_json {
+        let folded_body = create_folded_body(
+            upstream_resp,
+            client.clone(),
+            config.upstream_url.clone(),
+            headers,
+            body_json,
+            config.continue_thinking.clone(),
+        );
+        if let Some(exchange_dump) = exchange_dump {
+            Box::new(exchange_dump.tee_response_body(
+                status.as_u16(),
+                &response_headers_to_map(&response_headers),
+                folded_body,
+            ))
+        } else {
+            folded_body
+        }
+    } else if let Some(exchange_dump) = exchange_dump {
         let headers = upstream_resp.headers().clone();
         Box::new(exchange_dump.tee_response_body(status.as_u16(), &headers, upstream_resp))
     } else {
         Box::new(upstream_resp)
     };
+    let response_content_length = if should_fold { None } else { content_length };
 
     let response = Response::new(
         StatusCode(status.as_u16()),
         response_headers,
         response_body,
-        content_length,
+        response_content_length,
         None,
     );
 
     let _ = req.respond(response);
     Ok(())
+}
+
+fn response_headers_to_map(headers: &[Header]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for header in headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(header.field.as_str().as_bytes()),
+            HeaderValue::from_bytes(header.value.as_bytes()),
+        ) {
+            map.append(name, value);
+        }
+    }
+    map
 }

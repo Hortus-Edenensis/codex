@@ -34,6 +34,7 @@ pub(crate) struct GoalRuntimeConfig {
     pub(crate) enabled: bool,
     pub(crate) tools_available_for_thread: bool,
     pub(crate) root_accounting_state: Option<Arc<GoalAccountingState>>,
+    pub(crate) preview_state_db: Option<Arc<codex_state::StateRuntime>>,
 }
 
 pub(crate) enum ActiveGoalStopReason {
@@ -43,13 +44,14 @@ pub(crate) enum ActiveGoalStopReason {
 
 struct GoalRuntimeInner {
     thread_id: ThreadId,
-    state_dbs: Arc<codex_state::StateRuntime>,
+    goal_store: Arc<dyn codex_state::ThreadGoalStore>,
     analytics: GoalAnalytics,
     event_emitter: GoalEventEmitter,
     metrics: GoalMetrics,
     thread_manager: Weak<ThreadManager>,
     accounting_state: Arc<GoalAccountingState>,
     root_accounting_state: Option<Arc<GoalAccountingState>>,
+    preview_state_db: Option<Arc<codex_state::StateRuntime>>,
     enabled: AtomicBool,
     tools_available_for_thread: bool,
     goal_state_lock: Semaphore,
@@ -86,7 +88,7 @@ impl std::fmt::Debug for GoalRuntimeHandle {
 impl GoalRuntimeHandle {
     pub(crate) fn new(
         thread_id: ThreadId,
-        state_dbs: Arc<codex_state::StateRuntime>,
+        goal_store: Arc<dyn codex_state::ThreadGoalStore>,
         event_emitter: GoalEventEmitter,
         metrics: GoalMetrics,
         thread_manager: Weak<ThreadManager>,
@@ -96,13 +98,14 @@ impl GoalRuntimeHandle {
         Self {
             inner: Arc::new(GoalRuntimeInner {
                 thread_id,
-                state_dbs,
+                goal_store,
                 analytics: config.analytics,
                 event_emitter,
                 metrics,
                 thread_manager,
                 accounting_state,
                 root_accounting_state: config.root_accounting_state,
+                preview_state_db: config.preview_state_db,
                 enabled: AtomicBool::new(config.enabled),
                 tools_available_for_thread: config.tools_available_for_thread,
                 goal_state_lock: Semaphore::new(/*permits*/ 1),
@@ -290,8 +293,7 @@ impl GoalRuntimeHandle {
 
         let Some(active_goal) = self
             .inner
-            .state_dbs
-            .thread_goals()
+            .goal_store
             .get_thread_goal(self.thread_id())
             .await
             .map_err(|err| err.to_string())?
@@ -309,8 +311,7 @@ impl GoalRuntimeHandle {
         let previous_status = Some(active_goal.status);
         let Some(goal) = self
             .inner
-            .state_dbs
-            .thread_goals()
+            .goal_store
             .update_thread_goal(
                 self.thread_id(),
                 codex_state::GoalUpdate {
@@ -350,8 +351,7 @@ impl GoalRuntimeHandle {
 
         let goal = self
             .inner
-            .state_dbs
-            .thread_goals()
+            .goal_store
             .get_thread_goal(self.thread_id())
             .await
             .map_err(|err| err.to_string())?;
@@ -376,15 +376,15 @@ impl GoalRuntimeHandle {
         // change the goal after we read it but before the continuation launches.
         let _goal_state_permit = self.goal_state_permit().await?;
 
-        if self
-            .inner
-            .state_dbs
-            .thread_goals()
-            .has_thread_goal_continuation_deferral(self.thread_id())
-            .await
-            .map_err(|err| err.to_string())?
-        {
-            return Ok(());
+        if let Some(preview_state_db) = self.inner.preview_state_db.as_ref() {
+            if preview_state_db
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(self.thread_id())
+                .await
+                .map_err(|err| err.to_string())?
+            {
+                return Ok(());
+            }
         }
 
         let Some(thread_manager) = self.inner.thread_manager.upgrade() else {
@@ -398,8 +398,7 @@ impl GoalRuntimeHandle {
 
         let Some(goal) = self
             .inner
-            .state_dbs
-            .thread_goals()
+            .goal_store
             .get_thread_goal(self.thread_id())
             .await
             .map_err(|err| err.to_string())?
@@ -486,14 +485,13 @@ impl GoalRuntimeHandle {
             .await?;
         let outcome = self
             .inner
-            .state_dbs
-            .thread_goals()
+            .goal_store
             .account_thread_goal_usage(
                 self.thread_id(),
                 snapshot.time_delta_seconds,
                 snapshot.token_delta,
                 mode,
-                Some(snapshot.expected_goal_id.as_str()),
+                Some(snapshot.expected_goal_id.clone()),
             )
             .await
             .map_err(|err| err.to_string())?;
@@ -548,14 +546,13 @@ impl GoalRuntimeHandle {
             .await?;
         let outcome = self
             .inner
-            .state_dbs
-            .thread_goals()
+            .goal_store
             .account_thread_goal_usage(
                 self.thread_id(),
                 snapshot.time_delta_seconds,
                 snapshot.token_delta,
                 mode,
-                Some(snapshot.expected_goal_id.as_str()),
+                Some(snapshot.expected_goal_id.clone()),
             )
             .await
             .map_err(|err| err.to_string())?;
@@ -599,8 +596,7 @@ impl GoalRuntimeHandle {
     ) -> Result<Option<codex_state::ThreadGoalStatus>, String> {
         let goal = self
             .inner
-            .state_dbs
-            .thread_goals()
+            .goal_store
             .get_thread_goal(self.thread_id())
             .await
             .map_err(|err| err.to_string())?;

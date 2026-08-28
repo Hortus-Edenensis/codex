@@ -7,6 +7,7 @@ use serde_json::Value as JsonValue;
 // image-generation payloads. Keep this response-only so persisted rollout
 // history, model resume history, and other APIs stay unchanged.
 const REDACTED_PAYLOAD: &str = "[redacted]";
+const MAX_INLINE_PERSISTED_IMAGE_RESULT_BYTES: usize = 64 * 1024;
 const CHATGPT_REMOTE_CLIENT_NAMES: &[&str] =
     &["codex_chatgpt_android_remote", "codex_chatgpt_ios_remote"];
 
@@ -35,6 +36,24 @@ pub(super) fn redact_thread_resume_payloads(turns: &mut [Turn]) {
             ThreadItem::ImageGeneration(_) => false,
             _ => true,
         });
+    }
+}
+
+// Persisted image-generation items can contain multi-megabyte base64 payloads.
+// Once the image has a durable path, keep the item metadata but avoid sending
+// the duplicate inline bytes every time a client opens thread history.
+pub(super) fn compact_thread_history_image_payloads(turns: &mut [Turn]) {
+    for turn in turns {
+        for item in &mut turn.items {
+            let ThreadItem::ImageGeneration(image) = item else {
+                continue;
+            };
+            if image.saved_path.is_some()
+                && image.result.len() > MAX_INLINE_PERSISTED_IMAGE_RESULT_BYTES
+            {
+                image.result.clear();
+            }
+        }
     }
 }
 
@@ -150,6 +169,82 @@ mod tests {
                 duration_ms: Some(8),
             }
         );
+    }
+
+    #[test]
+    fn compacts_only_large_persisted_image_results() {
+        let large_result = "x".repeat(MAX_INLINE_PERSISTED_IMAGE_RESULT_BYTES + 1);
+        let small_result = "small-result".to_string();
+        let unsaved_result = "y".repeat(MAX_INLINE_PERSISTED_IMAGE_RESULT_BYTES + 1);
+        let persisted_path = test_path_buf("/tmp/generated.png").abs();
+        let mut thread = test_thread(vec![
+            ThreadItem::ImageGeneration(ImageGenerationItem {
+                id: "large-persisted".to_string(),
+                status: "completed".to_string(),
+                revised_prompt: Some("large".to_string()),
+                result: large_result,
+                transparent_background: None,
+                failure: None,
+                saved_path: Some(persisted_path.clone()),
+                imagegen_request_id: None,
+            }),
+            ThreadItem::ImageGeneration(ImageGenerationItem {
+                id: "small-persisted".to_string(),
+                status: "completed".to_string(),
+                revised_prompt: Some("small".to_string()),
+                result: small_result.clone(),
+                transparent_background: None,
+                failure: None,
+                saved_path: Some(persisted_path),
+                imagegen_request_id: None,
+            }),
+            ThreadItem::ImageGeneration(ImageGenerationItem {
+                id: "large-unsaved".to_string(),
+                status: "completed".to_string(),
+                revised_prompt: Some("unsaved".to_string()),
+                result: unsaved_result.clone(),
+                transparent_background: None,
+                failure: None,
+                saved_path: None,
+                imagegen_request_id: None,
+            }),
+        ]);
+
+        compact_thread_history_image_payloads(&mut thread.turns);
+
+        let expected = test_thread(vec![
+            ThreadItem::ImageGeneration(ImageGenerationItem {
+                id: "large-persisted".to_string(),
+                status: "completed".to_string(),
+                revised_prompt: Some("large".to_string()),
+                result: String::new(),
+                transparent_background: None,
+                failure: None,
+                saved_path: Some(test_path_buf("/tmp/generated.png").abs()),
+                imagegen_request_id: None,
+            }),
+            ThreadItem::ImageGeneration(ImageGenerationItem {
+                id: "small-persisted".to_string(),
+                status: "completed".to_string(),
+                revised_prompt: Some("small".to_string()),
+                result: small_result,
+                transparent_background: None,
+                failure: None,
+                saved_path: Some(test_path_buf("/tmp/generated.png").abs()),
+                imagegen_request_id: None,
+            }),
+            ThreadItem::ImageGeneration(ImageGenerationItem {
+                id: "large-unsaved".to_string(),
+                status: "completed".to_string(),
+                revised_prompt: Some("unsaved".to_string()),
+                result: unsaved_result,
+                transparent_background: None,
+                failure: None,
+                saved_path: None,
+                imagegen_request_id: None,
+            }),
+        ]);
+        assert_eq!(thread, expected);
     }
 
     #[test]

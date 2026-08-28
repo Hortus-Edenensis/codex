@@ -26,8 +26,8 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
+use codex_state::GeneratedMemoryStore;
 use codex_state::Stage1Output;
-use codex_state::StateRuntime;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -53,8 +53,7 @@ pub async fn run(
 ) {
     let phase_two_e2e_timer = context.start_timer(MEMORY_PHASE_TWO_E2E_MS);
 
-    let Some(db) = context.state_db() else {
-        // This should not happen.
+    let Some(store) = context.generated_memory_store() else {
         return;
     };
     let root = memory_root(&config.codex_home);
@@ -62,7 +61,7 @@ pub async fn run(
     let max_unused_days = config.memories.max_unused_days;
 
     // 1. Claim the global Phase 2 lock before touching the memory workspace.
-    let claim = match job::claim(context.as_ref(), db.as_ref()).await {
+    let claim = match job::claim(context.as_ref(), store.as_ref()).await {
         Ok(claim) => claim,
         Err(e) => {
             context.counter(MEMORY_PHASE_TWO_JOBS, /*inc*/ 1, &[("status", e)]);
@@ -75,7 +74,7 @@ pub async fn run(
         tracing::error!("failed preparing memory workspace: {err}");
         job::failed(
             context.as_ref(),
-            db.as_ref(),
+            store.as_ref(),
             &claim,
             "failed_prepare_workspace",
         )
@@ -93,7 +92,7 @@ pub async fn run(
         tracing::error!("failed to get agent config");
         job::failed(
             context.as_ref(),
-            db.as_ref(),
+            store.as_ref(),
             &claim,
             "failed_sandbox_policy",
         )
@@ -102,8 +101,7 @@ pub async fn run(
     };
 
     // 4. Load current DB-backed Phase 2 inputs.
-    let raw_memories = match db
-        .memories()
+    let raw_memories = match store
         .get_phase2_input_selection(max_raw_memories, max_unused_days)
         .await
     {
@@ -112,7 +110,7 @@ pub async fn run(
             tracing::error!("failed to list stage1 outputs from global: {err}");
             job::failed(
                 context.as_ref(),
-                db.as_ref(),
+                store.as_ref(),
                 &claim,
                 "failed_load_stage1_outputs",
             )
@@ -128,7 +126,7 @@ pub async fn run(
         tracing::error!("failed syncing phase2 workspace inputs: {err}");
         job::failed(
             context.as_ref(),
-            db.as_ref(),
+            store.as_ref(),
             &claim,
             "failed_sync_workspace_inputs",
         )
@@ -143,7 +141,7 @@ pub async fn run(
             tracing::error!("failed checking memory workspace changes: {err}");
             job::failed(
                 context.as_ref(),
-                db.as_ref(),
+                store.as_ref(),
                 &claim,
                 "failed_workspace_status",
             )
@@ -156,7 +154,7 @@ pub async fn run(
         // We check only after sync of the file system.
         job::succeed(
             context.as_ref(),
-            db.as_ref(),
+            store.as_ref(),
             &claim,
             new_watermark,
             &raw_memories,
@@ -171,7 +169,7 @@ pub async fn run(
         tracing::error!("failed writing memory workspace diff file: {err}");
         job::failed(
             context.as_ref(),
-            db.as_ref(),
+            store.as_ref(),
             &claim,
             "failed_workspace_diff_file",
         )
@@ -188,7 +186,13 @@ pub async fn run(
         Ok(agent) => agent,
         Err(err) => {
             tracing::error!("failed to spawn global memory consolidation agent: {err}");
-            job::failed(context.as_ref(), db.as_ref(), &claim, "failed_spawn_agent").await;
+            job::failed(
+                context.as_ref(),
+                store.as_ref(),
+                &claim,
+                "failed_spawn_agent",
+            )
+            .await;
             return;
         }
     };
@@ -199,6 +203,7 @@ pub async fn run(
         claim,
         new_watermark,
         raw_memories.clone(),
+        store,
         root,
         agent,
         phase_two_e2e_timer,
@@ -227,10 +232,9 @@ mod job {
 
     pub(super) async fn claim(
         context: &MemoryStartupContext,
-        db: &StateRuntime,
+        store: &dyn GeneratedMemoryStore,
     ) -> Result<Claim, &'static str> {
-        let claim = db
-            .memories()
+        let claim = store
             .try_claim_global_phase2_job(context.thread_id(), crate::stage_two::JOB_LEASE_SECONDS)
             .await
             .map_err(|e| {
@@ -263,13 +267,13 @@ mod job {
 
     pub(super) async fn failed(
         context: &MemoryStartupContext,
-        db: &StateRuntime,
+        store: &dyn GeneratedMemoryStore,
         claim: &Claim,
         reason: &'static str,
     ) {
         context.counter(MEMORY_PHASE_TWO_JOBS, /*inc*/ 1, &[("status", reason)]);
         if matches!(
-            db.memories()
+            store
                 .mark_global_phase2_job_failed(
                     &claim.token,
                     reason,
@@ -278,8 +282,7 @@ mod job {
                 .await,
             Ok(false)
         ) {
-            let _ = db
-                .memories()
+            let _ = store
                 .mark_global_phase2_job_failed_if_unowned(
                     &claim.token,
                     reason,
@@ -291,14 +294,14 @@ mod job {
 
     pub(super) async fn succeed(
         context: &MemoryStartupContext,
-        db: &StateRuntime,
+        store: &dyn GeneratedMemoryStore,
         claim: &Claim,
         completion_watermark: i64,
         selected_outputs: &[codex_state::Stage1Output],
         reason: &'static str,
     ) -> bool {
         context.counter(MEMORY_PHASE_TWO_JOBS, /*inc*/ 1, &[("status", reason)]);
-        db.memories()
+        store
             .mark_global_phase2_job_succeeded(&claim.token, completion_watermark, selected_outputs)
             .await
             .unwrap_or(false)
@@ -384,21 +387,18 @@ mod agent {
         claim: Claim,
         new_watermark: i64,
         selected_outputs: Vec<codex_state::Stage1Output>,
+        store: Arc<dyn GeneratedMemoryStore>,
         memory_root: codex_utils_absolute_path::AbsolutePathBuf,
         agent: SpawnedConsolidationAgent,
         phase_two_e2e_timer: Option<codex_otel::Timer>,
     ) {
-        let Some(db) = context.state_db() else {
-            return;
-        };
-
         tokio::spawn(async move {
             let _phase_two_e2e_timer = phase_two_e2e_timer;
             let SpawnedConsolidationAgent { thread_id, thread } = agent;
 
             // Loop the agent until we have the final status.
             let final_status =
-                loop_agent(db.clone(), claim.token.clone(), thread_id, &thread).await;
+                loop_agent(Arc::clone(&store), claim.token.clone(), thread_id, &thread).await;
 
             let agent_completed = matches!(final_status, AgentStatus::Completed(_));
             if agent_completed
@@ -425,8 +425,13 @@ mod agent {
                     Ok(()) => true,
                     Err(err) => {
                         tracing::error!("memory consolidation artifacts are invalid: {err}");
-                        job::failed(context.as_ref(), &db, &claim, "failed_invalid_artifacts")
-                            .await;
+                        job::failed(
+                            context.as_ref(),
+                            store.as_ref(),
+                            &claim,
+                            "failed_invalid_artifacts",
+                        )
+                        .await;
                         false
                     }
                 }
@@ -436,8 +441,7 @@ mod agent {
 
             if agent_completed && artifacts_valid {
                 // Do not reset the workspace baseline if we lost the lock.
-                let still_owns_lock = match db
-                    .memories()
+                let still_owns_lock = match store
                     .heartbeat_global_phase2_job(
                         &claim.token,
                         crate::stage_two::JOB_LEASE_SECONDS,
@@ -456,7 +460,12 @@ mod agent {
                         false
                     }
                     Err(_) => {
-                        job::failed(context.as_ref(), &db, &claim, "failed_confirm_ownership")
+                        job::failed(
+                            context.as_ref(),
+                            store.as_ref(),
+                            &claim,
+                            "failed_confirm_ownership",
+                        )
                             .await;
                         false
                     }
@@ -464,10 +473,16 @@ mod agent {
                 if still_owns_lock {
                     if let Err(err) = reset_memory_workspace_baseline(&memory_root).await {
                         tracing::error!("failed resetting memory workspace baseline: {err}");
-                        job::failed(context.as_ref(), &db, &claim, "failed_workspace_commit").await;
+                        job::failed(
+                            context.as_ref(),
+                            store.as_ref(),
+                            &claim,
+                            "failed_workspace_commit",
+                        )
+                        .await;
                     } else if !job::succeed(
                         context.as_ref(),
-                        &db,
+                        store.as_ref(),
                         &claim,
                         new_watermark,
                         &selected_outputs,
@@ -484,13 +499,13 @@ mod agent {
                 if let Err(err) = remove_memory_symlinks(&memory_root).await {
                     tracing::error!("failed removing memory workspace symbolic links: {err}");
                 }
-                job::failed(context.as_ref(), &db, &claim, "failed_agent").await;
+                job::failed(context.as_ref(), store.as_ref(), &claim, "failed_agent").await;
             }
         });
     }
 
     async fn loop_agent(
-        db: Arc<StateRuntime>,
+        store: Arc<dyn GeneratedMemoryStore>,
         token: String,
         thread_id: ThreadId,
         thread: &codex_core::CodexThread,
@@ -525,8 +540,7 @@ mod agent {
                 _ = status_poll_interval.tick() => {
                 }
                 _ = heartbeat_interval.tick() => {
-                    match db
-                        .memories()
+                    match store
                         .heartbeat_global_phase2_job(
                             &token,
                             crate::stage_two::JOB_LEASE_SECONDS,

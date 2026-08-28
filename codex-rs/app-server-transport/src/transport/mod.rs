@@ -31,6 +31,7 @@ mod unix_socket;
 mod unix_socket_tests;
 mod websocket;
 
+pub use remote_control::PersistedRemoteControlEnrollment;
 pub use remote_control::REMOTE_CONTROL_DISABLED_ENV_VAR;
 pub use remote_control::RemoteControlDisabledByRequirements;
 pub use remote_control::RemoteControlEnableError;
@@ -38,8 +39,10 @@ pub use remote_control::RemoteControlHandle;
 pub use remote_control::RemoteControlPolicy;
 pub use remote_control::RemoteControlStartConfig;
 pub use remote_control::RemoteControlStartupMode;
+pub use remote_control::RemoteControlStateStore;
 pub use remote_control::RemoteControlUnavailable;
 pub use remote_control::start_remote_control;
+pub use remote_control::start_remote_control_with_state_store;
 pub use remote_control::take_remote_control_disabled_env;
 pub use stdio::start_stdio_connection;
 pub use unix_socket::AppServerStartupLock;

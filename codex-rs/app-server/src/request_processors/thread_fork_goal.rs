@@ -1,17 +1,12 @@
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::validate_thread_goal_objective;
-use codex_state::StateRuntime;
 
 pub(super) async fn inherit_thread_goal_snapshot(
-    state_db: &StateRuntime,
+    goal_store: &dyn codex_state::ThreadGoalStore,
     source_thread_id: ThreadId,
     target_thread_id: ThreadId,
 ) -> anyhow::Result<bool> {
-    let Some(mut goal) = state_db
-        .thread_goals()
-        .get_thread_goal(source_thread_id)
-        .await?
-    else {
+    let Some(mut goal) = goal_store.get_thread_goal(source_thread_id).await? else {
         return Ok(false);
     };
     if let Err(err) = validate_thread_goal_objective(&goal.objective) {
@@ -20,9 +15,6 @@ pub(super) async fn inherit_thread_goal_snapshot(
     }
 
     goal.thread_id = target_thread_id;
-    state_db
-        .thread_goals()
-        .replace_thread_goal_snapshot(&goal)
-        .await?;
+    goal_store.replace_thread_goal_snapshot(goal).await?;
     Ok(true)
 }

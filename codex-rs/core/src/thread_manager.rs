@@ -46,6 +46,8 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
+use codex_postgres_thread_store::PostgresThreadStore;
+use codex_postgres_thread_store::PostgresThreadStoreConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
@@ -381,6 +383,17 @@ pub fn thread_store_from_config(
     state_db: Option<StateDbHandle>,
 ) -> Arc<dyn ThreadStore> {
     match &config.experimental_thread_store {
+        ThreadStoreConfig::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        } => Arc::new(PostgresThreadStore::from_env_or_unconfigured(
+            PostgresThreadStoreConfig {
+                database_url_env: database_url_env.clone(),
+                default_workspace_id: default_workspace_id.clone(),
+                redis_url_env: redis_url_env.clone(),
+            },
+        )),
         ThreadStoreConfig::Local => {
             let compression_enabled = config
                 .features
@@ -424,6 +437,27 @@ pub fn thread_store_from_config(
             store
         }
         ThreadStoreConfig::InMemory { id } => InMemoryThreadStore::for_id(id),
+    }
+}
+
+pub fn agent_graph_store_from_config(
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+) -> Option<Arc<dyn AgentGraphStore>> {
+    match &config.experimental_thread_store {
+        ThreadStoreConfig::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        } => Some(Arc::new(PostgresThreadStore::from_env_or_unconfigured(
+            PostgresThreadStoreConfig {
+                database_url_env: database_url_env.clone(),
+                default_workspace_id: default_workspace_id.clone(),
+                redis_url_env: redis_url_env.clone(),
+            },
+        )) as Arc<dyn AgentGraphStore>),
+        ThreadStoreConfig::Local => local_agent_graph_store_from_state_db(state_db),
+        ThreadStoreConfig::InMemory { .. } => None,
     }
 }
 

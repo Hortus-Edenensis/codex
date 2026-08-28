@@ -1,3 +1,4 @@
+mod agent_job;
 mod backfill_state;
 mod graph;
 mod log;
@@ -9,6 +10,13 @@ mod thread_artifact;
 mod thread_goal;
 mod thread_metadata;
 
+pub use agent_job::AgentJob;
+pub use agent_job::AgentJobCreateParams;
+pub use agent_job::AgentJobItem;
+pub use agent_job::AgentJobItemCreateParams;
+pub use agent_job::AgentJobItemStatus;
+pub use agent_job::AgentJobProgress;
+pub use agent_job::AgentJobStatus;
 pub use backfill_state::BackfillState;
 pub use backfill_state::BackfillStatus;
 pub use graph::DirectionalThreadSpawnEdgeStatus;

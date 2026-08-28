@@ -76,7 +76,6 @@ use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
-use codex_rollout::state_db;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -857,12 +856,9 @@ async fn maybe_mark_thread_memory_mode_polluted(
     if !prepared_call.server_pollutes_memory() {
         return;
     }
-    state_db::mark_thread_memory_mode_polluted(
-        sess.services.state_db.as_deref(),
-        sess.thread_id,
-        "mcp_tool_call",
-    )
-    .await;
+    if let Some(store) = sess.services.generated_memory_store.as_ref() {
+        let _ = store.mark_thread_memory_mode_polluted(sess.thread_id).await;
+    }
 }
 
 fn sanitize_mcp_tool_result_for_model(

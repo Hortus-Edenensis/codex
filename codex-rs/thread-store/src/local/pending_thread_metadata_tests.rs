@@ -280,6 +280,8 @@ fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         metadata: ThreadPersistenceMetadata {
             cwd: Some(std::env::current_dir().expect("cwd")),
             model_provider: "test-provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             memory_mode: ThreadMemoryMode::Enabled,
         },
     }

@@ -4,12 +4,12 @@ use super::protocol::RemoteControlPairingStatusResponse as BackendRemoteControlP
 use super::protocol::RemoteControlTarget;
 use super::protocol::StartRemoteControlPairingRequest;
 use super::protocol::StartRemoteControlPairingResponse;
+use super::storage::PersistedRemoteControlEnrollment;
+use super::storage::RemoteControlStateStore;
 use axum::http::HeaderMap;
 use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_protocol::RemoteControlPairingStatusResponse;
 use codex_login::default_client::create_client_without_request_logging;
-use codex_state::RemoteControlEnrollmentRecord;
-use codex_state::StateRuntime;
 use std::io;
 use std::io::ErrorKind;
 use time::OffsetDateTime;
@@ -242,12 +242,15 @@ impl RemoteControlEnrollment {
     }
 }
 
-pub(super) async fn load_persisted_remote_control_enrollment(
-    state_db: Option<&StateRuntime>,
+pub(super) async fn load_persisted_remote_control_enrollment<S>(
+    state_db: Option<&S>,
     remote_control_target: &RemoteControlTarget,
     account_id: &str,
     app_server_client_name: Option<&str>,
-) -> io::Result<Option<RemoteControlEnrollment>> {
+) -> io::Result<Option<RemoteControlEnrollment>>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
     let Some(state_db) = state_db else {
         return Err(io::Error::new(
             ErrorKind::NotFound,
@@ -306,14 +309,17 @@ pub(super) async fn load_persisted_remote_control_enrollment(
     }
 }
 
-pub(super) async fn update_persisted_remote_control_enrollment(
-    state_db: Option<&StateRuntime>,
+pub(super) async fn update_persisted_remote_control_enrollment<S>(
+    state_db: Option<&S>,
     remote_control_target: &RemoteControlTarget,
     account_id: &str,
     app_server_client_name: Option<&str>,
     enrollment: Option<&RemoteControlEnrollment>,
     remote_control_enabled: Option<bool>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
     let Some(state_db) = state_db else {
         return Err(io::Error::new(
             ErrorKind::NotFound,
@@ -336,7 +342,7 @@ pub(super) async fn update_persisted_remote_control_enrollment(
 
     if let Some(enrollment) = enrollment {
         state_db
-            .upsert_remote_control_enrollment(&RemoteControlEnrollmentRecord {
+            .upsert_remote_control_enrollment(&PersistedRemoteControlEnrollment {
                 websocket_url: remote_control_target.websocket_url.clone(),
                 account_id: account_id.to_string(),
                 app_server_client_name: app_server_client_name.map(str::to_string),

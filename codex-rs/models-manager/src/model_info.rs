@@ -141,6 +141,15 @@ fn is_h1_heading(line: &str) -> bool {
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+    model_info_from_slug_inner(slug, true)
+}
+
+/// Build baseline metadata for a model advertised by an OpenAI-compatible provider.
+pub fn compatible_model_info_from_slug(slug: &str) -> ModelInfo {
+    model_info_from_slug_inner(slug, false)
+}
+
+fn model_info_from_slug_inner(slug: &str, used_fallback_model_metadata: bool) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
         display_name: slug.to_string(),
@@ -175,7 +184,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
-        used_fallback_model_metadata: true, // this is the fallback model metadata
+        used_fallback_model_metadata,
         supports_search_tool: false,
         use_responses_lite: false,
         node_repl_auto_review_required: false,

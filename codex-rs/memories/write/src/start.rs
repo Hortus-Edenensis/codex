@@ -46,8 +46,8 @@ pub fn start_memories_startup_task(
         source.clone(),
     ));
 
-    if context.state_db().is_none() {
-        warn!("state db unavailable for memories startup pipeline; skipping");
+    if context.generated_memory_store().is_none() {
+        warn!("generated memory store unavailable for memories startup pipeline; skipping");
         return;
     }
 

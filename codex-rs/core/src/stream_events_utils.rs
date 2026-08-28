@@ -25,7 +25,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
-use codex_rollout::state_db;
+use codex_state::GeneratedMemoryStore;
 use codex_utils_stream_parser::strip_proposed_plan_blocks;
 use futures::Future;
 use tracing::debug;
@@ -115,13 +115,16 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
         finalized_facts.and_then(|facts| facts.memory_citation.as_ref())
     {
         record_stage1_output_usage_for_memory_citation(
-            sess.services.state_db.as_ref(),
+            sess.services.generated_memory_store.as_ref(),
             memory_citation,
         )
         .await
     } else {
-        record_stage1_output_usage_and_detect_memory_citation(sess.services.state_db.as_ref(), item)
-            .await
+        record_stage1_output_usage_and_detect_memory_citation(
+            sess.services.generated_memory_store.as_ref(),
+            item,
+        )
+        .await
     };
     if has_memory_citation {
         sess.record_memory_citation_for_turn(&turn_context.sub_id)
@@ -149,16 +152,13 @@ pub(crate) async fn mark_thread_memory_mode_polluted_if_external_context(
     {
         return;
     }
-    state_db::mark_thread_memory_mode_polluted(
-        sess.services.state_db.as_deref(),
-        sess.thread_id,
-        "record_completed_response_item",
-    )
-    .await;
+    if let Some(store) = sess.services.generated_memory_store.as_ref() {
+        let _ = store.mark_thread_memory_mode_polluted(sess.thread_id).await;
+    }
 }
 
 async fn record_stage1_output_usage_and_detect_memory_citation(
-    state_db_ctx: Option<&state_db::StateDbHandle>,
+    generated_memory_store: Option<&Arc<dyn GeneratedMemoryStore>>,
     item: &ResponseItem,
 ) -> bool {
     let Some(raw_text) = raw_assistant_output_text_from_item(item) else {
@@ -169,11 +169,11 @@ async fn record_stage1_output_usage_and_detect_memory_citation(
     let Some(memory_citation) = parse_memory_citation(citations) else {
         return false;
     };
-    record_stage1_output_usage_for_memory_citation(state_db_ctx, &memory_citation).await
+    record_stage1_output_usage_for_memory_citation(generated_memory_store, &memory_citation).await
 }
 
 async fn record_stage1_output_usage_for_memory_citation(
-    state_db_ctx: Option<&state_db::StateDbHandle>,
+    generated_memory_store: Option<&Arc<dyn GeneratedMemoryStore>>,
     memory_citation: &MemoryCitation,
 ) -> bool {
     let thread_ids = thread_ids_from_memory_citation(memory_citation);
@@ -181,8 +181,8 @@ async fn record_stage1_output_usage_for_memory_citation(
         return true;
     }
 
-    if let Some(db) = state_db_ctx {
-        let _ = db.memories().record_stage1_output_usage(&thread_ids).await;
+    if let Some(store) = generated_memory_store {
+        let _ = store.record_stage1_output_usage(&thread_ids).await;
     }
     true
 }

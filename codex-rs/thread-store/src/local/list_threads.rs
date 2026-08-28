@@ -374,6 +374,7 @@ mod tests {
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with;
+    use crate::local::test_support::write_session_file_with_fork;
 
     #[tokio::test]
     async fn list_threads_uses_default_provider_when_rollout_omits_provider() {
@@ -411,6 +412,62 @@ mod tests {
 
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].model_provider, "test-provider");
+    }
+
+    #[tokio::test]
+    async fn list_threads_preserves_forked_from_id_with_state_db() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+        runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .expect("backfill should be complete");
+
+        let child_uuid = Uuid::from_u128(103);
+        let parent_uuid = Uuid::from_u128(104);
+        let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("valid child id");
+        let parent_id = ThreadId::from_string(&parent_uuid.to_string()).expect("valid parent id");
+        write_session_file_with_fork(
+            home.path(),
+            home.path().join("sessions/2025/01/03"),
+            "2025-01-03T12-00-00",
+            child_uuid,
+            "Forked user message",
+            Some("test-provider"),
+            Some(parent_uuid),
+            ThreadHistoryMode::Legacy,
+        )
+        .expect("forked session file");
+
+        let page = store
+            .list_threads(ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                section: None,
+                project_id: None,
+                archived: false,
+                search_term: None,
+                relation_filter: None,
+                use_state_db_only: false,
+            })
+            .await
+            .expect("thread listing");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].thread_id, child_id);
+        assert_eq!(page.items[0].forked_from_id, Some(parent_id));
     }
 
     #[tokio::test]

@@ -31,6 +31,8 @@ use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WaitForEnvironmentHandler;
 use crate::tools::handlers::WriteStdinHandler;
+use crate::tools::handlers::agent_jobs::ReportAgentJobResultHandler;
+use crate::tools::handlers::agent_jobs::SpawnAgentsOnCsvHandler;
 use crate::tools::handlers::extension_tools::ExtensionToolAdapter;
 use crate::tools::handlers::multi_agents::CloseAgentHandler;
 use crate::tools::handlers::multi_agents::ResumeAgentHandler;
@@ -77,6 +79,8 @@ use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
@@ -663,6 +667,24 @@ fn collab_tools_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> b
                 || model_info.multi_agent_version == Some(MultiAgentVersion::V2)
         }
     }
+}
+
+fn agent_jobs_tools_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
+    turn_context
+        .config
+        .features
+        .get()
+        .enabled(Feature::SpawnCsv)
+        && collab_tools_enabled(turn_context, model_info)
+}
+
+fn agent_jobs_worker_tools_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
+    agent_jobs_tools_enabled(turn_context, model_info)
+        && matches!(
+            &turn_context.session_source,
+            SessionSource::SubAgent(SubAgentSource::Other(label))
+                if label.starts_with("agent_job:")
+        )
 }
 
 fn required_child_management_tool_names(
@@ -1335,6 +1357,13 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             registry
                 .add_with_exposure(WaitAgentHandler::new(context.wait_agent_timeouts), exposure);
             registry.add_with_exposure(CloseAgentHandler, exposure);
+        }
+    }
+
+    if agent_jobs_tools_enabled(turn_context, context.model_info) {
+        registry.add(SpawnAgentsOnCsvHandler);
+        if agent_jobs_worker_tools_enabled(turn_context, context.model_info) {
+            registry.add(ReportAgentJobResultHandler);
         }
     }
 }

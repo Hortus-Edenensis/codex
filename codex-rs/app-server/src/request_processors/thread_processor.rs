@@ -22,7 +22,13 @@ use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutRecorder;
+#[cfg(test)]
+use codex_state::ThreadMetadata;
 use codex_thread_store::PersistContext;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -31,6 +37,95 @@ const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
 const PAGINATED_FULL_HISTORY_DEPRECATION_SUMMARY: &str = "Full-history hydration is deprecated for paginated threads; use `excludeTurns: true`, then page with `thread/turns/list` and `thread/items/list`.";
 const PAGINATED_THREAD_READ_DEPRECATION_SUMMARY: &str = "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`.";
+const THREAD_FORK_DEDUPE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const THREAD_FORK_DEDUPE_IN_FLIGHT_TTL: Duration = Duration::from_secs(5 * 60);
+const THREAD_FORK_DEDUPE_MAX_ENTRIES: usize = 256;
+
+#[derive(Clone)]
+struct CachedThreadForkResponse {
+    response: ThreadForkResponse,
+    thread_originator: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ThreadForkDedupeKey {
+    source_thread_id: ThreadId,
+    history_hash: u64,
+    request_hash: u64,
+}
+
+enum ThreadForkDedupeEntry {
+    InFlight {
+        sender: watch::Sender<Option<Result<CachedThreadForkResponse, JSONRPCErrorError>>>,
+        started_at: Instant,
+    },
+    Completed {
+        outcome: CachedThreadForkResponse,
+        completed_at: Instant,
+    },
+}
+
+enum ThreadForkDedupeClaim {
+    Owner(ThreadForkDedupeKey),
+    Replay(CachedThreadForkResponse),
+    Wait(watch::Receiver<Option<Result<CachedThreadForkResponse, JSONRPCErrorError>>>),
+}
+
+fn thread_fork_request_hash(
+    params: &ThreadForkParams,
+    app_server_client_name: Option<&str>,
+    app_server_client_version: Option<&str>,
+    client_mcp_extensions: &ClientMcpExtensions,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_serde(&mut hasher, params);
+    hash_serde(&mut hasher, &app_server_client_name);
+    hash_serde(&mut hasher, &app_server_client_version);
+    let extensions = client_mcp_extensions
+        .iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    hash_serde(&mut hasher, &extensions);
+    hasher.finish()
+}
+
+fn thread_fork_dedupe_key(
+    source_thread_id: ThreadId,
+    history_items: &[RolloutItem],
+    source_thread_name: Option<&str>,
+    request_hash: u64,
+) -> ThreadForkDedupeKey {
+    let mut history_hasher = DefaultHasher::new();
+    hash_serde(&mut history_hasher, history_items);
+    hash_serde(&mut history_hasher, &source_thread_name);
+    ThreadForkDedupeKey {
+        source_thread_id,
+        history_hash: history_hasher.finish(),
+        request_hash,
+    }
+}
+
+fn hash_serde<T>(hasher: &mut DefaultHasher, value: &T)
+where
+    T: serde::Serialize + ?Sized,
+{
+    match serde_json::to_vec(value) {
+        Ok(serialized) => serialized.hash(hasher),
+        Err(err) => err.to_string().hash(hasher),
+    }
+}
+
+async fn wait_for_thread_fork_dedupe(
+    mut receiver: watch::Receiver<Option<Result<CachedThreadForkResponse, JSONRPCErrorError>>>,
+) -> Result<CachedThreadForkResponse, JSONRPCErrorError> {
+    loop {
+        if let Some(outcome) = receiver.borrow().clone() {
+            return outcome;
+        }
+        if receiver.changed().await.is_err() {
+            return Err(internal_error("thread fork dedupe owner dropped"));
+        }
+    }
+}
 
 async fn stage_pending_project_metadata(
     thread_manager: &ThreadManager,
@@ -212,24 +307,156 @@ fn collect_resume_override_mismatches(
     mismatch_details
 }
 
-fn merge_persisted_resume_metadata(
+#[cfg(test)]
+fn merge_stored_thread_resume_metadata(
     request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: &mut ConfigOverrides,
-    persisted_metadata: &ThreadMetadata,
+    stored_thread: &StoredThread,
 ) {
-    if has_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
+    if has_explicit_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
         return;
     }
 
-    typesafe_overrides.model = persisted_metadata.model.clone();
-    typesafe_overrides.model_provider = Some(persisted_metadata.model_provider.clone());
+    typesafe_overrides.model = stored_thread.model.clone();
+    typesafe_overrides.model_provider = Some(stored_thread.model_provider.clone());
 
-    if let Some(reasoning_effort) = persisted_metadata.reasoning_effort.as_ref() {
+    if !has_reasoning_effort_resume_override(request_overrides.as_ref())
+        && let Some(reasoning_effort) = stored_thread.reasoning_effort.as_ref()
+    {
         request_overrides.get_or_insert_with(HashMap::new).insert(
             "model_reasoning_effort".to_string(),
             serde_json::Value::String(reasoning_effort.to_string()),
         );
     }
+}
+
+fn resolve_thread_list_model_providers(
+    requested_model_providers: Option<Vec<String>>,
+    relation_filter_present: bool,
+    uses_postgres_thread_store: bool,
+    default_model_provider: &str,
+) -> Option<Vec<String>> {
+    match requested_model_providers {
+        Some(providers) if providers.is_empty() => None,
+        Some(providers) => Some(providers),
+        None if relation_filter_present || uses_postgres_thread_store => None,
+        None => Some(vec![default_model_provider.to_string()]),
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResumeModelMetadata {
+    model: Option<String>,
+    model_provider: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort_observed: bool,
+}
+
+impl ResumeModelMetadata {
+    fn is_empty(&self) -> bool {
+        self.model.is_none() && self.model_provider.is_none() && !self.reasoning_effort_observed
+    }
+}
+
+fn latest_resume_model_metadata_from_history(history: &InitialHistory) -> ResumeModelMetadata {
+    let mut metadata = ResumeModelMetadata::default();
+    let update_from_item = |metadata: &mut ResumeModelMetadata, item: &RolloutItem| match item {
+        RolloutItem::TurnContext(turn_context) => {
+            metadata.model = Some(turn_context.model.clone());
+            metadata.reasoning_effort = turn_context.effort.clone();
+            metadata.reasoning_effort_observed = true;
+        }
+        RolloutItem::EventMsg(EventMsg::SessionConfigured(event)) => {
+            metadata.model = Some(event.model.clone());
+            metadata.model_provider = Some(event.model_provider_id.clone());
+            metadata.reasoning_effort = event.reasoning_effort.clone();
+            metadata.reasoning_effort_observed = true;
+        }
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+            metadata.model = Some(event.thread_settings.model.clone());
+            metadata.model_provider = Some(event.thread_settings.model_provider_id.clone());
+            metadata.reasoning_effort = event.thread_settings.reasoning_effort.clone();
+            metadata.reasoning_effort_observed = true;
+        }
+        RolloutItem::SessionMeta(meta_line) => {
+            if let Some(model_provider) = meta_line.meta.model_provider.as_ref()
+                && !model_provider.is_empty()
+            {
+                metadata.model_provider = Some(model_provider.clone());
+            }
+        }
+        RolloutItem::ResponseItem(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::Compacted(_)
+        | RolloutItem::WorldState(_)
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::EventMsg(_) => {}
+    };
+    match history {
+        InitialHistory::Resumed(resumed) => {
+            for item in resumed.history.iter() {
+                update_from_item(&mut metadata, item);
+            }
+        }
+        InitialHistory::Forked(items) => {
+            for item in items {
+                update_from_item(&mut metadata, item);
+            }
+        }
+        InitialHistory::New | InitialHistory::Cleared => {}
+    }
+    metadata
+}
+
+fn apply_resume_model_metadata(
+    request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &mut ConfigOverrides,
+    metadata: &ResumeModelMetadata,
+) {
+    if has_explicit_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
+        return;
+    }
+    if let Some(model) = metadata.model.as_ref() {
+        typesafe_overrides.model = Some(model.clone());
+    }
+    if let Some(model_provider) = metadata.model_provider.as_ref() {
+        typesafe_overrides.model_provider = Some(model_provider.clone());
+    }
+    if !has_reasoning_effort_resume_override(request_overrides.as_ref())
+        && let Some(reasoning_effort) = metadata.reasoning_effort.as_ref()
+    {
+        request_overrides.get_or_insert_with(HashMap::new).insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String(reasoning_effort.to_string()),
+        );
+    }
+}
+
+fn resume_model_metadata_patch(
+    metadata: &ResumeModelMetadata,
+    current_model: Option<&str>,
+    current_model_provider: Option<&str>,
+    current_reasoning_effort: Option<&ReasoningEffort>,
+) -> Option<StoreThreadMetadataPatch> {
+    let mut patch = StoreThreadMetadataPatch::default();
+    if let Some(model) = metadata.model.as_ref()
+        && current_model != Some(model.as_str())
+    {
+        patch.model = Some(model.clone());
+    }
+    if let Some(model_provider) = metadata.model_provider.as_ref()
+        && current_model_provider != Some(model_provider.as_str())
+    {
+        patch.model_provider = Some(model_provider.clone());
+    }
+    if metadata.reasoning_effort_observed
+        && current_reasoning_effort != metadata.reasoning_effort.as_ref()
+    {
+        patch.reasoning_effort = Some(metadata.reasoning_effort.clone());
+    }
+    if patch.is_empty() { None } else { Some(patch) }
 }
 
 fn normalize_thread_list_cwd_filters(
@@ -256,15 +483,20 @@ fn normalize_thread_list_cwd_filters(
     Ok(Some(normalized_cwds))
 }
 
-fn has_model_resume_override(
+fn has_explicit_model_resume_override(
     request_overrides: Option<&HashMap<String, serde_json::Value>>,
     typesafe_overrides: &ConfigOverrides,
 ) -> bool {
     typesafe_overrides.model.is_some()
         || typesafe_overrides.model_provider.is_some()
         || request_overrides.is_some_and(|overrides| overrides.contains_key("model"))
-        || request_overrides
-            .is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
+        || request_overrides.is_some_and(|overrides| overrides.contains_key("model_provider"))
+}
+
+fn has_reasoning_effort_resume_override(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+) -> bool {
+    request_overrides.is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
 }
 
 fn has_permission_override(
@@ -441,11 +673,13 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
+    pub(super) generated_memory_store: Option<GeneratedMemoryStoreHandle>,
     pub(super) log_db: Option<LogDbLayer>,
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+    thread_fork_dedupe: Arc<Mutex<HashMap<ThreadForkDedupeKey, ThreadForkDedupeEntry>>>,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -475,6 +709,7 @@ impl ThreadRequestProcessor {
         thread_list_state_permit: Arc<Semaphore>,
         thread_goal_processor: ThreadGoalRequestProcessor,
         state_db: Option<StateDbHandle>,
+        generated_memory_store: Option<GeneratedMemoryStoreHandle>,
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
         turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
@@ -494,11 +729,13 @@ impl ThreadRequestProcessor {
             thread_list_state_permit,
             thread_goal_processor,
             state_db,
+            generated_memory_store,
             log_db,
             background_tasks: TaskTracker::new(),
             skills_watcher,
             turn_cost_worker,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            thread_fork_dedupe: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1830,17 +2067,16 @@ impl ThreadRequestProcessor {
     }
 
     async fn memory_reset_response_inner(&self) -> Result<MemoryResetResponse, JSONRPCErrorError> {
-        let state_db = self
-            .state_db
+        let generated_memory_store = self
+            .generated_memory_store
             .clone()
-            .ok_or_else(|| internal_error("sqlite state db unavailable for memory reset"))?;
+            .ok_or_else(|| internal_error("generated memory store unavailable for memory reset"))?;
 
-        state_db
-            .memories()
+        generated_memory_store
             .clear_memory_data()
             .await
             .map_err(|err| {
-                internal_error(format!("failed to clear memory rows in memories db: {err}"))
+                internal_error(format!("failed to clear generated memory rows: {err}"))
             })?;
 
         clear_memory_roots_contents(&self.config.codex_home)
@@ -2240,11 +2476,6 @@ impl ThreadRequestProcessor {
         )
         .await?;
         let SessionConfiguredEvent { rollout_path, .. } = session_configured;
-        let rollout_path = rollout_path.ok_or_else(|| {
-            internal_error(format!(
-                "rollout path missing after reloading thread {thread_id}"
-            ))
-        })?;
         // Revert keeps the existing thread state and subscriptions across the internal reload.
         // Start the replacement listener from that state instead of depending on the requesting
         // connection still being open.
@@ -2256,7 +2487,7 @@ impl ThreadRequestProcessor {
                 thread_id,
                 codex_thread.as_ref(),
                 &response_history,
-                rollout_path.as_path(),
+                rollout_path.as_deref(),
                 Some(resume_source_thread),
                 /*include_turns*/ false,
             )
@@ -2954,7 +3185,7 @@ impl ThreadRequestProcessor {
         let fallback_thread =
             build_thread_from_loaded_snapshot(thread_id, &config_snapshot, loaded_thread);
         let mut thread = if let Some(mut thread) = persisted_thread {
-            if thread.path.is_none() {
+            if thread.path.is_none() && !fallback_thread.ephemeral {
                 thread.path = fallback_thread.path.clone();
             }
             thread.session_id.clone_from(&fallback_thread.session_id);
@@ -3760,12 +3991,15 @@ impl ThreadRequestProcessor {
             typesafe_overrides.approval_policy = Some(approval_policy);
         }
         let has_explicit_model_resume_override =
-            has_model_resume_override(request_overrides.as_ref(), &typesafe_overrides);
+            has_explicit_model_resume_override(request_overrides.as_ref(), &typesafe_overrides);
+        let has_explicit_reasoning_effort_resume_override =
+            has_reasoning_effort_resume_override(request_overrides.as_ref());
         let persisted_metadata = self
             .load_and_apply_persisted_resume_metadata(
                 &thread_history,
                 &mut request_overrides,
                 &mut typesafe_overrides,
+                resume_source_thread.as_ref(),
             )
             .await;
 
@@ -3783,6 +4017,7 @@ impl ThreadRequestProcessor {
             }
         };
         if !has_explicit_model_resume_override
+            && !has_explicit_reasoning_effort_resume_override
             && persisted_metadata
                 .as_ref()
                 .is_some_and(|metadata| metadata.reasoning_effort.is_none())
@@ -3821,12 +4056,6 @@ impl ThreadRequestProcessor {
                 }
                 let instruction_sources = codex_thread.legacy_instruction_sources().await;
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
-                let Some(rollout_path) = rollout_path else {
-                    let error =
-                        internal_error(format!("rollout path missing for thread {thread_id}"));
-                    self.outgoing.send_error(request_id, error).await;
-                    return Ok(());
-                };
                 // Paginated JSONL is canonical, but its SQLite projection can lag after a
                 // previous write failure. Persist after reopening the live writer so legacy
                 // response hydration reads the latest durable turns and items.
@@ -3869,7 +4098,7 @@ impl ThreadRequestProcessor {
                         thread_id,
                         codex_thread.as_ref(),
                         &response_history,
-                        rollout_path.as_path(),
+                        rollout_path.as_deref(),
                         resume_source_thread,
                         include_turns && !paginated_resume,
                     )
@@ -3905,6 +4134,16 @@ impl ThreadRequestProcessor {
                     /*has_live_in_progress_turn*/ false,
                 );
                 let config_snapshot = codex_thread.config_snapshot().await;
+                self.backfill_resume_model_metadata(
+                    thread_id,
+                    StoreThreadMetadataPatch {
+                        model_provider: Some(session_configured.model_provider_id.clone()),
+                        model: Some(session_configured.model.clone()),
+                        reasoning_effort: Some(session_configured.reasoning_effort.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
                 let (turns_backwards_cursor, items_backwards_cursor) =
                     if matches!(config_snapshot.history_mode, ThreadHistoryMode::Paginated) {
                         match Self::paginated_resume_backwards_cursors(
@@ -4030,7 +4269,8 @@ impl ThreadRequestProcessor {
         thread_history: &InitialHistory,
         request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: &mut ConfigOverrides,
-    ) -> Option<ThreadMetadata> {
+        resume_source_thread: Option<&StoredThread>,
+    ) -> Option<ResumeModelMetadata> {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
@@ -4052,14 +4292,69 @@ impl ThreadRequestProcessor {
                     .map(|profile| profile.id);
             }
         }
-        let state_db_ctx = self.state_db.clone()?;
-        let persisted_metadata = state_db_ctx
-            .get_thread(resumed_history.conversation_id)
+        let history_metadata = latest_resume_model_metadata_from_history(thread_history);
+        let explicit_model_override =
+            has_explicit_model_resume_override(request_overrides.as_ref(), typesafe_overrides);
+        let mut effective_metadata =
+            resume_source_thread.map_or_else(ResumeModelMetadata::default, |stored_thread| {
+                ResumeModelMetadata {
+                    model: stored_thread.model.clone(),
+                    model_provider: Some(stored_thread.model_provider.clone()),
+                    reasoning_effort: stored_thread.reasoning_effort.clone(),
+                    reasoning_effort_observed: true,
+                }
+            });
+
+        if !explicit_model_override {
+            if history_metadata.model.is_some() {
+                effective_metadata.model.clone_from(&history_metadata.model);
+            }
+            if history_metadata.model_provider.is_some() {
+                effective_metadata
+                    .model_provider
+                    .clone_from(&history_metadata.model_provider);
+            }
+            if history_metadata.reasoning_effort_observed {
+                effective_metadata
+                    .reasoning_effort
+                    .clone_from(&history_metadata.reasoning_effort);
+                effective_metadata.reasoning_effort_observed = true;
+            }
+            apply_resume_model_metadata(request_overrides, typesafe_overrides, &effective_metadata);
+
+            if !history_metadata.is_empty()
+                && let Some(patch) = resume_model_metadata_patch(
+                    &history_metadata,
+                    resume_source_thread.and_then(|thread| thread.model.as_deref()),
+                    resume_source_thread.map(|thread| thread.model_provider.as_str()),
+                    resume_source_thread.and_then(|thread| thread.reasoning_effort.as_ref()),
+                )
+            {
+                let thread_id = resume_source_thread
+                    .map(|thread| thread.thread_id)
+                    .unwrap_or(resumed_history.conversation_id);
+                self.backfill_resume_model_metadata(thread_id, patch).await;
+            }
+        }
+
+        (!effective_metadata.is_empty()).then_some(effective_metadata)
+    }
+
+    async fn backfill_resume_model_metadata(
+        &self,
+        thread_id: ThreadId,
+        patch: StoreThreadMetadataPatch,
+    ) {
+        if patch.is_empty() {
+            return;
+        }
+        if let Err(err) = self
+            .thread_manager
+            .update_thread_metadata(thread_id, patch, /*include_archived*/ true)
             .await
-            .ok()
-            .flatten()?;
-        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
-        Some(persisted_metadata)
+        {
+            warn!("failed to backfill resume model metadata for thread {thread_id}: {err}");
+        }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -4264,7 +4559,7 @@ impl ThreadRequestProcessor {
                 )));
             };
 
-            let (emit_thread_goal_update, thread_goal_state_db) = self
+            let (emit_thread_goal_update, thread_goal_store) = self
                 .thread_goal_processor
                 .pending_resume_goal_state(existing_thread.as_ref())
                 .await;
@@ -4318,6 +4613,30 @@ impl ThreadRequestProcessor {
             } else {
                 None
             };
+            let latest_persisted_turn =
+                if paginated_resume && (include_turns || params.initial_turns_page.is_some()) {
+                    if let Some(turn) = paginated_turns
+                        .as_ref()
+                        .and_then(|turns| turns.last())
+                        .cloned()
+                    {
+                        Some(turn)
+                    } else {
+                        self.paginated_thread_turns_list_response(
+                            existing_thread_id,
+                            /*cursor*/ None,
+                            Some(1),
+                            Some(SortDirection::Desc),
+                            Some(TurnItemsView::NotLoaded),
+                        )
+                        .await?
+                        .data
+                        .into_iter()
+                        .next()
+                    }
+                } else {
+                    None
+                };
             let resume_cursor_store = paginated_resume.then(|| Arc::clone(&self.thread_store));
 
             let command = crate::thread_state::ThreadListenerCommand::SendThreadResumeResponse(
@@ -4329,12 +4648,13 @@ impl ThreadRequestProcessor {
                     instruction_sources,
                     thread_summary,
                     emit_thread_goal_update,
-                    thread_goal_state_db,
+                    thread_goal_store,
                     include_turns,
                     initial_turns_page: params.initial_turns_page.clone(),
                     paginated_turns,
                     paginated_initial_turns_page,
                     paginated_initial_turns_page_with_active_slot,
+                    latest_persisted_turn,
                     resume_cursor_store,
                     redact_resume_payloads,
                 }),
@@ -4388,14 +4708,24 @@ impl ThreadRequestProcessor {
         }
 
         let thread_id = stored_thread.thread_id.to_string();
-        let rollout_path = stored_thread.rollout_path.clone();
-        let mut stored_thread = self
-            .read_stored_thread_for_resume(
-                &thread_id,
-                rollout_path.as_ref(),
-                /*include_history*/ true,
-            )
-            .await?;
+        let rollout_path = stored_thread.rollout_path.clone().ok_or_else(|| {
+            internal_error(format!(
+                "thread {thread_id} did not include a rollout path for resume"
+            ))
+        })?;
+        let (history_items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to load thread history {}: {err}",
+                    rollout_path.display()
+                ))
+            })?;
+        let mut stored_thread = stored_thread;
+        stored_thread.history = Some(codex_thread_store::StoredThreadHistory {
+            thread_id: stored_thread.thread_id,
+            items: history_items,
+        });
         let history = self
             .stored_thread_to_initial_history(&mut stored_thread)
             .await?;
@@ -4408,31 +4738,55 @@ impl ThreadRequestProcessor {
         path: Option<&PathBuf>,
         include_history: bool,
     ) -> Result<StoredThread, JSONRPCErrorError> {
-        let result = if let Some(path) = path {
-            self.thread_store
-                .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
-                    rollout_path: path.clone(),
-                    include_archived: true,
-                    include_history,
-                })
-                .await
-        } else {
-            let existing_thread_id = match ThreadId::from_string(thread_id) {
-                Ok(id) => id,
-                Err(err) => {
-                    return Err(invalid_request(format!("invalid session id: {err}")));
-                }
-            };
+        let parsed_thread_id = ThreadId::from_string(thread_id);
+        let requested_path = path.cloned();
+        let (result, resumed_by_thread_id) = if let Ok(existing_thread_id) = parsed_thread_id {
             let params = StoreReadThreadParams {
                 thread_id: existing_thread_id,
                 include_archived: true,
                 include_history,
             };
-            self.thread_store.read_thread(params).await
+            match self.thread_store.read_thread(params).await {
+                Ok(stored_thread) => (Ok(stored_thread), true),
+                Err(err)
+                    if requested_path.is_some()
+                        && thread_store_read_missed_thread(&err, existing_thread_id) =>
+                {
+                    let Some(rollout_path) = requested_path.clone() else {
+                        return Err(thread_store_resume_read_error(err));
+                    };
+                    (
+                        self.thread_store
+                            .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
+                                rollout_path,
+                                include_archived: true,
+                                include_history,
+                            })
+                            .await,
+                        false,
+                    )
+                }
+                Err(err) => (Err(err), true),
+            }
+        } else if let Some(path) = requested_path.clone() {
+            (
+                self.thread_store
+                    .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
+                        rollout_path: path,
+                        include_archived: true,
+                        include_history,
+                    })
+                    .await,
+                false,
+            )
+        } else {
+            let err = parsed_thread_id.expect_err("invalid thread id without path fallback");
+            return Err(invalid_request(format!("invalid session id: {err}")));
         };
 
         let stored_thread = result.map_err(thread_store_resume_read_error)?;
         if let Some(requested_path) = path
+            && !resumed_by_thread_id
             && matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated)
         {
             let current_thread = self
@@ -4528,7 +4882,7 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         thread: &CodexThread,
         thread_history: &InitialHistory,
-        rollout_path: &Path,
+        rollout_path: Option<&Path>,
         resume_source_thread: Option<StoredThread>,
         include_turns: bool,
     ) -> std::result::Result<Thread, String> {
@@ -4542,32 +4896,33 @@ impl ThreadRequestProcessor {
             InitialHistory::Resumed(resumed) => {
                 let fallback_provider = config_snapshot.model_provider_id.as_str();
                 if let Some(stored_thread) = resume_source_thread {
-                    let stored_thread =
-                        if let Some(rollout_path) = stored_thread.rollout_path.clone() {
-                            self.thread_store
-                                .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
-                                    rollout_path,
-                                    include_archived: true,
-                                    include_history: false,
-                                })
-                                .await
-                                .unwrap_or(StoredThread {
+                    let fallback_stored_thread = stored_thread.clone();
+                    let stored_thread = self
+                        .thread_store
+                        .read_thread(StoreReadThreadParams {
+                            thread_id: stored_thread.thread_id,
+                            include_archived: true,
+                            include_history: false,
+                        })
+                        .await
+                        .or_else(|err| {
+                            if fallback_stored_thread.rollout_path.is_some()
+                                && thread_store_read_missed_thread(
+                                    &err,
+                                    fallback_stored_thread.thread_id,
+                                )
+                            {
+                                Ok(StoredThread {
                                     history: None,
-                                    ..stored_thread
+                                    ..fallback_stored_thread
                                 })
-                        } else {
-                            self.thread_store
-                                .read_thread(StoreReadThreadParams {
-                                    thread_id: stored_thread.thread_id,
-                                    include_archived: true,
-                                    include_history: false,
-                                })
-                                .await
-                                .unwrap_or(StoredThread {
-                                    history: None,
-                                    ..stored_thread
-                                })
-                        };
+                            } else {
+                                Err(err)
+                            }
+                        })
+                        .map_err(|read_err| {
+                            format!("failed to read thread from store: {read_err}")
+                        })?;
                     Ok(thread_from_stored_thread(
                         stored_thread,
                         fallback_provider,
@@ -4597,6 +4952,11 @@ impl ThreadRequestProcessor {
                 }
             }
             InitialHistory::Forked(items) => {
+                let Some(rollout_path) = rollout_path else {
+                    return Err(format!(
+                        "failed to build fork response for thread {thread_id}: rollout path missing"
+                    ));
+                };
                 let mut thread = build_thread_from_snapshot(
                     thread_id,
                     session_id.clone(),
@@ -4615,7 +4975,7 @@ impl ThreadRequestProcessor {
         thread.can_accept_direct_input = Some(can_accept_direct_input);
         thread.id = thread_id.to_string();
         thread.session_id = session_id;
-        thread.path = Some(rollout_path.to_path_buf());
+        thread.path = rollout_path.map(Path::to_path_buf);
         if include_turns {
             let history_items = thread_history.get_rollout_items();
             populate_thread_turns_from_history(
@@ -4656,6 +5016,12 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<(), JSONRPCErrorError> {
+        let fork_request_hash = thread_fork_request_hash(
+            &params,
+            app_server_client_name.as_deref(),
+            app_server_client_version.as_deref(),
+            &client_mcp_extensions,
+        );
         let ThreadForkParams {
             thread_id,
             last_turn_id,
@@ -4923,16 +5289,54 @@ impl ThreadRequestProcessor {
             .then(|| restored_token_usage_turn_id(&history_items, ephemeral_turns.as_slice()));
         let token_usage_history_items = paginated_source.then(|| Arc::clone(&history_items));
         let inherited_project_id = source_thread.project_id.clone();
+        let mut dedupe_claim = if ephemeral {
+            None
+        } else {
+            let key = thread_fork_dedupe_key(
+                source_thread_id,
+                history_items.as_slice(),
+                source_thread_name.as_deref(),
+                fork_request_hash,
+            );
+            match self.claim_thread_fork_dedupe(key).await {
+                ThreadForkDedupeClaim::Owner(key) => Some(key),
+                ThreadForkDedupeClaim::Replay(cached) => {
+                    self.replay_thread_fork_response(request_id, cached).await;
+                    return Ok(());
+                }
+                ThreadForkDedupeClaim::Wait(receiver) => {
+                    let cached = wait_for_thread_fork_dedupe(receiver).await?;
+                    self.replay_thread_fork_response(request_id, cached).await;
+                    return Ok(());
+                }
+            }
+        };
+        macro_rules! fork_try {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if let Some(dedupe_key) = dedupe_claim.take() {
+                            self.complete_thread_fork_dedupe(dedupe_key, Err(error.clone()))
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+        }
         let reserved_thread_id = if config.ephemeral {
             None
         } else {
-            stage_pending_project_metadata(
-                self.thread_manager.as_ref(),
-                self.thread_store.as_ref(),
-                inherited_project_id.as_deref(),
-                "thread/fork",
+            fork_try!(
+                stage_pending_project_metadata(
+                    self.thread_manager.as_ref(),
+                    self.thread_store.as_ref(),
+                    inherited_project_id.as_deref(),
+                    "thread/fork",
+                )
+                .await
             )
-            .await?
         };
 
         let new_thread = if let Some(prepared_fork) = prepared_fork {
@@ -4973,53 +5377,64 @@ impl ThreadRequestProcessor {
             Err(err) => {
                 remove_pending_project_metadata(self.thread_store.as_ref(), reserved_thread_id)
                     .await;
-                return Err(match err.details() {
+                let error = match err.details() {
                     CodexErrorDetails::Io(_) | CodexErrorDetails::Json(_) => {
                         invalid_request(format!("failed to load thread {source_thread_id}: {err}"))
                     }
                     CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
                     _ => internal_error(format!("error forking thread: {err}")),
-                });
+                };
+                if let Some(dedupe_key) = dedupe_claim.take() {
+                    self.complete_thread_fork_dedupe(dedupe_key, Err(error.clone()))
+                        .await;
+                }
+                return Err(error);
             }
         };
 
-        Self::set_app_server_client_info(
-            forked_thread.as_ref(),
-            app_server_client_name,
-            app_server_client_version,
-        )
-        .await?;
-        if session_configured.rollout_path.is_some()
-            && let Some(name) = source_thread_name.clone()
-        {
-            self.thread_manager
-                .update_thread_metadata(
-                    thread_id,
-                    StoreThreadMetadataPatch {
-                        name: Some(Some(name)),
-                        ..Default::default()
-                    },
-                    /*include_archived*/ true,
-                )
-                .await
-                .map_err(|err| core_thread_write_error("inherit source thread name", err))?;
+        fork_try!(
+            Self::set_app_server_client_info(
+                forked_thread.as_ref(),
+                app_server_client_name,
+                app_server_client_version,
+            )
+            .await
+        );
+        if !ephemeral && let Some(name) = source_thread_name.clone() {
+            fork_try!(
+                self.thread_manager
+                    .update_thread_metadata(
+                        thread_id,
+                        StoreThreadMetadataPatch {
+                            name: Some(Some(name)),
+                            ..Default::default()
+                        },
+                        /*include_archived*/ true,
+                    )
+                    .await
+                    .map_err(|err| core_thread_write_error("inherit source thread name", err))
+            );
         }
-        let inherited_goal = if defer_goal_continuation
-            && session_configured.rollout_path.is_some()
-            && goals_enabled
-        {
-            if let Some(state_db) = forked_thread.state_db().or_else(|| self.state_db.clone()) {
-                self.thread_goal_processor
-                    .flush_goal_progress_for_fork(source_thread_id)
-                    .await
-                    .map_err(|err| {
-                        internal_error(format!("failed to flush source thread goal: {err}"))
-                    })?;
-                inherit_thread_goal_snapshot(&state_db, source_thread_id, thread_id)
-                    .await
-                    .map_err(|err| {
-                        internal_error(format!("failed to inherit source thread goal: {err}"))
-                    })?
+        let inherited_goal = if defer_goal_continuation && !ephemeral && goals_enabled {
+            if let Some(goal_store) = self
+                .thread_goal_processor
+                .goal_store_for_live_thread(forked_thread.as_ref())
+            {
+                fork_try!(
+                    self.thread_goal_processor
+                        .flush_goal_progress_for_fork(source_thread_id)
+                        .await
+                        .map_err(|err| {
+                            internal_error(format!("failed to flush source thread goal: {err}"))
+                        })
+                );
+                fork_try!(
+                    inherit_thread_goal_snapshot(goal_store.as_ref(), source_thread_id, thread_id,)
+                        .await
+                        .map_err(|err| {
+                            internal_error(format!("failed to inherit source thread goal: {err}"))
+                        })
+                )
             } else {
                 false
             }
@@ -5051,10 +5466,11 @@ impl ThreadRequestProcessor {
 
         // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
         // pathless, so their visible history is projected before the source history is consumed.
-        let (mut thread, mut token_usage_turn_id) = if session_configured.rollout_path.is_some() {
-            let stored_thread = self
-                .read_stored_thread_for_new_fork(thread_id, include_turns && !paginated_source)
-                .await?;
+        let (mut thread, mut token_usage_turn_id) = if !ephemeral {
+            let stored_thread = fork_try!(
+                self.read_stored_thread_for_new_fork(thread_id, include_turns && !paginated_source)
+                    .await
+            );
             let (mut thread, history) = thread_from_stored_thread(
                 stored_thread,
                 fallback_model_provider.as_str(),
@@ -5092,7 +5508,7 @@ impl ThreadRequestProcessor {
             (thread, ephemeral_token_usage_turn_id)
         };
         if paginated_source && include_turns {
-            thread.turns = self.paginated_thread_full_turns(thread_id).await?;
+            thread.turns = fork_try!(self.paginated_thread_full_turns(thread_id).await);
             token_usage_turn_id = Some(restored_token_usage_turn_id(
                 token_usage_history_items
                     .as_deref()
@@ -5145,6 +5561,10 @@ impl ThreadRequestProcessor {
 
         let notif = thread_started_notification(thread);
         let connection_id = request_id.connection_id;
+        let cached_response = CachedThreadForkResponse {
+            response: response.clone(),
+            thread_originator: thread_originator.clone(),
+        };
         self.outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)
             .await;
@@ -5171,7 +5591,95 @@ impl ThreadRequestProcessor {
                 .emit_thread_goal_snapshot(thread_id)
                 .await;
         }
+        if let Some(dedupe_key) = dedupe_claim.take() {
+            self.complete_thread_fork_dedupe(dedupe_key, Ok(cached_response))
+                .await;
+        }
         Ok(())
+    }
+
+    async fn claim_thread_fork_dedupe(&self, key: ThreadForkDedupeKey) -> ThreadForkDedupeClaim {
+        let now = Instant::now();
+        let mut dedupe = self.thread_fork_dedupe.lock().await;
+        dedupe.retain(|_, entry| match entry {
+            ThreadForkDedupeEntry::InFlight { started_at, .. } => {
+                now.duration_since(*started_at) < THREAD_FORK_DEDUPE_IN_FLIGHT_TTL
+            }
+            ThreadForkDedupeEntry::Completed { completed_at, .. } => {
+                now.duration_since(*completed_at) < THREAD_FORK_DEDUPE_TTL
+            }
+        });
+        if dedupe.len() > THREAD_FORK_DEDUPE_MAX_ENTRIES {
+            dedupe.clear();
+        }
+
+        if let Some(entry) = dedupe.get(&key) {
+            return match entry {
+                ThreadForkDedupeEntry::InFlight { sender, .. } => {
+                    ThreadForkDedupeClaim::Wait(sender.subscribe())
+                }
+                ThreadForkDedupeEntry::Completed { outcome, .. } => {
+                    ThreadForkDedupeClaim::Replay(outcome.clone())
+                }
+            };
+        }
+
+        let (sender, _) = watch::channel(None);
+        dedupe.insert(
+            key.clone(),
+            ThreadForkDedupeEntry::InFlight {
+                sender,
+                started_at: now,
+            },
+        );
+        ThreadForkDedupeClaim::Owner(key)
+    }
+
+    async fn complete_thread_fork_dedupe(
+        &self,
+        key: ThreadForkDedupeKey,
+        outcome: Result<CachedThreadForkResponse, JSONRPCErrorError>,
+    ) {
+        let mut dedupe = self.thread_fork_dedupe.lock().await;
+        if let Some(ThreadForkDedupeEntry::InFlight { sender, .. }) = dedupe.remove(&key) {
+            let _ = sender.send(Some(outcome.clone()));
+        }
+        if let Ok(outcome) = outcome {
+            dedupe.insert(
+                key,
+                ThreadForkDedupeEntry::Completed {
+                    outcome,
+                    completed_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    async fn replay_thread_fork_response(
+        &self,
+        request_id: ConnectionRequestId,
+        cached: CachedThreadForkResponse,
+    ) {
+        if let Ok(thread_id) = ThreadId::from_string(&cached.response.thread.id) {
+            log_listener_attach_result(
+                self.ensure_conversation_listener(
+                    thread_id,
+                    request_id.connection_id,
+                    /*raw_events_enabled*/ false,
+                )
+                .await,
+                thread_id,
+                request_id.connection_id,
+                "thread",
+            );
+        }
+        self.outgoing
+            .send_response_with_thread_originator(
+                request_id,
+                cached.response,
+                cached.thread_originator,
+            )
+            .await;
     }
 
     async fn get_thread_summary_response_inner(
@@ -5190,30 +5698,52 @@ impl ThreadRequestProcessor {
                 .await
                 .map_err(|err| conversation_summary_thread_id_read_error(conversation_id, err)),
             GetConversationSummaryParams::RolloutPath { rollout_path } => {
-                let Some(local_thread_store) = self
-                    .thread_store
-                    .as_any()
-                    .downcast_ref::<LocalThreadStore>()
-                else {
-                    return Err(invalid_request(
-                        "rollout path queries are only supported with the local thread store",
-                    ));
-                };
-
-                local_thread_store
-                    .read_thread_by_rollout_path(
-                        rollout_path.clone(),
-                        /*include_archived*/ true,
-                        /*include_history*/ false,
-                    )
+                self.read_conversation_summary_source_by_rollout_path(rollout_path)
                     .await
-                    .map_err(|err| conversation_summary_rollout_path_read_error(&rollout_path, err))
             }
         };
 
         let stored_thread = read_result?;
         let summary = summary_from_stored_thread(stored_thread, fallback_provider);
         Ok(GetConversationSummaryResponse { summary })
+    }
+
+    async fn read_conversation_summary_source_by_rollout_path(
+        &self,
+        rollout_path: PathBuf,
+    ) -> Result<StoredThread, JSONRPCErrorError> {
+        match self
+            .thread_store
+            .read_thread_by_rollout_path(StoreReadThreadByRolloutPathParams {
+                rollout_path: rollout_path.clone(),
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+        {
+            Ok(stored_thread) => Ok(stored_thread),
+            Err(
+                err @ (ThreadStoreError::Unsupported { .. }
+                | ThreadStoreError::InvalidRequest { .. }),
+            ) => {
+                let path_error = conversation_summary_rollout_path_read_error(&rollout_path, err);
+                let Some(thread_id) = thread_id_from_rollout_path(&rollout_path) else {
+                    return Err(path_error);
+                };
+                self.thread_store
+                    .read_thread(StoreReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await
+                    .map_err(|_| path_error)
+            }
+            Err(err) => Err(conversation_summary_rollout_path_read_error(
+                &rollout_path,
+                err,
+            )),
+        }
     }
 
     async fn list_threads_common(
@@ -5241,17 +5771,16 @@ impl ThreadRequestProcessor {
         let mut items = Vec::with_capacity(requested_page_size);
         let mut next_cursor: Option<String> = None;
 
-        let model_provider_filter = match model_providers {
-            Some(providers) => {
-                if providers.is_empty() {
-                    None
-                } else {
-                    Some(providers)
-                }
-            }
-            None if relation_filter.is_some() => None,
-            None => Some(vec![self.config.model_provider_id.clone()]),
-        };
+        let uses_postgres_thread_store = matches!(
+            &self.config.experimental_thread_store,
+            codex_core::config::ThreadStoreConfig::Postgres { .. }
+        );
+        let model_provider_filter = resolve_thread_list_model_providers(
+            model_providers,
+            relation_filter.is_some(),
+            uses_postgres_thread_store,
+            self.config.model_provider_id.as_str(),
+        );
         let (allowed_sources_vec, source_kind_filter) =
             if relation_filter.is_some() && source_kinds.is_none() {
                 (Vec::new(), None)
@@ -5705,6 +6234,18 @@ fn thread_store_list_error(err: ThreadStoreError) -> JSONRPCErrorError {
     }
 }
 
+fn thread_store_read_missed_thread(err: &ThreadStoreError, thread_id: ThreadId) -> bool {
+    match err {
+        ThreadStoreError::InvalidRequest { message } => {
+            message == &format!("no rollout found for thread id {thread_id}")
+        }
+        ThreadStoreError::ThreadNotFound {
+            thread_id: missing_thread_id,
+        } => *missing_thread_id == thread_id,
+        _ => false,
+    }
+}
+
 fn thread_store_resume_read_error(err: ThreadStoreError) -> JSONRPCErrorError {
     match err {
         ThreadStoreError::InvalidRequest { message } => invalid_request(message),
@@ -5810,6 +6351,18 @@ fn conversation_summary_rollout_path_read_error(
             err
         )),
     }
+}
+
+fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
+    let file_name = path.file_name()?.to_str()?;
+    let file_name = file_name.strip_suffix(".zst").unwrap_or(file_name);
+    let core = file_name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    core.match_indices('-').rev().find_map(|(idx, _)| {
+        let suffix = &core[idx + 1..];
+        Uuid::parse_str(suffix)
+            .ok()
+            .and_then(|uuid| ThreadId::from_string(&uuid.to_string()).ok())
+    })
 }
 
 pub(super) fn core_thread_write_error(operation: &str, err: CodexErr) -> JSONRPCErrorError {

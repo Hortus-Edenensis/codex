@@ -16,21 +16,39 @@ pub enum BackendKind {
 #[derive(Debug, Clone)]
 pub(crate) struct BackendPaths {
     pub(crate) codex_bin: PathBuf,
+    pub(crate) codex_home: PathBuf,
     pub(crate) pid_file: PathBuf,
     pub(crate) update_pid_file: PathBuf,
+    pub(crate) socket_path: PathBuf,
     pub(crate) remote_control_enabled: bool,
 }
 
 pub(crate) fn pid_backend(paths: BackendPaths) -> PidBackend {
+    let BackendPaths {
+        codex_bin,
+        codex_home,
+        pid_file,
+        socket_path,
+        remote_control_enabled,
+        ..
+    } = paths;
     PidBackend::new(
-        paths.codex_bin,
-        paths.pid_file,
-        paths.remote_control_enabled,
+        codex_bin,
+        codex_home,
+        pid_file,
+        socket_path,
+        remote_control_enabled,
     )
 }
 
 pub(crate) fn pid_update_loop_backend(paths: BackendPaths) -> PidBackend {
-    PidBackend::new_update_loop(paths.codex_bin, paths.update_pid_file)
+    let BackendPaths {
+        codex_bin,
+        codex_home,
+        update_pid_file,
+        ..
+    } = paths;
+    PidBackend::new_update_loop(codex_bin, codex_home, update_pid_file)
 }
 
 pub(crate) async fn append_stderr_log_tail_context(pid_file: &Path, context: &mut String) {

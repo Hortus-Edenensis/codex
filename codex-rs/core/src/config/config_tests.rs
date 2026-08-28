@@ -4433,6 +4433,38 @@ async fn legacy_remote_thread_store_endpoint_is_rejected() {
 }
 
 #[test]
+fn default_thread_store_stays_local_without_explicit_config() {
+    assert_eq!(ThreadStoreConfig::default(), ThreadStoreConfig::Local);
+    assert_eq!(thread_store_config(None), ThreadStoreConfig::Local);
+}
+
+#[test]
+fn explicit_local_thread_store_config_stays_local() {
+    assert_eq!(
+        thread_store_config(Some(ThreadStoreToml::Local {})),
+        ThreadStoreConfig::Local
+    );
+}
+
+#[test]
+fn explicit_postgres_thread_store_config_preserves_env_names() {
+    let expected = ThreadStoreConfig::Postgres {
+        database_url_env: codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV.to_string(),
+        default_workspace_id: codex_postgres_thread_store::DEFAULT_WORKSPACE_ID.to_string(),
+        redis_url_env: Some("CODEX_REDIS_URL".to_string()),
+    };
+
+    assert_eq!(
+        thread_store_config(Some(ThreadStoreToml::Postgres {
+            database_url_env: codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV.to_string(),
+            default_workspace_id: codex_postgres_thread_store::DEFAULT_WORKSPACE_ID.to_string(),
+            redis_url_env: Some("CODEX_REDIS_URL".to_string()),
+        })),
+        expected
+    );
+}
+
+#[test]
 fn profile_tui_rejects_unsupported_settings() {
     let err = toml::from_str::<ConfigToml>(
         r#"profile = "work"

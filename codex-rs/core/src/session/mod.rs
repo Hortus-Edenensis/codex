@@ -1209,6 +1209,10 @@ impl Session {
         self.services.state_db.clone()
     }
 
+    pub(crate) fn thread_store(&self) -> Arc<dyn ThreadStore> {
+        Arc::clone(&self.services.thread_store)
+    }
+
     pub(crate) fn live_thread_for_persistence(
         &self,
         operation: &str,

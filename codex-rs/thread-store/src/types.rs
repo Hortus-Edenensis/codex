@@ -60,6 +60,12 @@ pub struct ThreadPersistenceMetadata {
     pub cwd: Option<PathBuf>,
     /// Model provider associated with the thread.
     pub model_provider: String,
+    /// Effective model associated with the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Effective reasoning effort associated with the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Memory mode associated with the live thread.
     pub memory_mode: MemoryMode,
 }

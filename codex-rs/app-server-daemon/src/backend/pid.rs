@@ -29,8 +29,10 @@ const STDERR_LOG_TAIL_BYTES: u64 = 4096;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct PidBackend {
     codex_bin: PathBuf,
+    codex_home: PathBuf,
     pid_file: PathBuf,
     lock_file: PathBuf,
+    socket_path: Option<PathBuf>,
     command_kind: PidCommandKind,
 }
 
@@ -75,24 +77,38 @@ enum PidCommandKind {
 }
 
 impl PidBackend {
-    pub(crate) fn new(codex_bin: PathBuf, pid_file: PathBuf, remote_control_enabled: bool) -> Self {
+    pub(crate) fn new(
+        codex_bin: PathBuf,
+        codex_home: PathBuf,
+        pid_file: PathBuf,
+        socket_path: PathBuf,
+        remote_control_enabled: bool,
+    ) -> Self {
         let lock_file = pid_file.with_extension("pid.lock");
         Self {
             codex_bin,
+            codex_home,
             pid_file,
             lock_file,
+            socket_path: Some(socket_path),
             command_kind: PidCommandKind::AppServer {
                 remote_control_enabled,
             },
         }
     }
 
-    pub(crate) fn new_update_loop(codex_bin: PathBuf, pid_file: PathBuf) -> Self {
+    pub(crate) fn new_update_loop(
+        codex_bin: PathBuf,
+        codex_home: PathBuf,
+        pid_file: PathBuf,
+    ) -> Self {
         let lock_file = pid_file.with_extension("pid.lock");
         Self {
             codex_bin,
+            codex_home,
             pid_file,
             lock_file,
+            socket_path: None,
             command_kind: PidCommandKind::UpdateLoop,
         }
     }
@@ -166,7 +182,7 @@ impl PidBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log.into_std().await));
-        if let Some((key, value)) = self.command_env() {
+        for (key, value) in self.command_env() {
             command.env(key, value);
         }
 
@@ -410,29 +426,55 @@ impl PidBackend {
     }
 
     #[cfg(unix)]
-    fn command_args(&self) -> Vec<&'static str> {
+    fn command_args(&self) -> Vec<String> {
         match self.command_kind {
             PidCommandKind::AppServer {
                 remote_control_enabled: true,
-            } => vec!["app-server", "--remote-control", "--listen", "unix://"],
+            } => vec![
+                "app-server".to_string(),
+                "--remote-control".to_string(),
+                "--listen".to_string(),
+                format!(
+                    "unix://{}",
+                    self.socket_path
+                        .as_ref()
+                        .expect("app-server pid backend must have a socket path")
+                        .display()
+                ),
+            ],
             PidCommandKind::AppServer {
                 remote_control_enabled: false,
-            } => vec!["app-server", "--listen", "unix://"],
-            PidCommandKind::UpdateLoop => vec!["app-server", "daemon", "pid-update-loop"],
+            } => vec![
+                "app-server".to_string(),
+                "--listen".to_string(),
+                format!(
+                    "unix://{}",
+                    self.socket_path
+                        .as_ref()
+                        .expect("app-server pid backend must have a socket path")
+                        .display()
+                ),
+            ],
+            PidCommandKind::UpdateLoop => vec![
+                "app-server".to_string(),
+                "daemon".to_string(),
+                "pid-update-loop".to_string(),
+            ],
         }
     }
 
     #[cfg(unix)]
-    fn command_env(&self) -> Option<(&'static str, &'static str)> {
-        match self.command_kind {
+    fn command_env(&self) -> Vec<(&'static str, String)> {
+        let mut env = vec![("CODEX_HOME", self.codex_home.to_string_lossy().into_owned())];
+        if matches!(
+            self.command_kind,
             PidCommandKind::AppServer {
                 remote_control_enabled: false,
-            } => Some((REMOTE_CONTROL_DISABLED_ENV_VAR, "1")),
-            PidCommandKind::AppServer {
-                remote_control_enabled: true,
             }
-            | PidCommandKind::UpdateLoop => None,
+        ) {
+            env.push((REMOTE_CONTROL_DISABLED_ENV_VAR, "1".to_string()));
         }
+        env
     }
 
     fn terminate_process(&self, pid: u32) -> Result<()> {

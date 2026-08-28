@@ -9,7 +9,38 @@ use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
 use http::Method;
 use http::header::ETAG;
+use serde::Deserialize;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CompatibleModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub context_length: Option<i64>,
+    #[serde(default)]
+    pub supports_image_in: bool,
+    #[serde(default)]
+    pub supports_reasoning: bool,
+    #[serde(default)]
+    pub supports_dynamic_tools: bool,
+    #[serde(default)]
+    pub reasoning_efforts: Option<CompatibleReasoningEfforts>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CompatibleReasoningEfforts {
+    #[serde(default)]
+    pub support: bool,
+    #[serde(default)]
+    pub valid_efforts: Vec<codex_protocol::openai_models::ReasoningEffort>,
+    #[serde(default)]
+    pub default_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+}
+
+#[derive(Deserialize)]
+struct CompatibleModelsResponse {
+    data: Vec<CompatibleModelInfo>,
+}
 
 pub struct ModelsClient<T: HttpTransport> {
     session: EndpointSession<T>,
@@ -76,6 +107,40 @@ impl<T: HttpTransport> ModelsClient<T> {
             })?;
 
         Ok((models, header_etag))
+    }
+
+    pub async fn list_compatible_models(
+        &self,
+        request_url: String,
+        extra_headers: HeaderMap,
+    ) -> Result<(Vec<CompatibleModelInfo>, Option<String>), ApiError> {
+        let resp = self
+            .session
+            .execute_with(
+                Method::GET,
+                Self::path(),
+                extra_headers,
+                /*body*/ None,
+                move |req| {
+                    req.url.clone_from(&request_url);
+                },
+            )
+            .await?;
+
+        let header_etag = resp
+            .headers
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let CompatibleModelsResponse { data } =
+            serde_json::from_slice::<CompatibleModelsResponse>(&resp.body).map_err(|error| {
+                ApiError::Stream(format!(
+                    "failed to decode OpenAI-compatible models response: {error}; body: {}",
+                    String::from_utf8_lossy(&resp.body)
+                ))
+            })?;
+
+        Ok((data, header_etag))
     }
 }
 
@@ -262,5 +327,63 @@ mod tests {
 
         assert_eq!(models.len(), 0);
         assert_eq!(etag, Some("\"abc\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn parses_openai_compatible_models_response() {
+        #[derive(Clone)]
+        struct CompatibleTransport;
+
+        impl HttpTransport for CompatibleTransport {
+            async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
+                Ok(Response {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    body: serde_json::to_vec(&json!({
+                        "object": "list",
+                        "data": [{
+                            "id": "kimi-k3",
+                            "context_length": 1_048_576,
+                            "supports_image_in": true,
+                            "supports_reasoning": true,
+                            "supports_dynamic_tools": true,
+                            "reasoning_efforts": {
+                                "support": true,
+                                "valid_efforts": ["low", "high", "max"],
+                                "default_effort": "max"
+                            }
+                        }]
+                    }))
+                    .unwrap()
+                    .into(),
+                })
+            }
+
+            async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
+                Err(TransportError::Build("stream should not run".to_string()))
+            }
+        }
+
+        let provider = provider("https://api.moonshot.cn/v1");
+        let request_url = ModelsClient::<CompatibleTransport>::request_url(&provider, "0.142.5");
+        let client = ModelsClient::new(CompatibleTransport, provider, Arc::new(DummyAuth));
+
+        let (models, _) = client
+            .list_compatible_models(request_url, HeaderMap::new())
+            .await
+            .expect("compatible models response should parse");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "kimi-k3");
+        assert_eq!(models[0].context_length, Some(1_048_576));
+        assert!(models[0].supports_dynamic_tools);
+        assert_eq!(
+            models[0]
+                .reasoning_efforts
+                .as_ref()
+                .and_then(|efforts| efforts.default_effort.as_ref())
+                .map(ToString::to_string),
+            Some("max".to_string())
+        );
     }
 }

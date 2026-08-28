@@ -2044,6 +2044,7 @@ dependencies = [
  "codex-models-manager",
  "codex-otel",
  "codex-plugin",
+ "codex-postgres-thread-store",
  "codex-protocol",
  "codex-queue-extension",
  "codex-rmcp-client",
@@ -2797,6 +2798,7 @@ dependencies = [
  "codex-network-proxy",
  "codex-otel",
  "codex-plugin",
+ "codex-postgres-thread-store",
  "codex-prompts",
  "codex-protocol",
  "codex-response-debug-context",
@@ -2830,6 +2832,7 @@ dependencies = [
  "codex-web-search-extension",
  "codex-windows-sandbox",
  "core_test_support",
+ "csv",
  "ctor 0.6.3",
  "dirs",
  "dunce",
@@ -3742,6 +3745,7 @@ dependencies = [
  "codex-secrets",
  "codex-state",
  "codex-terminal-detection",
+ "codex-thread-store",
  "codex-utils-absolute-path",
  "codex-utils-output-truncation",
  "codex-utils-template",
@@ -3934,6 +3938,23 @@ dependencies = [
  "codex-utils-plugins",
  "pretty_assertions",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codex-postgres-thread-store"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codex-agent-graph-store",
+ "codex-protocol",
+ "codex-rollout",
+ "codex-state",
+ "codex-thread-store",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

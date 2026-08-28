@@ -23,6 +23,7 @@ base64 = { workspace = true }
 bm25 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
+csv = { workspace = true }
 codex-analytics = { workspace = true }
 codex-agent-graph-store = { workspace = true }
 codex-agent-roles = { workspace = true }
@@ -59,6 +60,7 @@ codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-plugin = { workspace = true }
 codex-model-provider = { workspace = true }
+codex-postgres-thread-store = { workspace = true }
 codex-protocol = { workspace = true }
 codex-response-debug-context = { workspace = true }
 codex-prompts = { workspace = true }

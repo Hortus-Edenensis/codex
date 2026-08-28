@@ -31,9 +31,11 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_queue_extension::QueuedItemService;
 use codex_rollout::state_db::StateDbHandle;
+use codex_thread_store::ThreadStore;
 
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::thread_state::ThreadGoalStoreHandle;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
 
@@ -41,6 +43,7 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) state_db: Option<StateDbHandle>,
+    pub(crate) goal_store: Option<ThreadGoalStoreHandle>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) thread_manager: Weak<ThreadManager>,
     pub(crate) goal_service: Arc<GoalService>,
@@ -50,6 +53,8 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) http_client_factory: HttpClientFactory,
     /// Process-scoped queue shared by idle dispatch and app-server requests.
     pub(crate) queue_service: Option<Arc<QueuedItemService>>,
+    /// Process-scoped persistence backend for extensions that need stored thread history.
+    pub(crate) thread_store: Arc<dyn ThreadStore>,
 }
 
 pub(crate) fn thread_extensions<S>(
@@ -63,6 +68,7 @@ where
         event_sink,
         auth_manager,
         state_db,
+        goal_store,
         analytics_events_client,
         thread_manager,
         goal_service,
@@ -71,16 +77,26 @@ where
         git_attribution_base_url,
         http_client_factory,
         queue_service,
+        thread_store,
     } = dependencies;
     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::clone(&event_sink));
     if let Some(queue_service) = queue_service {
         codex_queue_extension::install(&mut builder, queue_service);
     }
     codex_history_notes_extension::install(&mut builder, auth_manager.clone());
-    if let Some(state_db) = state_db {
-        codex_goal_extension::install_with_backend(
+    if let Some(goal_store) = goal_store {
+        let preview_state_db = if thread_store
+            .as_any()
+            .is::<codex_postgres_thread_store::PostgresThreadStore>()
+        {
+            None
+        } else {
+            state_db
+        };
+        codex_goal_extension::install_with_goal_store(
             &mut builder,
-            state_db,
+            goal_store,
+            preview_state_db,
             analytics_events_client,
             codex_otel::global(),
             thread_manager.clone(),

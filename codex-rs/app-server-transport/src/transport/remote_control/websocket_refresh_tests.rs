@@ -15,6 +15,7 @@ use crate::transport::remote_control::protocol::normalize_remote_control_url;
 use crate::transport::remote_control::tests::remote_control_handle_with_current_enrollment;
 use codex_app_server_protocol::RemoteControlPairingStartParams;
 use codex_app_server_protocol::RemoteControlPairingStartResponse;
+use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -200,7 +201,7 @@ async fn websocket_retry_after_throttles_pairing_refresh() {
     let auth_manager = remote_control_auth_manager();
     let mut remote_handle =
         remote_control_handle_with_current_enrollment(&remote_control_url, auth_manager.clone());
-    remote_handle.state_db = Some(state_db.clone());
+    remote_handle.state_db = Some(state_db.clone() as Arc<dyn RemoteControlStateStore>);
     remote_handle
         .current_enrollment
         .lock()
@@ -295,7 +296,7 @@ async fn pairing_http_date_retry_after_throttles_websocket_refresh() {
     let auth_manager = remote_control_auth_manager();
     let mut remote_handle =
         remote_control_handle_with_current_enrollment(&remote_control_url, auth_manager.clone());
-    remote_handle.state_db = Some(state_db.clone());
+    remote_handle.state_db = Some(state_db.clone() as Arc<dyn RemoteControlStateStore>);
     remote_handle
         .current_enrollment
         .lock()

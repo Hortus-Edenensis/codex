@@ -529,10 +529,29 @@ pub struct ConfigToml {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadStoreToml {
     Local {},
+    Postgres {
+        /// Environment variable containing the PostgreSQL connection URL.
+        #[serde(default = "default_remote_sql_url_env")]
+        database_url_env: String,
+        /// Workspace used before app-server exposes explicit workspace routing.
+        #[serde(default = "default_remote_sql_workspace_id")]
+        default_workspace_id: String,
+        /// Optional environment variable containing the Redis URL for realtime state.
+        #[serde(default)]
+        redis_url_env: Option<String>,
+    },
     #[schemars(skip)]
     InMemory {
         id: String,
     },
+}
+
+fn default_remote_sql_url_env() -> String {
+    "CODEX_REMOTE_SQL_URL".to_string()
+}
+
+fn default_remote_sql_workspace_id() -> String {
+    "default".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]

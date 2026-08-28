@@ -34,7 +34,6 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
-use codex_rollout::state_db;
 use codex_shell_command::parse_command::parse_shell_script;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -441,9 +440,23 @@ impl ToolRegistry {
     }
 
     pub(crate) fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
-        self.tools
-            .get(&name.clone().with_default_namespace())
-            .map(|tool| Arc::clone(&tool.runtime))
+        if let Some(tool) = self.tools.get(&name.clone().with_default_namespace()) {
+            return Some(Arc::clone(&tool.runtime));
+        }
+        if name.namespace.is_some() {
+            return None;
+        }
+
+        let mut matches = self
+            .tools
+            .iter()
+            .filter(|(tool_name, _)| flat_tool_name(tool_name).as_ref() == name.name)
+            .map(|(_, tool)| Arc::clone(&tool.runtime));
+        let first_match = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first_match)
     }
 
     #[cfg(test)]
@@ -779,13 +792,11 @@ async fn handle_any_tool(
     let output = tool.handle(invocation.clone()).await?;
     if output.contains_external_context()
         && invocation.turn.config.memories.disable_on_external_context
+        && let Some(store) = invocation.session.services.generated_memory_store.as_ref()
     {
-        state_db::mark_thread_memory_mode_polluted(
-            invocation.session.services.state_db.as_deref(),
-            invocation.session.thread_id,
-            "tool_output",
-        )
-        .await;
+        let _ = store
+            .mark_thread_memory_mode_polluted(invocation.session.thread_id)
+            .await;
     }
     let post_tool_use_payload =
         CoreToolRuntime::post_tool_use_payload(tool, &invocation, output.as_ref());

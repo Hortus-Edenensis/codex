@@ -1,0 +1,50 @@
+name: responses-api-proxy-ci
+
+on:
+  push:
+    branches:
+      - codex/issue-30364-continue-thinking-proxy
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  proxy-ci:
+    name: Format, lint, and test responses-api-proxy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libcap-dev \
+            pkg-config
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest
+
+      - name: cargo fmt
+        run: cargo fmt -- --config imports_granularity=Item --check
+
+      - name: cargo clippy
+        run: cargo clippy -p codex-responses-api-proxy --tests -- -D warnings
+
+      - name: cargo nextest
+        run: cargo nextest run -p codex-responses-api-proxy

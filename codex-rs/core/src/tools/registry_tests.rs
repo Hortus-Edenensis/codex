@@ -368,6 +368,23 @@ fn registry_allows_identical_names_in_different_namespaces() {
     assert_eq!(registry.first_collision(), None);
 }
 
+#[test]
+fn handler_looks_up_flattened_namespaced_tool_name() {
+    let namespaced_name = codex_tools::ToolName::namespaced("codex_app", "read_thread");
+    let handler = Arc::new(TestHandler {
+        tool_name: namespaced_name,
+    }) as Arc<dyn CoreToolRuntime>;
+    let registry = ToolRegistry::from_tools([Arc::clone(&handler)]);
+
+    let flattened = registry.tool(&codex_tools::ToolName::plain("codex_appread_thread"));
+
+    assert!(
+        flattened
+            .as_ref()
+            .is_some_and(|resolved| Arc::ptr_eq(resolved, &handler))
+    );
+}
+
 #[tokio::test]
 async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
     let (session, _turn) = crate::session::tests::make_session_and_context().await;

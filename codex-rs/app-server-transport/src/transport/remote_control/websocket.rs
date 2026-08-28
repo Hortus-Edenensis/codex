@@ -16,6 +16,7 @@ use super::segment::ClientSegmentObservation;
 use super::segment::ClientSegmentReassembler;
 use super::segment::REMOTE_CONTROL_SEGMENT_MAX_BYTES;
 use super::segment::split_server_envelope_for_transport;
+use super::storage::RemoteControlStateStore;
 use crate::transport::TransportEvent;
 use crate::transport::remote_control::auth::RemoteControlConnectionAuth;
 use crate::transport::remote_control::auth::load_remote_control_auth;
@@ -38,7 +39,6 @@ use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_core::util::backoff;
 use codex_login::AuthManager;
 use codex_login::UnauthorizedRecovery;
-use codex_state::StateRuntime;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -258,7 +258,7 @@ pub(crate) struct RemoteControlWebsocket {
     installation_id: String,
     server_name: String,
     remote_control_target: Option<RemoteControlTarget>,
-    state_db: Option<Arc<StateRuntime>>,
+    state_db: Option<Arc<dyn RemoteControlStateStore>>,
     auth_manager: Arc<AuthManager>,
     status_publisher: RemoteControlStatusPublisher,
     shutdown_token: CancellationToken,
@@ -402,7 +402,7 @@ pub(super) struct RemoteControlConnectOptions<'a> {
 impl RemoteControlWebsocket {
     pub(crate) fn new(
         config: RemoteControlWebsocketConfig,
-        state_db: Option<Arc<StateRuntime>>,
+        state_db: Option<Arc<dyn RemoteControlStateStore>>,
         auth_manager: Arc<AuthManager>,
         channels: RemoteControlChannels,
         shutdown_token: CancellationToken,
@@ -593,7 +593,7 @@ impl RemoteControlWebsocket {
             }
         };
         self.remote_control_target = Some(remote_control_target.clone());
-        let Some(state_db) = self.state_db.clone() else {
+        let Some(state_store) = self.state_db.clone() else {
             self.transition_unknown_to(RemoteControlDesiredState::Disabled);
             return true;
         };
@@ -618,7 +618,7 @@ impl RemoteControlWebsocket {
                     continue;
                 }
             };
-            let enrollment = match state_db
+            let enrollment = match state_store
                 .get_remote_control_enrollment(
                     &remote_control_target.websocket_url,
                     &auth.account_id,
@@ -1320,9 +1320,9 @@ fn next_reconnect_delay(reconnect_attempt: &mut u64) -> (std::time::Duration, bo
     (reconnect_delay, reconnect_backoff_reset)
 }
 
-pub(super) async fn connect_remote_control_websocket(
+pub(super) async fn connect_remote_control_websocket<S>(
     remote_control_target: &RemoteControlTarget,
-    state_db: Option<&StateRuntime>,
+    state_store: Option<&S>,
     mut auth_context: RemoteControlAuthContext<'_>,
     current_enrollment: &CurrentRemoteControlEnrollment,
     connect_options: RemoteControlConnectOptions<'_>,
@@ -1330,14 +1330,17 @@ pub(super) async fn connect_remote_control_websocket(
 ) -> io::Result<(
     WebSocketStream<MaybeTlsStream<TcpStream>>,
     tungstenite::http::Response<()>,
-)> {
+)>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
     ensure_rustls_crypto_provider();
 
     let (auth, enrollment) = {
         let mut current_enrollment = current_enrollment.lock().await;
         let auth = prepare_remote_control_enrollment(
             remote_control_target,
-            state_db,
+            state_store,
             &mut auth_context,
             &mut current_enrollment,
             connect_options,
@@ -1387,7 +1390,7 @@ pub(super) async fn connect_remote_control_websocket(
                         enrollment.environment_id
                     );
                     replace_remote_control_enrollment_if_matches(
-                        state_db,
+                        state_store,
                         remote_control_target,
                         RemoteControlEnrollmentAuthContext {
                             auth: &auth,
@@ -1439,19 +1442,22 @@ pub(super) async fn connect_remote_control_websocket(
     }
 }
 
-async fn prepare_remote_control_enrollment(
+async fn prepare_remote_control_enrollment<S>(
     remote_control_target: &RemoteControlTarget,
-    state_db: Option<&StateRuntime>,
+    state_store: Option<&S>,
     auth_context: &mut RemoteControlAuthContext<'_>,
     enrollment: &mut Option<RemoteControlEnrollment>,
     connect_options: RemoteControlConnectOptions<'_>,
     status_publisher: &RemoteControlStatusPublisher,
-) -> io::Result<RemoteControlConnectionAuth> {
-    let Some(state_db) = state_db else {
+) -> io::Result<RemoteControlConnectionAuth>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
+    let Some(state_store) = state_store else {
         *enrollment = None;
         return Err(io::Error::new(
             ErrorKind::NotFound,
-            "remote control requires sqlite state db",
+            "remote control requires state storage",
         ));
     };
 
@@ -1468,7 +1474,7 @@ async fn prepare_remote_control_enrollment(
     let enrollment_account_id = enrollment.as_ref().map(|enrollment| &enrollment.account_id);
     if enrollment_account_id.is_some_and(|account_id| account_id != &auth.account_id) {
         resolve_desired_state_after_account_change(
-            state_db,
+            state_store,
             remote_control_target,
             auth_context.auth_manager,
             &auth.account_id,
@@ -1502,7 +1508,7 @@ async fn prepare_remote_control_enrollment(
 
     if enrollment.is_none() {
         let loaded_enrollment = load_persisted_remote_control_enrollment(
-            Some(state_db),
+            Some(state_store),
             remote_control_target,
             &auth.account_id,
             connect_options.app_server_client_name,
@@ -1519,7 +1525,7 @@ async fn prepare_remote_control_enrollment(
 
     enroll_and_persist_remote_control_server(
         remote_control_target,
-        state_db,
+        state_store,
         RemoteControlEnrollmentAuthContext {
             auth: &auth,
             recovery: auth_context,
@@ -1564,7 +1570,7 @@ async fn prepare_remote_control_enrollment(
                 );
                 enroll_and_persist_remote_control_server(
                     remote_control_target,
-                    state_db,
+                    state_store,
                     RemoteControlEnrollmentAuthContext {
                         auth: &auth,
                         recovery: auth_context,
@@ -1597,13 +1603,16 @@ async fn prepare_remote_control_enrollment(
     Ok(auth)
 }
 
-async fn resolve_desired_state_after_account_change(
-    state_db: &StateRuntime,
+async fn resolve_desired_state_after_account_change<S>(
+    state_store: &S,
     remote_control_target: &RemoteControlTarget,
     auth_manager: &Arc<AuthManager>,
     account_id: &str,
     connect_options: RemoteControlConnectOptions<'_>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
     let durable_enabled = RemoteControlDesiredState::Enabled {
         persistence_preference: Some(true),
     };
@@ -1616,14 +1625,13 @@ async fn resolve_desired_state_after_account_change(
     if *connect_options.desired_state_tx.borrow() != durable_enabled {
         return Ok(());
     }
-    let enrollment = state_db
+    let enrollment = state_store
         .get_remote_control_enrollment(
             &remote_control_target.websocket_url,
             account_id,
             connect_options.app_server_client_name,
         )
-        .await
-        .map_err(io::Error::other)?;
+        .await?;
     let current_auth = load_remote_control_auth(auth_manager).await?;
     if current_auth.account_id != account_id {
         return Err(io::Error::new(
@@ -1654,19 +1662,22 @@ fn websocket_response_reports_missing_remote_app_server(
         })
 }
 
-async fn replace_remote_control_enrollment_if_matches(
-    state_db: Option<&StateRuntime>,
+async fn replace_remote_control_enrollment_if_matches<S>(
+    state_store: Option<&S>,
     remote_control_target: &RemoteControlTarget,
     auth_context: RemoteControlEnrollmentAuthContext<'_, '_>,
     current_enrollment: &CurrentRemoteControlEnrollment,
     enrollment: &RemoteControlEnrollment,
     connect_options: RemoteControlConnectOptions<'_>,
     status_publisher: &RemoteControlStatusPublisher,
-) -> io::Result<()> {
-    let Some(state_db) = state_db else {
+) -> io::Result<()>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
+    let Some(state_store) = state_store else {
         return Err(io::Error::new(
             ErrorKind::NotFound,
-            "remote control requires sqlite state db",
+            "remote control requires state storage",
         ));
     };
     let mut current_enrollment = current_enrollment.lock().await;
@@ -1678,7 +1689,7 @@ async fn replace_remote_control_enrollment_if_matches(
     }
     enroll_and_persist_remote_control_server(
         remote_control_target,
-        state_db,
+        state_store,
         auth_context,
         &mut current_enrollment,
         connect_options,
@@ -1705,15 +1716,18 @@ async fn clear_remote_control_server_token_if_matches(
     Ok(())
 }
 
-async fn enroll_and_persist_remote_control_server(
+async fn enroll_and_persist_remote_control_server<S>(
     remote_control_target: &RemoteControlTarget,
-    state_db: &StateRuntime,
+    state_store: &S,
     auth_context: RemoteControlEnrollmentAuthContext<'_, '_>,
     enrollment: &mut Option<RemoteControlEnrollment>,
     connect_options: RemoteControlConnectOptions<'_>,
     status_publisher: &RemoteControlStatusPublisher,
     selection: RemoteControlEnrollmentSelection,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
     match selection {
         RemoteControlEnrollmentSelection::ReuseOrCreate => {
             if enrollment.is_some() {
@@ -1772,7 +1786,7 @@ async fn enroll_and_persist_remote_control_server(
         }
     };
     if let Err(err) = update_persisted_remote_control_enrollment(
-        Some(state_db),
+        Some(state_store),
         remote_control_target,
         &auth_context.auth.account_id,
         connect_options.app_server_client_name,
@@ -1782,7 +1796,7 @@ async fn enroll_and_persist_remote_control_server(
     .await
     {
         return Err(io::Error::other(format!(
-            "failed to persist remote control enrollment in sqlite state db: {err}"
+            "failed to persist remote control enrollment in state storage: {err}"
         )));
     }
     info!(
@@ -2419,7 +2433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_remote_control_websocket_requires_sqlite_state_db() {
+    async fn connect_remote_control_websocket_requires_state_storage() {
         let remote_control_target = normalize_remote_control_url("http://127.0.0.1:9/backend-api/")
             .expect("target should parse");
         let auth_manager = remote_control_auth_manager();
@@ -2432,7 +2446,7 @@ mod tests {
 
         let err = connect_remote_control_websocket(
             &remote_control_target,
-            /*state_db*/ None,
+            None::<&codex_state::StateRuntime>,
             RemoteControlAuthContext {
                 auth_manager: &auth_manager,
                 auth_recovery: &mut auth_recovery,
@@ -2450,10 +2464,10 @@ mod tests {
             &status_publisher,
         )
         .await
-        .expect_err("missing sqlite state db should fail remote control");
+        .expect_err("missing state storage should fail remote control");
 
         assert_eq!(err.kind(), ErrorKind::NotFound);
-        assert_eq!(err.to_string(), "remote control requires sqlite state db");
+        assert_eq!(err.to_string(), "remote control requires state storage");
         assert_eq!(*current_enrollment.lock().await, None);
     }
 

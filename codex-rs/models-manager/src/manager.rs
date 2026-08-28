@@ -610,8 +610,18 @@ fn requested_model_is_available(
     requested_model.is_some_and(|requested_model| {
         available_models
             .iter()
-            .any(|available_model| available_model.model == requested_model)
+            .any(|available_model| model_ids_match(&available_model.model, requested_model))
     })
+}
+
+fn model_ids_match(available_model: &str, requested_model: &str) -> bool {
+    available_model == requested_model
+        || available_model
+            .strip_prefix("openai.")
+            .is_some_and(|model| model == requested_model)
+        || requested_model
+            .strip_prefix("openai.")
+            .is_some_and(|model| model == available_model)
 }
 
 fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {

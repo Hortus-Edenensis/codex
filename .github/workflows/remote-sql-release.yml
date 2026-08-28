@@ -1,0 +1,532 @@
+name: remote-sql-release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - v0.151.0-remote-sql-copy.1
+  pull_request:
+    paths:
+      - .github/remote-sql-migrations.sha256
+      - .github/scripts/copy_workspace_smoke.py
+      - .github/scripts/deploy_remote_sql_release.py
+      - .github/workflows/remote-sql-release.yml
+      - codex-rs/postgres-thread-store/migrations/**
+
+concurrency:
+  group: remote-sql-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  EXPECTED_TAG: v0.151.0-remote-sql-copy.1
+  VERSION_BASE: 0.151.0-remote-sql-copy.1
+  UPSTREAM_PARENT: 4ee04c0aa5833ac39b1763f6ea44c7bc777c83dd
+  REMOTE_SQL_PARENT: 03efbd5ef6b960ae622b1f3fcc4a8e7f178407b2
+  HISTORY_PARENT: cee6ff5d0007b1a8e16c6c607143fdb4d0838243
+  TARGET_TRIPLE: x86_64-unknown-linux-gnu
+
+jobs:
+  migration-integrity:
+    name: Remote SQL migration integrity
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Verify immutable PostgreSQL migrations
+        run: sha256sum --check --strict .github/remote-sql-migrations.sha256
+      - name: Verify release helpers
+        run: |
+          python3 -m py_compile \
+            .github/scripts/copy_workspace_smoke.py \
+            .github/scripts/deploy_remote_sql_release.py
+          python3 -m unittest discover -s .github/scripts -p 'test_*remote_sql_release.py'
+          python3 -m unittest discover -s .github/scripts -p 'test_copy_workspace_smoke.py'
+
+  build-release:
+    name: Build immutable Linux release
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.1'
+    needs: migration-integrity
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      archive_name: ${{ steps.package.outputs.archive_name }}
+      binary_sha256: ${{ steps.package.outputs.binary_sha256 }}
+      runtime_version: ${{ steps.identity.outputs.runtime_version }}
+      sha12: ${{ steps.identity.outputs.sha12 }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Lock tag and three-parent lineage
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF_NAME}" = "${EXPECTED_TAG}"
+          source_sha="$(git rev-list -n 1 "${GITHUB_REF}")"
+          test "${source_sha}" = "${GITHUB_SHA}"
+          test "$(git show -s --format=%P "${source_sha}")" = \
+            "${UPSTREAM_PARENT} ${REMOTE_SQL_PARENT} ${HISTORY_PARENT}"
+          sha12="${source_sha:0:12}"
+          runtime_version="${VERSION_BASE}+${sha12}"
+          printf 'source_sha=%s\nsha12=%s\nruntime_version=%s\n' \
+            "${source_sha}" "${sha12}" "${runtime_version}" >> "${GITHUB_OUTPUT}"
+      - name: Verify immutable PostgreSQL migrations again at the tag
+        run: sha256sum --check --strict .github/remote-sql-migrations.sha256
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Install native build tools
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils \
+            file \
+            libcap-dev \
+            libssl-dev \
+            pkg-config \
+            protobuf-compiler
+      - name: Embed the self-hosted runtime version
+        env:
+          RUNTIME_VERSION: ${{ steps.identity.outputs.runtime_version }}
+        run: |
+          set -euo pipefail
+          sed -i "s/^version = \"0\.0\.0\"$/version = \"${RUNTIME_VERSION}\"/" \
+            codex-rs/Cargo.toml
+          grep -qx "version = \"${RUNTIME_VERSION}\"" codex-rs/Cargo.toml
+          cd codex-rs
+          cargo metadata --format-version 1 --no-deps >/dev/null
+      - name: Build and strip codex
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          RUST_MIN_STACK: "8388608"
+        run: |
+          set -euo pipefail
+          cd codex-rs
+          cargo build --ignore-rust-version --release -p codex-cli --bin codex
+          strip --strip-unneeded target/release/codex
+      - name: Verify ELF, interpreter, glibc ceiling, and runtime version
+        env:
+          RUNTIME_VERSION: ${{ steps.identity.outputs.runtime_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=codex-rs/target/release/codex
+          file "${binary}" | grep -Eq 'ELF 64-bit LSB.*x86-64.*dynamically linked.*stripped'
+          readelf --program-headers "${binary}" \
+            | grep -Fq '[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]'
+          max_glibc="$({ readelf --version-info "${binary}" \
+            | grep -Eo 'GLIBC_[0-9]+(\.[0-9]+)+' \
+            | sed 's/^GLIBC_//' \
+            | sort -Vu \
+            | tail -1; })"
+          test -n "${max_glibc}"
+          dpkg --compare-versions "${max_glibc}" le 2.35
+          "${binary}" --version | grep -Fq "${RUNTIME_VERSION}"
+      - name: Package versioned release assets
+        id: package
+        env:
+          RUNTIME_VERSION: ${{ steps.identity.outputs.runtime_version }}
+          SHA12: ${{ steps.identity.outputs.sha12 }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="${RUNNER_TEMP}/remote-sql-release"
+          stage="${RUNNER_TEMP}/remote-sql-release-stage"
+          rm -rf "${output}" "${stage}"
+          mkdir -p "${output}" "${stage}"
+          install -m 0755 codex-rs/target/release/codex "${stage}/codex"
+          cat > "${stage}/PROVENANCE.txt" <<EOF
+          release_tag=${EXPECTED_TAG}
+          runtime_version=${RUNTIME_VERSION}
+          source_sha=${SOURCE_SHA}
+          source_sha12=${SHA12}
+          parents=${UPSTREAM_PARENT} ${REMOTE_SQL_PARENT} ${HISTORY_PARENT}
+          upstream_parent=${UPSTREAM_PARENT}
+          remote_sql_parent=${REMOTE_SQL_PARENT}
+          history_recovery_parent=${HISTORY_PARENT}
+          target=${TARGET_TRIPLE}
+          builder_image=ubuntu-22.04
+          rust_toolchain=1.95.0
+          glibc_ceiling=2.35
+          github_run_id=${GITHUB_RUN_ID}
+          github_run_attempt=${GITHUB_RUN_ATTEMPT}
+          EOF
+          cp "${stage}/PROVENANCE.txt" "${output}/PROVENANCE.txt"
+          cp "${stage}/codex" "${output}/codex"
+          archive_name="codex-${VERSION_BASE}-${SHA12}-${TARGET_TRIPLE}.tar.gz"
+          source_date_epoch="$(git show -s --format=%ct "${SOURCE_SHA}")"
+          tar --directory "${stage}" \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --mtime="@${source_date_epoch}" \
+            -cf - codex PROVENANCE.txt \
+            | gzip -n > "${output}/${archive_name}"
+          archive_sha="$(sha256sum "${output}/${archive_name}" | awk '{print $1}')"
+          provenance_sha="$(sha256sum "${output}/PROVENANCE.txt" | awk '{print $1}')"
+          binary_sha="$(sha256sum "${stage}/codex" | awk '{print $1}')"
+          printf '%s  %s\n%s  %s\n%s  %s\n' \
+            "${archive_sha}" "${archive_name}" \
+            "${provenance_sha}" PROVENANCE.txt \
+            "${binary_sha}" codex > "${output}/SHA256SUMS.txt"
+          tar -tzf "${output}/${archive_name}" \
+            | sort \
+            | diff -u <(printf 'PROVENANCE.txt\ncodex\n') -
+          (cd "${output}" && sha256sum --check --strict SHA256SUMS.txt)
+          rm "${output}/codex"
+          printf 'archive_name=%s\nbinary_sha256=%s\n' \
+            "${archive_name}" "${binary_sha}" >> "${GITHUB_OUTPUT}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: remote-sql-release-bundle
+          path: |
+            ${{ runner.temp }}/remote-sql-release/${{ steps.package.outputs.archive_name }}
+            ${{ runner.temp }}/remote-sql-release/SHA256SUMS.txt
+            ${{ runner.temp }}/remote-sql-release/PROVENANCE.txt
+          if-no-files-found: error
+          retention-days: 90
+
+  draft-release:
+    name: Create authenticated draft Release
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.1'
+    needs: build-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: remote-sql-release-bundle
+          path: release-bundle
+      - name: Create or refresh only the draft Release
+        env:
+          ARCHIVE_NAME: ${{ needs.build-release.outputs.archive_name }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "release-bundle/${ARCHIVE_NAME}"
+          test -f release-bundle/SHA256SUMS.txt
+          test -f release-bundle/PROVENANCE.txt
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${EXPECTED_TAG}" 2>/dev/null)"; then
+            test "$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["draft"]).lower())' <<<"${release_json}")" = true
+          else
+            gh release create "${EXPECTED_TAG}" \
+              --draft \
+              --prerelease \
+              --latest=false \
+              --verify-tag \
+              --title "${EXPECTED_TAG}" \
+              --notes "Self-hosted PostgreSQL copy-workspace release. Publication is gated on deployment, restart, resume, goal, memory, fork, and Kimi smoke evidence."
+          fi
+          gh release upload "${EXPECTED_TAG}" --clobber \
+            "release-bundle/${ARCHIVE_NAME}" \
+            release-bundle/SHA256SUMS.txt \
+            release-bundle/PROVENANCE.txt
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${EXPECTED_TAG}" \
+            | python3 -c '
+          import json
+          import os
+          import sys
+
+          release = json.load(sys.stdin)
+          expected = {os.environ["ARCHIVE_NAME"], "SHA256SUMS.txt", "PROVENANCE.txt"}
+          names = [asset.get("name") for asset in release.get("assets", [])]
+          if len(names) != len(expected) or set(names) != expected:
+              raise SystemExit(f"draft Release asset set mismatch: {sorted(names)}")
+          '
+
+  deploy-copy-workspace:
+    name: Deploy draft asset and run fail-closed smoke
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.1'
+    needs:
+      - build-release
+      - draft-release
+    runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
+    timeout-minutes: 55
+    permissions:
+      contents: read
+    env:
+      ARCHIVE_NAME: ${{ needs.build-release.outputs.archive_name }}
+      COPY_CONTAINER: ${{ vars.COPY_WORKSPACE_CONTAINER || 'workspace' }}
+      COPY_DEPLOYMENT: ${{ vars.COPY_WORKSPACE_DEPLOYMENT || 'codex-workspace-copy' }}
+      COPY_NAMESPACE: ${{ vars.COPY_WORKSPACE_NAMESPACE || 'codex-internal' }}
+      COPY_RELEASE_ROOT: ${{ vars.COPY_WORKSPACE_RELEASE_ROOT || '/workspace/shared-state/.git/codex-persist/codex-standalone/releases' }}
+      COPY_BACKUP_ROOT: ${{ vars.COPY_WORKSPACE_BACKUP_ROOT || '/workspace/shared-state/.git/codex-persist/private-backups/codex-workspace-copy' }}
+      COPY_RESUME_THREAD_ID: ${{ vars.COPY_WORKSPACE_RESUME_THREAD_ID || '019f1846-9419-7853-b035-f2ba0fad3d72' }}
+      RUNTIME_VERSION: ${{ needs.build-release.outputs.runtime_version }}
+      SOURCE_SHA: ${{ needs.build-release.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Initialize runner-local deployment state paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'DEPLOY_STATE=%s\nSMOKE_STATE=%s\n' \
+            "${RUNNER_TEMP}/remote-sql-deploy-state.json" \
+            "${RUNNER_TEMP}/remote-sql-smoke-state.json" >> "${GITHUB_ENV}"
+      - name: Recheck migration source on the deployment runner
+        run: sha256sum --check --strict .github/remote-sql-migrations.sha256
+      - name: Resolve the one ready old-release Pod
+        id: current
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_json="$(python3 .github/scripts/deploy_remote_sql_release.py current-pod \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}")"
+          pod="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pod"])' <<<"${current_json}")"
+          test -n "${pod}"
+          echo "pod=${pod}" >> "${GITHUB_OUTPUT}"
+      - name: Wait up to 15 minutes for all existing work to become idle
+        run: |
+          python3 .github/scripts/copy_workspace_smoke.py wait-idle \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.current.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --idle-timeout-seconds 900
+      - name: Resolve and record an existing nonempty historical thread
+        id: known
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolved="$(python3 .github/scripts/copy_workspace_smoke.py resolve-known \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.current.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}")"
+          thread_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["threadId"])' <<<"${resolved}")"
+          test -n "${thread_id}"
+          printf '%s\n' "${resolved}"
+          echo "COPY_RESUME_THREAD_ID=${thread_id}" >> "${GITHUB_ENV}"
+          echo "thread_id=${thread_id}" >> "${GITHUB_OUTPUT}"
+      - name: Download draft assets, install immutable directory, and back up PostgreSQL
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/deploy_remote_sql_release.py prepare \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --release-tag "${EXPECTED_TAG}" \
+            --runtime-version "${RUNTIME_VERSION}" \
+            --source-sha "${SOURCE_SHA}" \
+            --release-selector "${RUNTIME_VERSION}" \
+            --archive-name "${ARCHIVE_NAME}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --repository-root "${GITHUB_WORKSPACE}" \
+            --migration-manifest "${GITHUB_WORKSPACE}/.github/remote-sql-migrations.sha256"
+      - name: Recheck the idle gate immediately before selector CAS
+        run: |
+          python3 .github/scripts/copy_workspace_smoke.py wait-idle \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.current.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --idle-timeout-seconds 900
+      - name: Dry-run and apply the command plus annotation CAS
+        id: activate
+        run: |
+          python3 .github/scripts/deploy_remote_sql_release.py activate \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}"
+      - name: Read the activated Pod from deployment state
+        id: activated
+        run: |
+          pod="$(python3 -c 'import json,os; print(json.load(open(os.environ["DEPLOY_STATE"]))["newPod"])')"
+          test -n "${pod}"
+          echo "pod=${pod}" >> "${GITHUB_OUTPUT}"
+      - name: Verify known resume, Kimi turn, goal, memory, and fork deduplication
+        id: smoke-pre
+        run: |
+          python3 .github/scripts/copy_workspace_smoke.py pre-restart \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.activated.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --state-file "${SMOKE_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}" \
+            --model kimi-k3 \
+            --model-provider kimi \
+            --cwd /workspace/repo
+      - name: Restart the managed app-server daemon
+        run: |
+          python3 .github/scripts/deploy_remote_sql_release.py restart-daemon \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}"
+      - name: Verify persistence after daemon restart
+        run: |
+          python3 .github/scripts/copy_workspace_smoke.py post-restart \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.activated.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --state-file "${SMOKE_STATE}"
+      - name: Remove only release-created smoke threads
+        if: always()
+        continue-on-error: true
+        run: |
+          if test -f "${SMOKE_STATE}" && test -n "${{ steps.activated.outputs.pod }}"; then
+            python3 .github/scripts/copy_workspace_smoke.py cleanup \
+              --namespace "${COPY_NAMESPACE}" \
+              --pod "${{ steps.activated.outputs.pod }}" \
+              --container "${COPY_CONTAINER}" \
+              --state-file "${SMOKE_STATE}"
+          fi
+      - name: CAS rollback on any failed deployment or smoke gate
+        if: failure() && steps.prepare.outcome == 'success'
+        run: |
+          python3 .github/scripts/deploy_remote_sql_release.py rollback \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}"
+
+  publish-release:
+    name: Publish only after deployment evidence passes
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.1'
+    needs:
+      - build-release
+      - deploy-copy-workspace
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      ARCHIVE_NAME: ${{ needs.build-release.outputs.archive_name }}
+    steps:
+      - name: Re-download and verify the exact draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          verify_dir="${RUNNER_TEMP}/publish-release-verify"
+          rm -rf "${verify_dir}"
+          mkdir -p "${verify_dir}"
+          asset_fingerprint() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${EXPECTED_TAG}" \
+              | python3 -c '
+          import json
+          import os
+          import sys
+
+          release = json.load(sys.stdin)
+          if release.get("draft") is not True:
+              raise SystemExit("Release is no longer a draft")
+          if release.get("tag_name") != os.environ["EXPECTED_TAG"]:
+              raise SystemExit("Release tag mismatch")
+          expected = {os.environ["ARCHIVE_NAME"], "SHA256SUMS.txt", "PROVENANCE.txt"}
+          assets = release.get("assets", [])
+          names = [asset.get("name") for asset in assets]
+          if len(names) != len(expected) or set(names) != expected:
+              raise SystemExit(f"draft Release asset set mismatch: {sorted(names)}")
+          print("\n".join(
+              ":".join(str(asset[key]) for key in ("name", "id", "size", "updated_at"))
+              for asset in sorted(assets, key=lambda item: item["name"])
+          ))
+          '
+          }
+          before_assets="$(asset_fingerprint)"
+          gh release download "${EXPECTED_TAG}" \
+            --dir "${verify_dir}" \
+            --pattern "${ARCHIVE_NAME}" \
+            --pattern SHA256SUMS.txt \
+            --pattern PROVENANCE.txt
+          python3 - "${verify_dir}" "${ARCHIVE_NAME}" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          root = Path(sys.argv[1])
+          archive_name = sys.argv[2]
+          expected_names = {archive_name, "PROVENANCE.txt", "codex"}
+          sums = {}
+          for line in (root / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, name = line.split(maxsplit=1)
+              name = name.lstrip("*")
+              if name in sums or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                  raise SystemExit("invalid SHA256SUMS.txt")
+              sums[name] = digest
+          if set(sums) != expected_names:
+              raise SystemExit("SHA256SUMS.txt entry set mismatch")
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          archive_bytes = (root / archive_name).read_bytes()
+          standalone_provenance = (root / "PROVENANCE.txt").read_bytes()
+          if sha256(archive_bytes) != sums[archive_name]:
+              raise SystemExit("archive SHA-256 mismatch")
+          if sha256(standalone_provenance) != sums["PROVENANCE.txt"]:
+              raise SystemExit("standalone provenance SHA-256 mismatch")
+          with tarfile.open(root / archive_name, "r:gz") as bundle:
+              members = bundle.getmembers()
+              names = [member.name for member in members]
+              if len(names) != 2 or set(names) != {"codex", "PROVENANCE.txt"}:
+                  raise SystemExit("archive member set mismatch")
+              if not all(member.isfile() for member in members):
+                  raise SystemExit("archive contains a non-file member")
+              codex = bundle.extractfile("codex")
+              provenance = bundle.extractfile("PROVENANCE.txt")
+              if codex is None or provenance is None:
+                  raise SystemExit("archive member could not be read")
+              codex_bytes = codex.read()
+              bundled_provenance = provenance.read()
+          if sha256(codex_bytes) != sums["codex"]:
+              raise SystemExit("archive codex SHA-256 mismatch")
+          if bundled_provenance != standalone_provenance:
+              raise SystemExit("bundled and standalone provenance differ")
+          PY
+          after_assets="$(asset_fingerprint)"
+          test "${before_assets}" = "${after_assets}"
+      - name: Publish the re-verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "${EXPECTED_TAG}" \
+            --draft=false \
+            --prerelease \
+            --latest=false

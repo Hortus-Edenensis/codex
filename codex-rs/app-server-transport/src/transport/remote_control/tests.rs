@@ -8,6 +8,8 @@ use super::protocol::ClientId;
 use super::protocol::StreamId;
 use super::protocol::normalize_remote_control_url;
 use super::server_api::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
+use super::storage::PersistedRemoteControlEnrollment;
+use super::storage::RemoteControlStateStore;
 use super::websocket::REMOTE_CONTROL_PROTOCOL_VERSION;
 use super::websocket::RemoteControlWebsocket;
 use super::websocket::RemoteControlWebsocketConfig;
@@ -42,6 +44,7 @@ use codex_state::StateRuntime;
 use codex_utils_absolute_path::test_support::PathExt;
 use futures::SinkExt;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use gethostname::gethostname;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -136,6 +139,63 @@ async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime>
     .expect("state runtime should initialize")
 }
 
+fn remote_control_state_store(
+    state_runtime: Arc<StateRuntime>,
+) -> Arc<dyn RemoteControlStateStore> {
+    state_runtime
+}
+
+#[derive(Clone)]
+struct StaticRemoteControlStateStore {
+    enrollment: PersistedRemoteControlEnrollment,
+}
+
+impl RemoteControlStateStore for StaticRemoteControlStateStore {
+    fn get_remote_control_enrollment<'a>(
+        &'a self,
+        websocket_url: &'a str,
+        account_id: &'a str,
+        app_server_client_name: Option<&'a str>,
+    ) -> BoxFuture<'a, std::io::Result<Option<PersistedRemoteControlEnrollment>>> {
+        Box::pin(async move {
+            if self.enrollment.websocket_url == websocket_url
+                && self.enrollment.account_id == account_id
+                && self.enrollment.app_server_client_name.as_deref() == app_server_client_name
+            {
+                Ok(Some(self.enrollment.clone()))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn upsert_remote_control_enrollment<'a>(
+        &'a self,
+        _enrollment: &'a PersistedRemoteControlEnrollment,
+    ) -> BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(async { Err(std::io::Error::other("unexpected upsert")) })
+    }
+
+    fn set_remote_control_enabled<'a>(
+        &'a self,
+        _websocket_url: &'a str,
+        _account_id: &'a str,
+        _app_server_client_name: Option<&'a str>,
+        _remote_control_enabled: bool,
+    ) -> BoxFuture<'a, std::io::Result<u64>> {
+        Box::pin(async { Err(std::io::Error::other("unexpected set enabled")) })
+    }
+
+    fn delete_remote_control_enrollment<'a>(
+        &'a self,
+        _websocket_url: &'a str,
+        _account_id: &'a str,
+        _app_server_client_name: Option<&'a str>,
+    ) -> BoxFuture<'a, std::io::Result<u64>> {
+        Box::pin(async { Err(std::io::Error::other("unexpected delete")) })
+    }
+}
+
 #[tokio::test]
 async fn plain_start_resolves_persisted_remote_control_preference() {
     let cases = [
@@ -181,7 +241,7 @@ async fn plain_start_resolves_persisted_remote_control_preference() {
             remote_control_target: None,
             server_name: test_server_name(),
         },
-        Some(state_db),
+        Some(remote_control_state_store(state_db)),
         remote_control_auth_manager(),
         RemoteControlChannels {
             transport_event_tx,
@@ -208,6 +268,65 @@ async fn plain_start_resolves_persisted_remote_control_preference() {
         };
         assert_eq!(*desired_state_tx.borrow(), expected, "case {name}");
     }
+}
+
+#[tokio::test]
+async fn plain_start_resolves_persisted_remote_control_preference_from_state_store() {
+    let remote_control_target = normalize_remote_control_url(TEST_REMOTE_CONTROL_URL)
+        .expect("remote control target should normalize");
+    let state_store: Arc<dyn RemoteControlStateStore> = Arc::new(StaticRemoteControlStateStore {
+        enrollment: PersistedRemoteControlEnrollment {
+            websocket_url: remote_control_target.websocket_url.clone(),
+            account_id: "account_id".to_string(),
+            app_server_client_name: Some("postgres-client".to_string()),
+            server_id: "server-postgres".to_string(),
+            environment_id: "environment-postgres".to_string(),
+            server_name: "server-name-postgres".to_string(),
+            remote_control_enabled: Some(true),
+        },
+    });
+    let (transport_event_tx, _transport_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (status_tx, _status_rx) = watch::channel(RemoteControlStatusChangedNotification {
+        status: RemoteControlConnectionStatus::Disabled,
+        server_name: test_server_name(),
+        installation_id: TEST_INSTALLATION_ID.to_string(),
+        environment_id: None,
+    });
+    let (desired_state_tx, _desired_state_rx) = watch::channel(RemoteControlDesiredState::Unknown);
+    let desired_state_tx = Arc::new(desired_state_tx);
+    let mut websocket = RemoteControlWebsocket::new(
+        RemoteControlWebsocketConfig {
+            remote_control_url: TEST_REMOTE_CONTROL_URL.to_string(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            remote_control_target: None,
+            server_name: test_server_name(),
+        },
+        Some(state_store),
+        remote_control_auth_manager(),
+        RemoteControlChannels {
+            transport_event_tx,
+            status_publisher: RemoteControlStatusPublisher::new(status_tx),
+            current_enrollment: Arc::new(RemoteControlEnrollmentState::new(
+                /*enrollment*/ None,
+            )),
+            pairing_persistence_key: watch::channel(None).0,
+            desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
+        },
+        CancellationToken::new(),
+        desired_state_tx.clone(),
+    );
+
+    assert!(
+        websocket
+            .resolve_unknown_desired_state(Some("postgres-client"))
+            .await
+    );
+    assert_eq!(
+        *desired_state_tx.borrow(),
+        RemoteControlDesiredState::Enabled {
+            persistence_preference: Some(true),
+        }
+    );
 }
 
 #[tokio::test]
@@ -431,7 +550,9 @@ async fn ephemeral_enable_preserves_durable_preference() {
         TEST_REMOTE_CONTROL_URL,
         remote_control_auth_manager(),
     );
-    remote_handle.state_db = Some(remote_control_state_runtime(&codex_home).await);
+    remote_handle.state_db = Some(remote_control_state_store(
+        remote_control_state_runtime(&codex_home).await,
+    ));
     remote_handle
         .desired_state_tx
         .send_replace(RemoteControlDesiredState::Enabled {
@@ -1106,7 +1227,7 @@ async fn remote_control_start_reports_missing_state_db_as_disabled_when_enabled(
         RemoteControlStartupMode::EnabledEphemeral,
     )
     .await
-    .expect("remote control should start disabled without sqlite state db");
+    .expect("remote control should start disabled without state storage");
     let mut status_rx = remote_handle.status_receiver();
     assert_eq!(
         status_rx.borrow().clone(),
@@ -1120,7 +1241,7 @@ async fn remote_control_start_reports_missing_state_db_as_disabled_when_enabled(
 
     timeout(Duration::from_millis(100), listener.accept())
         .await
-        .expect_err("remote control should not connect without sqlite state db");
+        .expect_err("remote control should not connect without state storage");
 
     assert_eq!(
         remote_handle
@@ -1130,10 +1251,10 @@ async fn remote_control_start_reports_missing_state_db_as_disabled_when_enabled(
     );
     timeout(Duration::from_millis(100), listener.accept())
         .await
-        .expect_err("remote control should remain disabled without sqlite state db");
+        .expect_err("remote control should remain disabled without state storage");
     timeout(Duration::from_millis(20), status_rx.changed())
         .await
-        .expect_err("status should remain disabled without sqlite state db");
+        .expect_err("status should remain disabled without state storage");
 
     shutdown_token.cancel();
     timeout(Duration::from_secs(1), remote_task)

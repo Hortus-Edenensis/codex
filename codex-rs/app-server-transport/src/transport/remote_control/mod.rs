@@ -7,6 +7,7 @@ mod host_device;
 mod protocol;
 mod segment;
 mod server_api;
+mod storage;
 mod websocket;
 
 use self::auth::load_remote_control_auth;
@@ -27,6 +28,8 @@ use self::protocol::RemoteControlPairingStatusCode;
 use self::protocol::ServerEvent;
 use self::protocol::StreamId;
 use self::protocol::normalize_remote_control_url;
+pub use self::storage::PersistedRemoteControlEnrollment;
+pub use self::storage::RemoteControlStateStore;
 use super::CHANNEL_CAPACITY;
 use super::TransportEvent;
 use super::next_connection_id;
@@ -110,7 +113,7 @@ pub struct RemoteControlHandle {
     desired_state_rpc_lock: Arc<Semaphore>,
     desired_state_persistence_lock: Arc<Semaphore>,
     status_tx: Arc<watch::Sender<RemoteControlStatusChangedNotification>>,
-    state_db: Option<Arc<StateRuntime>>,
+    state_db: Option<Arc<dyn RemoteControlStateStore>>,
     remote_control_url: String,
     current_enrollment: CurrentRemoteControlEnrollment,
     pairing_persistence_key: RemoteControlPairingPersistenceKey,
@@ -199,7 +202,7 @@ impl fmt::Display for RemoteControlUnavailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "remote control cannot be enabled because sqlite state db is unavailable"
+            "remote control cannot be enabled because state storage is unavailable"
         )
     }
 }
@@ -260,7 +263,7 @@ impl RemoteControlHandle {
         self.ensure_remote_control_allowed()
             .map_err(RemoteControlEnableError::DisabledByRequirements)?;
         if self.state_db.is_none() {
-            warn!("remote control cannot be enabled because sqlite state db is unavailable");
+            warn!("remote control cannot be enabled because state storage is unavailable");
             return Err(RemoteControlEnableError::Unavailable(
                 RemoteControlUnavailable,
             ));
@@ -358,22 +361,21 @@ impl RemoteControlHandle {
         app_server_client_name: Option<&str>,
         remote_control_enabled: bool,
     ) -> io::Result<()> {
-        let state_db = self
+        let state_store = self
             .state_db
             .as_deref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, RemoteControlUnavailable))?;
         let auth = load_remote_control_auth(&self.auth_manager).await?;
         let remote_control_target = normalize_remote_control_url(&self.remote_control_url)?;
         let app_server_client_name = self.pairing_persistence_key(app_server_client_name)?;
-        state_db
+        state_store
             .set_remote_control_enabled(
                 &remote_control_target.websocket_url,
                 &auth.account_id,
                 app_server_client_name.as_deref(),
                 remote_control_enabled,
             )
-            .await
-            .map_err(io::Error::other)?;
+            .await?;
         Ok(())
     }
 
@@ -527,7 +529,7 @@ impl RemoteControlHandle {
             return Ok(enrollment);
         }
 
-        let state_db = self
+        let state_store = self
             .state_db
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
@@ -541,7 +543,7 @@ impl RemoteControlHandle {
             }
         };
         update_persisted_remote_control_enrollment(
-            Some(state_db),
+            Some(state_store),
             &enrollment.remote_control_target,
             &auth.account_id,
             app_server_client_name,
@@ -573,12 +575,12 @@ impl RemoteControlHandle {
                     return Ok((enrollment, false));
                 }
 
-                let state_db = self
+                let state_store = self
                     .state_db
                     .as_deref()
                     .ok_or_else(pairing_unavailable_error)?;
                 if let Some(mut enrollment) = load_persisted_remote_control_enrollment(
-                    Some(state_db),
+                    Some(state_store),
                     &remote_control_target,
                     &auth.account_id,
                     app_server_client_name,
@@ -939,11 +941,33 @@ pub async fn start_remote_control(
     app_server_client_name_rx: Option<oneshot::Receiver<String>>,
     startup_mode: RemoteControlStartupMode,
 ) -> io::Result<(JoinHandle<()>, RemoteControlHandle)> {
+    let state_store = state_db.map(|state_db| state_db as Arc<dyn RemoteControlStateStore>);
+    start_remote_control_with_state_store(
+        config,
+        state_store,
+        auth_manager,
+        transport_event_tx,
+        shutdown_token,
+        app_server_client_name_rx,
+        startup_mode,
+    )
+    .await
+}
+
+pub async fn start_remote_control_with_state_store(
+    config: RemoteControlStartConfig,
+    state_store: Option<Arc<dyn RemoteControlStateStore>>,
+    auth_manager: Arc<AuthManager>,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    shutdown_token: CancellationToken,
+    app_server_client_name_rx: Option<oneshot::Receiver<String>>,
+    startup_mode: RemoteControlStartupMode,
+) -> io::Result<(JoinHandle<()>, RemoteControlHandle)> {
     let policy = config.policy;
-    let state_db_available = state_db.is_some();
+    let state_store_available = state_store.is_some();
     let requested_initial_enabled = startup_mode == RemoteControlStartupMode::EnabledEphemeral;
     let desired_state =
-        if policy == RemoteControlPolicy::DisabledByRequirements || !state_db_available {
+        if policy == RemoteControlPolicy::DisabledByRequirements || !state_store_available {
             RemoteControlDesiredState::Disabled
         } else {
             match startup_mode {
@@ -955,8 +979,8 @@ pub async fn start_remote_control(
             }
         };
     let initial_enabled = desired_state.is_enabled();
-    if requested_initial_enabled && !state_db_available {
-        warn!("remote control disabled because sqlite state db is unavailable");
+    if requested_initial_enabled && !state_store_available {
+        warn!("remote control disabled because state storage is unavailable");
     }
     let remote_control_target = if initial_enabled {
         Some(normalize_remote_control_url(&config.remote_control_url)?)
@@ -976,7 +1000,7 @@ pub async fn start_remote_control(
     let (pairing_persistence_key, _pairing_persistence_key_rx) = watch::channel(None);
     let websocket_pairing_persistence_key = pairing_persistence_key.clone();
     let handle_auth_manager = auth_manager.clone();
-    let handle_state_db = state_db.clone();
+    let handle_state_store = state_store.clone();
     let server_name = gethostname().to_string_lossy().trim().to_string();
     let remote_control_url = config.remote_control_url;
     let installation_id = config.installation_id;
@@ -996,7 +1020,7 @@ pub async fn start_remote_control(
         remote_control_url = %remote_control_url,
         installation_id = %installation_id,
         server_name = %server_name,
-        state_db_available,
+        state_store_available,
         ?desired_state,
         "starting app-server remote control websocket task"
     );
@@ -1020,7 +1044,7 @@ pub async fn start_remote_control(
                 remote_control_target,
                 server_name,
             },
-            state_db,
+            state_store,
             auth_manager,
             RemoteControlChannels {
                 transport_event_tx,
@@ -1074,7 +1098,7 @@ pub async fn start_remote_control(
             desired_state_rpc_lock,
             desired_state_persistence_lock,
             status_tx: Arc::new(status_tx),
-            state_db: handle_state_db,
+            state_db: handle_state_store,
             remote_control_url: handle_remote_control_url,
             current_enrollment,
             pairing_persistence_key,

@@ -285,11 +285,13 @@ fn resolve_mcp_oauth_credentials_store_mode(
 #[cfg(test)]
 pub(crate) async fn test_config() -> Config {
     let codex_home = tempfile::tempdir().expect("create temp dir");
+    let base_config = ConfigToml {
+        model: Some("gpt-5.5".to_string()),
+        experimental_thread_store: Some(ThreadStoreToml::Local {}),
+        ..Default::default()
+    };
     Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            model: Some("gpt-5.5".to_string()),
-            ..Default::default()
-        },
+        base_config,
         ConfigOverrides::default(),
         AbsolutePathBuf::from_absolute_path(codex_home.path()).expect("temp dir should resolve"),
     )
@@ -594,7 +596,13 @@ fn build_network_proxy_spec(
 /// Configured thread persistence backend.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ThreadStoreConfig {
-    /// Persist threads locally using rollout JSONL files and sqlite metadata.
+    /// Persist threads in remote PostgreSQL when selected explicitly.
+    Postgres {
+        database_url_env: String,
+        default_workspace_id: String,
+        redis_url_env: Option<String>,
+    },
+    /// Persist threads locally using rollout JSONL files and SQLite metadata.
     #[default]
     Local,
     /// In-memory thread store for test and debug configurations.
@@ -2413,6 +2421,15 @@ fn resolve_tool_suggest_config_from_config(
 fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConfig {
     match thread_store {
         Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
+        Some(ThreadStoreToml::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        }) => ThreadStoreConfig::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        },
         Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
         None => ThreadStoreConfig::Local,
     }

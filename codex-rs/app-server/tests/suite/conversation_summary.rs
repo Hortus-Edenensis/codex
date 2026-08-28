@@ -141,6 +141,8 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
+                model: None,
+                reasoning_effort: None,
                 memory_mode: ThreadMemoryMode::Disabled,
             },
         })
@@ -192,6 +194,22 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
         })
         .await?
         .expect("getConversationSummary should succeed");
+    let GetConversationSummaryResponse { summary } = serde_json::from_value(result)?;
+
+    assert_eq!(summary.conversation_id, thread_id);
+    assert_eq!(summary.path, PathBuf::new());
+    assert_eq!(summary.cwd, PathBuf::new());
+    assert_eq!(summary.model_provider, "test");
+
+    let result = client
+        .request(ClientRequest::GetConversationSummary {
+            request_id: RequestId::Integer(2),
+            params: GetConversationSummaryParams::RolloutPath {
+                rollout_path: rollout_path(codex_home.path(), FILENAME_TS, &thread_id.to_string()),
+            },
+        })
+        .await?
+        .expect("getConversationSummary should fall back from rollout path to thread id");
     let GetConversationSummaryResponse { summary } = serde_json::from_value(result)?;
 
     assert_eq!(summary.conversation_id, thread_id);

@@ -1990,7 +1990,7 @@ fn thread_list_params(
         sort_key: Some(sort_key),
         sort_direction: None,
         model_providers: match provider_filter {
-            ProviderFilter::Any => None,
+            ProviderFilter::Any => Some(Vec::new()),
             ProviderFilter::MatchDefault(default_provider) => Some(vec![default_provider]),
         },
         source_kinds: Some(crate::resume_source_kinds(include_non_interactive)),
@@ -3968,7 +3968,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_thread_list_params_omit_provider_filter() {
+    fn remote_thread_list_params_request_all_providers() {
         let params = thread_list_params(
             Some(String::from("cursor-1")),
             Some(Path::new("repo/on/server")),
@@ -3980,7 +3980,7 @@ mod tests {
         );
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
-        assert_eq!(params.model_providers, None);
+        assert_eq!(params.model_providers, Some(Vec::new()));
         assert_eq!(
             params.source_kinds,
             Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
@@ -4004,7 +4004,7 @@ mod tests {
         );
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
-        assert_eq!(params.model_providers, None);
+        assert_eq!(params.model_providers, Some(Vec::new()));
         let source_kinds = crate::resume_source_kinds(/*include_non_interactive*/ true);
         assert_eq!(params.source_kinds, Some(source_kinds));
     }

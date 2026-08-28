@@ -20,7 +20,6 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::user_input::UserInput;
 use codex_rollout::RolloutItem;
-use codex_rollout::state_db::StateDbHandle;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -34,6 +33,8 @@ use tokio::sync::watch;
 use tracing::error;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
+pub(crate) type ThreadGoalStoreHandle = Arc<dyn codex_state::ThreadGoalStore>;
+pub(crate) type GeneratedMemoryStoreHandle = Arc<dyn codex_state::GeneratedMemoryStore>;
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
@@ -44,7 +45,7 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
     pub(crate) emit_thread_goal_update: bool,
-    pub(crate) thread_goal_state_db: Option<StateDbHandle>,
+    pub(crate) thread_goal_store: Option<ThreadGoalStoreHandle>,
     pub(crate) include_turns: bool,
     pub(crate) initial_turns_page:
         Option<codex_app_server_protocol::ThreadResumeInitialTurnsPageParams>,
@@ -52,6 +53,8 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) paginated_initial_turns_page: Option<codex_app_server_protocol::TurnsPage>,
     pub(crate) paginated_initial_turns_page_with_active_slot:
         Option<codex_app_server_protocol::TurnsPage>,
+    /// Durable newest paginated turn, independent of the client-requested page ordering.
+    pub(crate) latest_persisted_turn: Option<Turn>,
     pub(crate) resume_cursor_store: Option<Arc<dyn codex_thread_store::ThreadStore>>,
     pub(crate) redact_resume_payloads: bool,
 }
@@ -75,7 +78,7 @@ pub(crate) enum ThreadListenerCommand {
     EmitThreadGoalCleared,
     // EmitThreadGoalSnapshot is used to read and emit the latest goal state in the listener order.
     EmitThreadGoalSnapshot {
-        state_db: StateDbHandle,
+        goal_store: ThreadGoalStoreHandle,
     },
     // ResolveServerRequest is used to notify the client that the request has been resolved.
     // It is executed in the thread listener's context to ensure that the resolved notification is ordered with regard to the request itself.
@@ -329,6 +332,7 @@ struct ThreadStateManagerInner {
     live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
+    completed_resume_turns: HashMap<(ThreadId, ConnectionId), String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -449,6 +453,9 @@ impl ThreadStateManager {
                 .threads
                 .remove(&thread_id)
                 .map(|thread_entry| thread_entry.state);
+            state
+                .completed_resume_turns
+                .retain(|(fenced_thread_id, _), _| *fenced_thread_id != thread_id);
             state.thread_ids_by_connection.retain(|_, thread_ids| {
                 thread_ids.remove(&thread_id);
                 !thread_ids.is_empty()
@@ -523,6 +530,9 @@ impl ThreadStateManager {
                 thread_entry.connection_ids.remove(&connection_id);
                 thread_entry.update_has_connections();
             }
+            state
+                .completed_resume_turns
+                .remove(&(thread_id, connection_id));
         };
 
         true
@@ -588,30 +598,82 @@ impl ThreadStateManager {
         true
     }
 
-    pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
-        {
-            let mut state = self.state.lock().await;
-            state.live_connections.remove(&connection_id);
-            let thread_ids = state
+    pub(crate) async fn note_completed_resume_turn(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        turn_id: Option<String>,
+    ) {
+        let mut state = self.state.lock().await;
+        let key = (thread_id, connection_id);
+        let subscribed = state.live_connections.contains_key(&connection_id)
+            && state
                 .thread_ids_by_connection
-                .remove(&connection_id)
-                .unwrap_or_default();
-            for thread_id in &thread_ids {
-                if let Some(thread_entry) = state.threads.get_mut(thread_id) {
-                    thread_entry.connection_ids.remove(&connection_id);
-                    thread_entry.update_has_connections();
-                }
-            }
-            thread_ids
-                .into_iter()
-                .filter(|thread_id| {
-                    state
-                        .threads
-                        .get(thread_id)
-                        .is_some_and(|thread_entry| thread_entry.connection_ids.is_empty())
-                })
-                .collect::<Vec<_>>()
+                .get(&connection_id)
+                .is_some_and(|thread_ids| thread_ids.contains(&thread_id));
+        if !subscribed {
+            state.completed_resume_turns.remove(&key);
+            return;
         }
+        match turn_id {
+            Some(turn_id) => {
+                state.completed_resume_turns.insert(key, turn_id);
+            }
+            None => {
+                state.completed_resume_turns.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) async fn has_completed_resume_turn(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+    ) -> bool {
+        self.state
+            .lock()
+            .await
+            .completed_resume_turns
+            .contains_key(&(thread_id, connection_id))
+    }
+
+    pub(crate) async fn clear_completed_resume_turn(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+    ) {
+        self.state
+            .lock()
+            .await
+            .completed_resume_turns
+            .remove(&(thread_id, connection_id));
+    }
+
+    pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
+        let mut state = self.state.lock().await;
+        state.live_connections.remove(&connection_id);
+        state
+            .completed_resume_turns
+            .retain(|(_, fenced_connection_id), _| *fenced_connection_id != connection_id);
+        let thread_ids = state
+            .thread_ids_by_connection
+            .remove(&connection_id)
+            .unwrap_or_default();
+        for thread_id in &thread_ids {
+            if let Some(thread_entry) = state.threads.get_mut(thread_id) {
+                thread_entry.connection_ids.remove(&connection_id);
+                thread_entry.update_has_connections();
+            }
+        }
+        thread_ids
+            .into_iter()
+            .filter(|thread_id| {
+                state
+                    .threads
+                    .get(thread_id)
+                    .is_some_and(|thread_entry| thread_entry.connection_ids.is_empty())
+            })
+            .collect::<Vec<_>>()
     }
 
     pub(crate) async fn subscribe_to_has_connections(

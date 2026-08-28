@@ -33,8 +33,13 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_state::GeneratedMemoryStore;
+#[cfg(test)]
 use codex_state::StateRuntime;
 use codex_terminal_detection::user_agent;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::StoredThreadHistory;
+use codex_thread_store::ThreadStore;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,6 +75,8 @@ impl StageOneRequestContext {
 pub(crate) struct MemoryStartupContext {
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
+    generated_memory_store: Option<Arc<dyn GeneratedMemoryStore>>,
+    thread_store: Arc<dyn ThreadStore>,
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
     provider: SharedModelProvider,
@@ -171,10 +178,14 @@ impl MemoryStartupContext {
             model,
             originator().value,
         );
+        let generated_memory_store = thread.generated_memory_store();
+        let thread_store = thread.thread_store();
 
         Self {
             thread_id,
             thread,
+            generated_memory_store,
+            thread_store,
             thread_manager,
             auth_manager,
             provider,
@@ -186,8 +197,26 @@ impl MemoryStartupContext {
         self.thread_id
     }
 
+    #[cfg(test)]
     pub(crate) fn state_db(&self) -> Option<Arc<StateRuntime>> {
         self.thread.state_db()
+    }
+
+    pub(crate) fn generated_memory_store(&self) -> Option<Arc<dyn GeneratedMemoryStore>> {
+        self.generated_memory_store.clone()
+    }
+
+    pub(crate) async fn load_thread_history(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<StoredThreadHistory> {
+        self.thread_store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to load thread history for {thread_id}: {err}"))
     }
 
     pub(crate) fn provider(&self) -> &dyn ModelProvider {

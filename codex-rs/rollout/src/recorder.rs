@@ -1,5 +1,6 @@
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -657,9 +658,15 @@ impl RolloutRecorder {
                 )
                 .await
                 {
-                    return Ok(repaired_db_page.into());
+                    return Ok(backfill_thread_item_forked_from_id_from_filesystem_scan(
+                        repaired_db_page.into(),
+                        &fs_page,
+                    ));
                 }
-                return Ok(db_page.into());
+                return Ok(backfill_thread_item_forked_from_id_from_filesystem_scan(
+                    db_page.into(),
+                    &fs_page,
+                ));
             }
             if listing_has_metadata_filters {
                 for item in &db_page.items {
@@ -699,9 +706,15 @@ impl RolloutRecorder {
                     )
                     .await
                     {
-                        return Ok(repaired_db_page.into());
+                        return Ok(backfill_thread_item_forked_from_id_from_filesystem_scan(
+                            repaired_db_page.into(),
+                            &fs_page,
+                        ));
                     }
-                    return Ok(db_page.into());
+                    return Ok(backfill_thread_item_forked_from_id_from_filesystem_scan(
+                        db_page.into(),
+                        &fs_page,
+                    ));
                 }
                 codex_state::record_fallback(
                     "list_threads",
@@ -715,7 +728,10 @@ impl RolloutRecorder {
                 )
                 .await);
             }
-            return Ok(db_page.into());
+            return Ok(backfill_thread_item_forked_from_id_from_filesystem_scan(
+                db_page.into(),
+                &fs_page,
+            ));
         }
         if listing_has_metadata_filters {
             let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
@@ -1249,6 +1265,31 @@ fn page_from_filesystem_scan(
     }
 }
 
+fn backfill_thread_item_forked_from_id_from_filesystem_scan(
+    mut page: ThreadsPage,
+    fs_page: &ThreadsPage,
+) -> ThreadsPage {
+    let forked_from_by_thread_id = fs_page
+        .items
+        .iter()
+        .filter_map(|item| {
+            item.thread_id
+                .map(|thread_id| (thread_id, item.forked_from_id))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for item in &mut page.items {
+        let Some(thread_id) = item.thread_id else {
+            continue;
+        };
+        if item.forked_from_id.is_none() {
+            item.forked_from_id = forked_from_by_thread_id.get(&thread_id).copied().flatten();
+        }
+    }
+
+    page
+}
+
 async fn fill_missing_thread_item_metadata_from_state_db(
     state_db_ctx: Option<&StateRuntime>,
     mut page: ThreadsPage,
@@ -1286,6 +1327,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
         thread_id: _state_thread_id,
         first_user_message,
         preview,
+        forked_from_id,
         section,
         project_id,
         cwd,
@@ -1294,6 +1336,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
         git_origin_url,
         source,
         history_mode: _,
+        thread_source,
         parent_thread_id,
         agent_nickname,
         agent_role,
@@ -1309,6 +1352,9 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
     }
     if item.preview.is_none() {
         item.preview = preview;
+    }
+    if item.forked_from_id.is_none() {
+        item.forked_from_id = forked_from_id;
     }
     item.section = section;
     item.project_id = project_id;
@@ -1326,6 +1372,9 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
     }
     if item.source.is_none() {
         item.source = source;
+    }
+    if item.thread_source.is_none() {
+        item.thread_source = thread_source;
     }
     if item.parent_thread_id.is_none() {
         item.parent_thread_id = parent_thread_id;
@@ -2024,6 +2073,7 @@ fn thread_item_from_state_metadata(
         thread_id: Some(item.id),
         first_user_message: item.first_user_message,
         preview: item.preview,
+        forked_from_id: None,
         section: item.section,
         project_id: item.project_id,
         cwd: Some(item.cwd),
@@ -2036,6 +2086,7 @@ fn thread_item_from_state_metadata(
                 .unwrap_or(SessionSource::Unknown),
         ),
         history_mode: item.history_mode,
+        thread_source: item.thread_source,
         parent_thread_id,
         agent_nickname: item.agent_nickname,
         agent_role: item.agent_role,

@@ -758,6 +758,8 @@ SELECT
                 metadata: ThreadPersistenceMetadata {
                     cwd: Some(home.path().to_path_buf()),
                     model_provider: "test-provider".to_string(),
+                    model: None,
+                    reasoning_effort: None,
                     memory_mode: ThreadMemoryMode::Enabled,
                 },
             })
