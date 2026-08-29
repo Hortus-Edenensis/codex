@@ -233,8 +233,18 @@ jobs:
           test -f "release-bundle/${ARCHIVE_NAME}"
           test -f release-bundle/SHA256SUMS.txt
           test -f release-bundle/PROVENANCE.txt
-          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${EXPECTED_TAG}" 2>/dev/null)"; then
-            test "$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["draft"]).lower())' <<<"${release_json}")" = true
+          if release_json="$(gh release view "${EXPECTED_TAG}" --json isDraft,tagName 2>/dev/null)"; then
+            python3 -c '
+          import json
+          import os
+          import sys
+
+          release = json.load(sys.stdin)
+          if release.get("isDraft") is not True:
+              raise SystemExit("Release is no longer a draft")
+          if release.get("tagName") != os.environ["EXPECTED_TAG"]:
+              raise SystemExit("draft Release tag mismatch")
+          ' <<<"${release_json}"
           else
             gh release create "${EXPECTED_TAG}" \
               --draft \
@@ -248,13 +258,17 @@ jobs:
             "release-bundle/${ARCHIVE_NAME}" \
             release-bundle/SHA256SUMS.txt \
             release-bundle/PROVENANCE.txt
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${EXPECTED_TAG}" \
+          gh release view "${EXPECTED_TAG}" --json assets,isDraft,tagName \
             | python3 -c '
           import json
           import os
           import sys
 
           release = json.load(sys.stdin)
+          if release.get("isDraft") is not True:
+              raise SystemExit("Release is no longer a draft")
+          if release.get("tagName") != os.environ["EXPECTED_TAG"]:
+              raise SystemExit("draft Release tag mismatch")
           expected = {os.environ["ARCHIVE_NAME"], "SHA256SUMS.txt", "PROVENANCE.txt"}
           names = [asset.get("name") for asset in release.get("assets", [])]
           if len(names) != len(expected) or set(names) != expected:
