@@ -30,6 +30,7 @@ MIGRATION_PATHS = [
     "codex-rs/postgres-thread-store/migrations/0005_threads_memory_mode.sql",
     "codex-rs/postgres-thread-store/migrations/0006_normalize_thread_history_mode.sql",
     "codex-rs/postgres-thread-store/migrations/0007_generated_memory_pipeline.sql",
+    "codex-rs/postgres-thread-store/migrations/0008_thread_goal_continuation_deferrals.sql",
 ]
 
 
@@ -354,7 +355,9 @@ def expected_sqlx_migrations(
 ) -> list[tuple[int, str]]:
     lines = manifest_path.read_text(encoding="utf-8").splitlines()
     if len(lines) != len(MIGRATION_PATHS):
-        raise DeployError("remote SQL migration manifest must contain exactly seven entries")
+        raise DeployError(
+            f"remote SQL migration manifest must contain exactly {len(MIGRATION_PATHS)} entries"
+        )
     checksums: list[tuple[int, str]] = []
     for version, (line, expected_path) in enumerate(zip(lines, MIGRATION_PATHS), 1):
         parts = line.split(maxsplit=1)

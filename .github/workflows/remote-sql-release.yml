@@ -5,7 +5,7 @@ on:
     branches:
       - "**"
     tags:
-      - v0.151.0-remote-sql-copy.3
+      - v0.151.0-remote-sql-copy.4
   pull_request:
     paths:
       - .github/remote-sql-migrations.sha256
@@ -21,8 +21,8 @@ concurrency:
 permissions: {}
 
 env:
-  EXPECTED_TAG: v0.151.0-remote-sql-copy.3
-  VERSION_BASE: 0.151.0-remote-sql-copy.3
+  EXPECTED_TAG: v0.151.0-remote-sql-copy.4
+  VERSION_BASE: 0.151.0-remote-sql-copy.4
   LINEAGE_MERGE: 150745544e6841702655579c78e21803f9b2927b
   UPSTREAM_PARENT: 4ee04c0aa5833ac39b1763f6ea44c7bc777c83dd
   REMOTE_SQL_PARENT: 03efbd5ef6b960ae622b1f3fcc4a8e7f178407b2
@@ -52,7 +52,7 @@ jobs:
 
   build-release:
     name: Build immutable Linux release
-    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.3'
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.4'
     needs: migration-integrity
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -211,7 +211,7 @@ jobs:
 
   draft-release:
     name: Create authenticated draft Release
-    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.3'
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.4'
     needs: build-release
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -230,6 +230,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          wait_for_release_view() {
+            local release_json=""
+            for _ in $(seq 1 10); do
+              if release_json="$(gh release view "${EXPECTED_TAG}" --json assets,isDraft,tagName 2>/dev/null)"; then
+                printf '%s\n' "${release_json}"
+                return 0
+              fi
+              sleep 2
+            done
+            gh release view "${EXPECTED_TAG}" --json assets,isDraft,tagName
+          }
           test -f "release-bundle/${ARCHIVE_NAME}"
           test -f release-bundle/SHA256SUMS.txt
           test -f release-bundle/PROVENANCE.txt
@@ -253,13 +264,25 @@ jobs:
               --verify-tag \
               --title "${EXPECTED_TAG}" \
               --notes "PostgreSQL copy-workspace release. Publication is gated on external SSH deployment and verification."
+            release_json="$(wait_for_release_view)"
+            python3 -c '
+          import json
+          import os
+          import sys
+
+          release = json.load(sys.stdin)
+          if release.get("isDraft") is not True:
+              raise SystemExit("Release is no longer a draft")
+          if release.get("tagName") != os.environ["EXPECTED_TAG"]:
+              raise SystemExit("draft Release tag mismatch")
+          ' <<<"${release_json}"
           fi
           gh release upload "${EXPECTED_TAG}" --clobber \
             "release-bundle/${ARCHIVE_NAME}" \
             release-bundle/SHA256SUMS.txt \
             release-bundle/PROVENANCE.txt
-          gh release view "${EXPECTED_TAG}" --json assets,isDraft,tagName \
-            | python3 -c '
+          release_json="$(wait_for_release_view)"
+          python3 -c '
           import json
           import os
           import sys
