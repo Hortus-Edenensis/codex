@@ -22,7 +22,7 @@ jobs:
   deploy-copy-workspace:
     name: Recover deployment from the verified draft asset
     runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
-    timeout-minutes: 55
+    timeout-minutes: 120
     permissions:
       contents: write
     outputs:
@@ -34,6 +34,8 @@ jobs:
       COPY_RELEASE_ROOT: ${{ vars.COPY_WORKSPACE_RELEASE_ROOT || '/workspace/shared-state/.git/codex-persist/codex-standalone/releases' }}
       COPY_BACKUP_ROOT: ${{ vars.COPY_WORKSPACE_BACKUP_ROOT || '/workspace/shared-state/.git/codex-persist/private-backups/codex-workspace-copy' }}
       COPY_RESUME_THREAD_ID: ${{ vars.COPY_WORKSPACE_RESUME_THREAD_ID || '019f1846-9419-7853-b035-f2ba0fad3d72' }}
+      COPY_POSTGRES_POD: ${{ vars.COPY_WORKSPACE_POSTGRES_POD || 'codex-postgres-0' }}
+      COPY_POSTGRES_CONTAINER: ${{ vars.COPY_WORKSPACE_POSTGRES_CONTAINER || 'postgres' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -141,6 +143,8 @@ jobs:
             --namespace "${COPY_NAMESPACE}" \
             --pod "${{ steps.current.outputs.pod }}" \
             --container "${COPY_CONTAINER}" \
+            --postgres-pod "${COPY_POSTGRES_POD}" \
+            --postgres-container "${COPY_POSTGRES_CONTAINER}" \
             --idle-timeout-seconds 900
       - name: Resolve and record an existing nonempty historical thread
         id: known
@@ -173,12 +177,15 @@ jobs:
             --repository "${GITHUB_REPOSITORY}" \
             --release-id "${{ steps.draft.outputs.release_id }}" \
             --release-tag "${EXPECTED_TAG}" \
+            --postgres-pod "${COPY_POSTGRES_POD}" \
+            --postgres-container "${COPY_POSTGRES_CONTAINER}" \
             --runtime-version "${RUNTIME_VERSION}" \
             --source-sha "${SOURCE_SHA}" \
             --release-selector "${RUNTIME_VERSION}" \
             --archive-name "${ARCHIVE_NAME}" \
             --run-id "${GITHUB_RUN_ID}" \
             --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --pg-backup-timeout 3600 \
             --repository-root "${GITHUB_WORKSPACE}" \
             --migration-manifest "${GITHUB_WORKSPACE}/.github/remote-sql-migrations.sha256"
       - name: Recheck the idle gate immediately before selector CAS
@@ -187,6 +194,8 @@ jobs:
             --namespace "${COPY_NAMESPACE}" \
             --pod "${{ steps.current.outputs.pod }}" \
             --container "${COPY_CONTAINER}" \
+            --postgres-pod "${COPY_POSTGRES_POD}" \
+            --postgres-container "${COPY_POSTGRES_CONTAINER}" \
             --idle-timeout-seconds 900
       - name: Dry-run and apply the command plus annotation CAS
         id: activate

@@ -484,6 +484,48 @@ def copy_to_pod(args: argparse.Namespace, pod: str, source: Path, destination: s
     )
 
 
+def copy_from_pod(
+    args: argparse.Namespace,
+    pod: str,
+    container: str,
+    source: str,
+    destination: Path,
+) -> None:
+    kubectl(
+        args,
+        "cp",
+        f"{pod}:{source}",
+        str(destination),
+        "-c",
+        container,
+        timeout=args.pg_backup_timeout,
+    )
+
+
+def postgres_exec(
+    args: argparse.Namespace,
+    script: str,
+    script_args: list[str],
+    *,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    return kubectl(
+        args,
+        "exec",
+        "-i",
+        args.postgres_pod,
+        "-c",
+        args.postgres_container,
+        "--",
+        "sh",
+        "-s",
+        "--",
+        *script_args,
+        input_text=script,
+        timeout=timeout,
+    )
+
+
 def parse_safe_output(text: str, required: set[str]) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in text.splitlines():
@@ -614,6 +656,9 @@ def backup_postgres(
         deployment_path = directory / "deployment.json"
         metadata_path = directory / "backup-metadata.json"
         expected_migrations_path = directory / "expected-sqlx-migrations.txt"
+        dump_path = directory / "postgres.dump"
+        restore_list_path = directory / "pg_restore.list"
+        live_migrations_path = directory / "live-sqlx-migrations.txt"
         deployment_path.write_text(
             json.dumps(deployment, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -625,31 +670,141 @@ def backup_postgres(
             "".join(f"{version}:{checksum}\n" for version, checksum in sqlx_checksums),
             encoding="utf-8",
         )
+        postgres_base = f"/tmp/codex-pg-backup-{os.getpid()}-{int(time.time())}"
+        postgres_dump = f"{postgres_base}.dump"
+        postgres_list = f"{postgres_base}.list"
+        postgres_migrations = f"{postgres_base}.migrations"
+        create_script = r'''set -eu
+umask 077
+dump="$1"
+restore_list="$2"
+live_migrations="$3"
+cleanup() {
+  rm -f "${dump}" "${restore_list}" "${live_migrations}"
+}
+trap cleanup EXIT HUP INT TERM
+command -v pg_dump >/dev/null 2>&1
+command -v pg_restore >/dev/null 2>&1
+command -v psql >/dev/null 2>&1
+[ -n "${POSTGRES_USER:-}" ]
+[ -n "${POSTGRES_PASSWORD:-}" ]
+[ -n "${POSTGRES_DB:-}" ]
+PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
+  -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+  --format=custom --compress=6 --no-owner --no-privileges \
+  --file="${dump}" >/dev/null
+pg_restore --list "${dump}" > "${restore_list}"
+PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+  -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+  -XAtq -v ON_ERROR_STOP=1 \
+  -c "SELECT version::text || ':' || encode(checksum, 'hex') FROM _sqlx_migrations WHERE version BETWEEN 1 AND 7 AND success ORDER BY version" \
+  > "${live_migrations}"
+[ -s "${dump}" ]
+[ -s "${restore_list}" ]
+[ -s "${live_migrations}" ]
+trap - EXIT HUP INT TERM
+printf 'POSTGRES_BACKUP_READY=1\n'
+'''
+        cleanup_script = r'''set -eu
+rm -f "$1" "$2" "$3"
+'''
+        postgres_exec(
+            args,
+            create_script,
+            [postgres_dump, postgres_list, postgres_migrations],
+            timeout=args.pg_backup_timeout,
+        )
+        try:
+            copy_from_pod(
+                args,
+                args.postgres_pod,
+                args.postgres_container,
+                postgres_dump,
+                dump_path,
+            )
+            copy_from_pod(
+                args,
+                args.postgres_pod,
+                args.postgres_container,
+                postgres_list,
+                restore_list_path,
+            )
+            copy_from_pod(
+                args,
+                args.postgres_pod,
+                args.postgres_container,
+                postgres_migrations,
+                live_migrations_path,
+            )
+        finally:
+            postgres_exec(
+                args,
+                cleanup_script,
+                [postgres_dump, postgres_list, postgres_migrations],
+                timeout=120,
+            )
+        if live_migrations_path.read_bytes() != expected_migrations_path.read_bytes():
+            raise DeployError("live SQLx migrations did not match the release sources")
+        if dump_path.stat().st_size <= 0 or restore_list_path.stat().st_size <= 0:
+            raise DeployError("PostgreSQL backup output was empty")
         remote_base = f"/tmp/codex-backup-{os.getpid()}-{int(time.time())}"
-        remote_deployment = f"{remote_base}.deployment"
-        remote_metadata = f"{remote_base}.metadata"
-        remote_migrations = f"{remote_base}.migrations"
-        copy_to_pod(args, pod, deployment_path, remote_deployment)
-        copy_to_pod(args, pod, metadata_path, remote_metadata)
-        copy_to_pod(args, pod, expected_migrations_path, remote_migrations)
+        remote_paths = {
+            "deployment.json": f"{remote_base}.deployment",
+            "backup-metadata.json": f"{remote_base}.metadata",
+            "expected-sqlx-migrations.txt": f"{remote_base}.expected-migrations",
+            "live-sqlx-migrations.txt": f"{remote_base}.live-migrations",
+            "pg_restore.list": f"{remote_base}.restore-list",
+            "postgres.dump": f"{remote_base}.dump",
+        }
+        local_paths = {
+            "deployment.json": deployment_path,
+            "backup-metadata.json": metadata_path,
+            "expected-sqlx-migrations.txt": expected_migrations_path,
+            "live-sqlx-migrations.txt": live_migrations_path,
+            "pg_restore.list": restore_list_path,
+            "postgres.dump": dump_path,
+        }
+        try:
+            for name, source in local_paths.items():
+                copy_to_pod(args, pod, source, remote_paths[name])
+        except Exception:
+            kubectl(
+                args,
+                "exec",
+                pod,
+                "-c",
+                args.container,
+                "--",
+                "rm",
+                "-f",
+                *remote_paths.values(),
+                timeout=120,
+                check=False,
+            )
+            raise
     script = r'''set -eu
 umask 077
 backup_root="$1"
 backup_name="$2"
 source_deployment="$3"
 source_metadata="$4"
-source_migrations="$5"
+source_expected_migrations="$5"
+source_live_migrations="$6"
+source_restore_list="$7"
+source_dump="$8"
 destination="${backup_root}/${backup_name}"
 stage="${backup_root}/.staging-${backup_name}-$$"
 cleanup() {
   rm -rf "${stage}"
-  rm -f "${source_deployment}" "${source_metadata}" "${source_migrations}"
+  rm -f \
+    "${source_deployment}" \
+    "${source_metadata}" \
+    "${source_expected_migrations}" \
+    "${source_live_migrations}" \
+    "${source_restore_list}" \
+    "${source_dump}"
 }
 trap cleanup EXIT HUP INT TERM
-command -v pg_dump >/dev/null 2>&1
-command -v pg_restore >/dev/null 2>&1
-command -v psql >/dev/null 2>&1
-[ -n "${CODEX_REMOTE_SQL_URL:-}" ]
 [ ! -e "${destination}" ]
 mkdir -p "${backup_root}"
 chmod 0700 "${backup_root}"
@@ -657,14 +812,10 @@ mkdir -p "${stage}"
 chmod 0700 "${stage}"
 install -m 0600 "${source_deployment}" "${stage}/deployment.json"
 install -m 0600 "${source_metadata}" "${stage}/backup-metadata.json"
-install -m 0600 "${source_migrations}" "${stage}/expected-sqlx-migrations.txt"
-PGDATABASE="${CODEX_REMOTE_SQL_URL}" pg_dump \
-  --format=custom --no-owner --no-privileges \
-  --file="${stage}/postgres.dump" >/dev/null
-pg_restore --list "${stage}/postgres.dump" > "${stage}/pg_restore.list"
-PGDATABASE="${CODEX_REMOTE_SQL_URL}" psql -XAtq -v ON_ERROR_STOP=1 \
-  -c "SELECT version::text || ':' || encode(checksum, 'hex') FROM _sqlx_migrations WHERE version BETWEEN 1 AND 7 AND success ORDER BY version" \
-  > "${stage}/live-sqlx-migrations.txt"
+install -m 0600 "${source_expected_migrations}" "${stage}/expected-sqlx-migrations.txt"
+install -m 0600 "${source_live_migrations}" "${stage}/live-sqlx-migrations.txt"
+install -m 0600 "${source_restore_list}" "${stage}/pg_restore.list"
+install -m 0600 "${source_dump}" "${stage}/postgres.dump"
 cmp -s "${stage}/expected-sqlx-migrations.txt" "${stage}/live-sqlx-migrations.txt"
 [ -s "${stage}/postgres.dump" ]
 [ -s "${stage}/pg_restore.list" ]
@@ -686,25 +837,50 @@ mv "${stage}" "${destination}"
 chmod 0700 "${destination}"
 find "${destination}" -type f -exec chmod 0600 {} +
 trap - EXIT HUP INT TERM
-rm -f "${source_deployment}" "${source_metadata}" "${source_migrations}"
+rm -f \
+  "${source_deployment}" \
+  "${source_metadata}" \
+  "${source_expected_migrations}" \
+  "${source_live_migrations}" \
+  "${source_restore_list}" \
+  "${source_dump}"
 printf 'BACKUP_DIR=%s\n' "${destination}"
 printf 'BACKUP_SHA256=%s\n' "${dump_sha}"
 printf 'BACKUP_BYTES=%s\n' "${dump_bytes}"
 printf 'RESTORE_LIST_ENTRIES=%s\n' "${list_entries}"
 '''
-    result = remote_exec(
-        args,
-        pod,
-        script,
-        [
-            args.pg_backup_root,
-            backup_name,
-            remote_deployment,
-            remote_metadata,
-            remote_migrations,
-        ],
-        timeout=args.pg_backup_timeout,
-    )
+    try:
+        result = remote_exec(
+            args,
+            pod,
+            script,
+            [
+                args.pg_backup_root,
+                backup_name,
+                remote_paths["deployment.json"],
+                remote_paths["backup-metadata.json"],
+                remote_paths["expected-sqlx-migrations.txt"],
+                remote_paths["live-sqlx-migrations.txt"],
+                remote_paths["pg_restore.list"],
+                remote_paths["postgres.dump"],
+            ],
+            timeout=args.pg_backup_timeout,
+        )
+    except Exception:
+        kubectl(
+            args,
+            "exec",
+            pod,
+            "-c",
+            args.container,
+            "--",
+            "rm",
+            "-f",
+            *remote_paths.values(),
+            timeout=120,
+            check=False,
+        )
+        raise
     values = parse_safe_output(
         result.stdout,
         {"BACKUP_DIR", "BACKUP_SHA256", "BACKUP_BYTES", "RESTORE_LIST_ENTRIES"},
@@ -944,6 +1120,8 @@ def prepare(args: argparse.Namespace) -> None:
         "deploymentResourceVersion": resource_version,
         "deploymentRevision": deployment_revision,
         "container": args.container,
+        "postgresPod": args.postgres_pod,
+        "postgresContainer": args.postgres_container,
         "commandIndex": args.command_index,
         "releaseVariable": args.release_variable,
         "releaseAnnotation": args.release_annotation,
@@ -1371,6 +1549,8 @@ def parse_args() -> argparse.Namespace:
     prepare_parser.add_argument("--repository", required=True)
     prepare_parser.add_argument("--release-tag", required=True)
     prepare_parser.add_argument("--release-id", type=positive_int_arg, required=True)
+    prepare_parser.add_argument("--postgres-pod", required=True)
+    prepare_parser.add_argument("--postgres-container", default="postgres")
     prepare_parser.add_argument("--runtime-version", required=True)
     prepare_parser.add_argument("--source-sha", required=True)
     prepare_parser.add_argument("--release-selector", required=True)

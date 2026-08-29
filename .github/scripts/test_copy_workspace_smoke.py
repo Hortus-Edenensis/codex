@@ -125,6 +125,27 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
         self.assertTrue(statuses.call_args_list[0].kwargs["use_state_db_only"])
         self.assertFalse(statuses.call_args_list[1].kwargs["use_state_db_only"])
 
+    def test_process_gate_supports_direct_server_and_postgres_pod(self) -> None:
+        args = SimpleNamespace(
+            namespace="namespace",
+            pod="workspace-pod",
+            container="workspace",
+            postgres_pod="postgres-pod",
+            postgres_container="postgres",
+        )
+        process = mock.Mock(stdout="DAEMON_DESCENDANTS=0\n")
+        jobs = mock.Mock(
+            stdout="RUNNING_AGENT_JOBS=0\nRUNNING_AGENT_JOB_ITEMS=0\n"
+        )
+        with mock.patch.object(
+            smoke, "kubectl_shell", return_value=process
+        ) as workspace_shell, mock.patch.object(
+            smoke, "postgres_shell", return_value=jobs
+        ) as database_shell:
+            self.assertEqual(smoke.process_and_job_gate(args), (0, 0, 0))
+        self.assertIn("app-server --listen unix", workspace_shell.call_args.args[1])
+        self.assertIn("POSTGRES_PASSWORD", database_shell.call_args.args[1])
+
     def test_turns_page_fails_closed_on_empty_history(self) -> None:
         with self.assertRaisesRegex(smoke.SmokeError, "no persisted turns"):
             smoke.turns_page(FakeClient([{"data": [], "nextCursor": None}]), "known")

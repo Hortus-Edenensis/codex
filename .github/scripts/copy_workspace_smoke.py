@@ -378,6 +378,30 @@ def kubectl_shell(
     )
 
 
+def postgres_shell(
+    args: argparse.Namespace, script: str, script_args: list[str]
+) -> subprocess.CompletedProcess[str]:
+    return run(
+        [
+            "kubectl",
+            "-n",
+            args.namespace,
+            "exec",
+            "-i",
+            args.postgres_pod,
+            "-c",
+            args.postgres_container,
+            "--",
+            "sh",
+            "-s",
+            "--",
+            *script_args,
+        ],
+        input_text=script,
+        timeout=120,
+    )
+
+
 def parse_safe_output(text: str, keys: set[str]) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in text.splitlines():
@@ -461,8 +485,18 @@ def statuses_are_idle(status_counts: dict[str, int]) -> bool:
 def process_and_job_gate(args: argparse.Namespace) -> tuple[int, int, int]:
     script = r'''set -eu
 pid_file=/home/codex/.codex/app-server-daemon/app-server.pid
-[ -r "${pid_file}" ]
-daemon_pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${pid_file}")"
+daemon_pid=""
+if [ -r "${pid_file}" ]; then
+  daemon_pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${pid_file}")"
+fi
+case "${daemon_pid}" in
+  ''|*[!0-9]*)
+    daemon_pid="$(ps -eo pid=,args= | awk '
+      /codex .*app-server --listen unix:\/\// { count++; pid=$1 }
+      END { if (count == 1) print pid }
+    ')"
+    ;;
+esac
 case "${daemon_pid}" in ''|*[!0-9]*) exit 1 ;; esac
 kill -0 "${daemon_pid}"
 descendants="$(ps -eo pid=,ppid= | awk -v root="${daemon_pid}" '
@@ -480,32 +514,35 @@ descendants="$(ps -eo pid=,ppid= | awk -v root="${daemon_pid}" '
     }
     print count
   }')"
+printf 'DAEMON_DESCENDANTS=%s\n' "${descendants}"
+'''
+    process_result = kubectl_shell(args, script, [])
+    process_values = parse_safe_output(process_result.stdout, {"DAEMON_DESCENDANTS"})
+    postgres_script = r'''set -eu
 command -v psql >/dev/null 2>&1
-[ -n "${CODEX_REMOTE_SQL_URL:-}" ]
-counts="$(PGDATABASE="${CODEX_REMOTE_SQL_URL}" psql -XAtq \
-  -v ON_ERROR_STOP=1 \
+[ -n "${POSTGRES_USER:-}" ]
+[ -n "${POSTGRES_PASSWORD:-}" ]
+[ -n "${POSTGRES_DB:-}" ]
+counts="$(PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+  -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+  -XAtq -v ON_ERROR_STOP=1 \
   -c "SELECT (SELECT count(*) FROM agent_jobs WHERE status = 'running'), (SELECT count(*) FROM agent_job_items WHERE status = 'running')")"
 jobs="${counts%%|*}"
 items="${counts#*|}"
-case "${descendants}:${jobs}:${items}" in *[!0-9:]*) exit 1 ;; esac
-printf 'DAEMON_DESCENDANTS=%s\n' "${descendants}"
+case "${jobs}:${items}" in *[!0-9:]*) exit 1 ;; esac
 printf 'RUNNING_AGENT_JOBS=%s\n' "${jobs}"
 printf 'RUNNING_AGENT_JOB_ITEMS=%s\n' "${items}"
 '''
-    result = kubectl_shell(args, script, [])
-    values = parse_safe_output(
-        result.stdout,
-        {"DAEMON_DESCENDANTS", "RUNNING_AGENT_JOBS", "RUNNING_AGENT_JOB_ITEMS"},
+    postgres_result = postgres_shell(args, postgres_script, [])
+    postgres_values = parse_safe_output(
+        postgres_result.stdout,
+        {"RUNNING_AGENT_JOBS", "RUNNING_AGENT_JOB_ITEMS"},
     )
-    counts = tuple(
-        int(values[key])
-        for key in (
-            "DAEMON_DESCENDANTS",
-            "RUNNING_AGENT_JOBS",
-            "RUNNING_AGENT_JOB_ITEMS",
-        )
+    return (
+        int(process_values["DAEMON_DESCENDANTS"]),
+        int(postgres_values["RUNNING_AGENT_JOBS"]),
+        int(postgres_values["RUNNING_AGENT_JOB_ITEMS"]),
     )
-    return counts
 
 
 def persisted_memory_mode(args: argparse.Namespace, thread_id: str) -> str:
@@ -1053,6 +1090,8 @@ def parse_args() -> argparse.Namespace:
 
     idle = subparsers.add_parser("wait-idle")
     add_kube_arguments(idle)
+    idle.add_argument("--postgres-pod", required=True)
+    idle.add_argument("--postgres-container", default="postgres")
     idle.add_argument("--idle-timeout-seconds", type=float, default=900.0)
     idle.add_argument("--idle-poll-seconds", type=float, default=10.0)
 

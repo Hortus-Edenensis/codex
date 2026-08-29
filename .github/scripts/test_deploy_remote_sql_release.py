@@ -335,6 +335,59 @@ class ReleaseScriptTests(unittest.TestCase):
                     deploy.release_assets(args, Path(raw))
         download.assert_not_called()
 
+    def test_backup_uses_postgres_pod_and_stages_verified_files(self) -> None:
+        args = argparse.Namespace(
+            namespace="codex-internal",
+            container="workspace",
+            release_selector="0.151.0-remote-sql-copy.1+150745544e68",
+            run_id="123",
+            run_attempt="1",
+            postgres_pod="codex-postgres-0",
+            postgres_container="postgres",
+            pg_backup_root="/backups",
+            pg_backup_timeout=60,
+        )
+        checksum = "a" * 96
+
+        def materialize(
+            _args: argparse.Namespace,
+            _pod: str,
+            _container: str,
+            source: str,
+            destination: Path,
+        ) -> None:
+            if source.endswith(".dump"):
+                destination.write_bytes(b"custom-dump")
+            elif source.endswith(".list"):
+                destination.write_text("restore-entry\n", encoding="utf-8")
+            else:
+                destination.write_text(f"1:{checksum}\n", encoding="utf-8")
+
+        safe = mock.Mock(
+            stdout=(
+                "BACKUP_DIR=/backups/release\n"
+                + "BACKUP_SHA256="
+                + "b" * 64
+                + "\nBACKUP_BYTES=11\nRESTORE_LIST_ENTRIES=1\n"
+            )
+        )
+        with mock.patch.object(deploy, "postgres_exec") as postgres_exec, mock.patch.object(
+            deploy, "copy_from_pod", side_effect=materialize
+        ) as copy_from, mock.patch.object(deploy, "copy_to_pod") as copy_to, mock.patch.object(
+            deploy, "remote_exec", return_value=safe
+        ):
+            result = deploy.backup_postgres(
+                args,
+                "workspace-pod",
+                {"metadata": {}},
+                {"backupFormatVersion": 1},
+                [(1, checksum)],
+            )
+        self.assertEqual(result["BACKUP_BYTES"], "11")
+        self.assertEqual(postgres_exec.call_count, 2)
+        self.assertEqual(copy_from.call_count, 3)
+        self.assertEqual(copy_to.call_count, 6)
+
     def test_parse_args_accepts_positive_release_id_for_prepare(self) -> None:
         argv = [
             "deploy_remote_sql_release.py",
@@ -359,6 +412,8 @@ class ReleaseScriptTests(unittest.TestCase):
             "v0.151.0-remote-sql-copy.1",
             "--release-id",
             "42",
+            "--postgres-pod",
+            "codex-postgres-0",
             "--runtime-version",
             "0.151.0-remote-sql-copy.1+150745544e68",
             "--source-sha",
@@ -398,6 +453,8 @@ class ReleaseScriptTests(unittest.TestCase):
             "owner/repository",
             "--release-tag",
             "v0.151.0-remote-sql-copy.1",
+            "--postgres-pod",
+            "codex-postgres-0",
             "--runtime-version",
             "0.151.0-remote-sql-copy.1+150745544e68",
             "--source-sha",
