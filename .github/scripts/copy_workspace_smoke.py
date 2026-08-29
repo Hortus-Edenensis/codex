@@ -549,15 +549,18 @@ def persisted_memory_mode(args: argparse.Namespace, thread_id: str) -> str:
     script = r'''set -eu
 thread_id="$1"
 case "${thread_id}" in ''|*[!0-9a-f-]*) exit 1 ;; esac
-command -v psql >/dev/null 2>&1
-[ -n "${CODEX_REMOTE_SQL_URL:-}" ]
-mode="$(PGDATABASE="${CODEX_REMOTE_SQL_URL}" psql -XAtq \
+[ -n "${POSTGRES_USER:-}" ]
+[ -n "${POSTGRES_PASSWORD:-}" ]
+[ -n "${POSTGRES_DB:-}" ]
+mode="$(PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+  -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+  -XAtq \
   -v ON_ERROR_STOP=1 -v thread_id="${thread_id}" \
   -c "SELECT memory_mode FROM threads WHERE id = :'thread_id'")"
 case "${mode}" in enabled|disabled) ;; *) exit 1 ;; esac
 printf 'MEMORY_MODE=%s\n' "${mode}"
 '''
-    result = kubectl_shell(args, script, [thread_id])
+    result = postgres_shell(args, script, [thread_id])
     return parse_safe_output(result.stdout, {"MEMORY_MODE"})["MEMORY_MODE"]
 
 
@@ -1089,6 +1092,11 @@ def add_kube_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_postgres_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--postgres-pod", default="codex-postgres-0")
+    parser.add_argument("--postgres-container", default="postgres")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fail-closed PostgreSQL copy-workspace release gates and smoke tests."
@@ -1097,13 +1105,13 @@ def parse_args() -> argparse.Namespace:
 
     idle = subparsers.add_parser("wait-idle")
     add_kube_arguments(idle)
-    idle.add_argument("--postgres-pod", required=True)
-    idle.add_argument("--postgres-container", default="postgres")
+    add_postgres_arguments(idle)
     idle.add_argument("--idle-timeout-seconds", type=float, default=900.0)
     idle.add_argument("--idle-poll-seconds", type=float, default=10.0)
 
     pre = subparsers.add_parser("pre-restart")
     add_kube_arguments(pre)
+    add_postgres_arguments(pre)
     pre.add_argument("--state-file", type=Path, required=True)
     pre.add_argument("--resume-thread-id", required=True)
     pre.add_argument("--model", default="kimi-k3")
@@ -1119,6 +1127,8 @@ def parse_args() -> argparse.Namespace:
     for command in ("post-restart", "cleanup"):
         subparser = subparsers.add_parser(command)
         add_kube_arguments(subparser)
+        if command == "post-restart":
+            add_postgres_arguments(subparser)
         subparser.add_argument("--state-file", type=Path, required=True)
     return parser.parse_args()
 

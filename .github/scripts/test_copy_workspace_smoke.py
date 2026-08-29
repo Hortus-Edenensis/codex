@@ -146,6 +146,28 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
         self.assertIn("app-server --listen unix", workspace_shell.call_args.args[1])
         self.assertIn("POSTGRES_PASSWORD", database_shell.call_args.args[1])
 
+    def test_persisted_memory_mode_reads_from_postgres_pod(self) -> None:
+        args = SimpleNamespace(
+            namespace="namespace",
+            pod="workspace-pod",
+            container="workspace",
+            postgres_pod="postgres-pod",
+            postgres_container="postgres",
+        )
+        result = mock.Mock(stdout="MEMORY_MODE=enabled\n")
+        with mock.patch.object(
+            smoke, "postgres_shell", return_value=result
+        ) as database_shell, mock.patch.object(
+            smoke, "kubectl_shell", side_effect=AssertionError("workspace shell unused")
+        ):
+            self.assertEqual(smoke.persisted_memory_mode(args, "abc123"), "enabled")
+        database_shell.assert_called_once()
+        script = database_shell.call_args.args[1]
+        self.assertIn("PGPASSWORD", script)
+        self.assertIn("-h 127.0.0.1", script)
+        self.assertIn("${POSTGRES_DB}", script)
+        self.assertNotIn("CODEX_REMOTE_SQL_URL", script)
+
     def test_turns_page_fails_closed_on_empty_history(self) -> None:
         with self.assertRaisesRegex(smoke.SmokeError, "no persisted turns"):
             smoke.turns_page(FakeClient([{"data": [], "nextCursor": None}]), "known")
@@ -274,6 +296,47 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(smoke.SmokeError, "duplicate thread id"):
             smoke.all_thread_ids(client)
+
+    def test_parse_args_adds_postgres_defaults_to_pre_and_post_restart(self) -> None:
+        with mock.patch(
+            "sys.argv",
+            [
+                "copy_workspace_smoke.py",
+                "pre-restart",
+                "--namespace",
+                "namespace",
+                "--pod",
+                "workspace-pod",
+                "--container",
+                "workspace",
+                "--state-file",
+                "state.json",
+                "--resume-thread-id",
+                "thread",
+            ],
+        ):
+            pre_args = smoke.parse_args()
+        self.assertEqual(pre_args.postgres_pod, "codex-postgres-0")
+        self.assertEqual(pre_args.postgres_container, "postgres")
+
+        with mock.patch(
+            "sys.argv",
+            [
+                "copy_workspace_smoke.py",
+                "post-restart",
+                "--namespace",
+                "namespace",
+                "--pod",
+                "workspace-pod",
+                "--container",
+                "workspace",
+                "--state-file",
+                "state.json",
+            ],
+        ):
+            post_args = smoke.parse_args()
+        self.assertEqual(post_args.postgres_pod, "codex-postgres-0")
+        self.assertEqual(post_args.postgres_container, "postgres")
 
 
 if __name__ == "__main__":
