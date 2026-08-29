@@ -68,17 +68,20 @@ def common_args(state_file: Path) -> argparse.Namespace:
 
 
 class ReleaseScriptTests(unittest.TestCase):
-    def test_publish_redownloads_and_revalidates_exact_assets(self) -> None:
+    def test_workflow_stops_at_authenticated_draft_without_self_hosted_jobs(
+        self,
+    ) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        publish = workflow.split("  publish-release:\n", 1)[1]
-        self.assertIn('gh release download "${EXPECTED_TAG}"', publish)
-        self.assertIn("SHA256SUMS.txt entry set mismatch", publish)
-        self.assertIn("archive codex SHA-256 mismatch", publish)
-        self.assertIn("bundled and standalone provenance differ", publish)
-        self.assertLess(
-            publish.index('after_assets="$(asset_fingerprint)"'),
-            publish.index('gh release edit "${EXPECTED_TAG}"'),
-        )
+        draft = workflow.split("  draft-release:\n", 1)[1]
+        self.assertNotIn("  deploy-copy-workspace:\n", workflow)
+        self.assertNotIn("  publish-release:\n", workflow)
+        self.assertNotIn("self-hosted", workflow)
+        self.assertIn("runs-on: ubuntu-22.04", draft)
+        self.assertIn('gh release create "${EXPECTED_TAG}"', draft)
+        self.assertIn("--draft", draft)
+        self.assertIn('gh release upload "${EXPECTED_TAG}" --clobber', draft)
+        self.assertIn("draft Release asset set mismatch", draft)
+        self.assertIn("external SSH deployment and verification", draft)
 
     def test_deployment_shape_requires_one_recreate_replica(self) -> None:
         valid = deployment_document()
