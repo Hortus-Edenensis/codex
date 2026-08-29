@@ -769,28 +769,32 @@ dump_sha="$4"
 cleanup() {
   rm -f "${dump}" "${restore_list}" "${live_migrations}" "${dump_sha}"
 }
+fail() {
+  printf 'POSTGRES_BACKUP_FAILED=%s\n' "$1" >&2
+  exit 1
+}
 trap cleanup EXIT HUP INT TERM
-command -v pg_dump >/dev/null 2>&1
-command -v pg_restore >/dev/null 2>&1
-command -v psql >/dev/null 2>&1
-[ -n "${POSTGRES_USER:-}" ]
-[ -n "${POSTGRES_PASSWORD:-}" ]
-[ -n "${POSTGRES_DB:-}" ]
+command -v pg_dump >/dev/null 2>&1 || fail missing_pg_dump
+command -v pg_restore >/dev/null 2>&1 || fail missing_pg_restore
+command -v psql >/dev/null 2>&1 || fail missing_psql
+[ -n "${POSTGRES_USER:-}" ] || fail missing_postgres_user
+[ -n "${POSTGRES_PASSWORD:-}" ] || fail missing_postgres_password
+[ -n "${POSTGRES_DB:-}" ] || fail missing_postgres_database
 PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
   -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
   --format=custom --compress=6 --no-owner --no-privileges \
-  --file="${dump}" >/dev/null
-pg_restore --list "${dump}" > "${restore_list}"
+  --file="${dump}" >/dev/null || fail pg_dump
+pg_restore --list "${dump}" > "${restore_list}" || fail pg_restore_list
 PGPASSWORD="${POSTGRES_PASSWORD}" psql \
   -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
   -XAtq -v ON_ERROR_STOP=1 \
   -c "SELECT version::text || ':' || encode(checksum, 'hex') FROM _sqlx_migrations WHERE version BETWEEN 1 AND 7 AND success ORDER BY version" \
-  > "${live_migrations}"
-[ -s "${dump}" ]
-[ -s "${restore_list}" ]
-[ -s "${live_migrations}" ]
-sha256sum "${dump}" | awk '{print $1}' > "${dump_sha}"
-[ "$(wc -l < "${dump_sha}" | tr -d ' ')" = 1 ]
+  > "${live_migrations}" || fail sqlx_migrations
+[ -s "${dump}" ] || fail empty_dump
+[ -s "${restore_list}" ] || fail empty_restore_list
+[ -s "${live_migrations}" ] || fail empty_sqlx_migrations
+sha256sum "${dump}" | awk '{print $1}' > "${dump_sha}" || fail dump_sha256
+[ "$(wc -l < "${dump_sha}" | tr -d ' ')" = 1 ] || fail dump_sha256_lines
 trap - EXIT HUP INT TERM
 printf 'POSTGRES_BACKUP_READY=1\n'
 '''
