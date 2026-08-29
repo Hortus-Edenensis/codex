@@ -1,9 +1,7 @@
 name: recover-remote-sql-release-v0.151.0
 
 on:
-  push:
-    branches:
-      - ci/recover-v0.151.0-remote-sql-copy.1
+  workflow_dispatch:
 
 concurrency:
   group: recover-remote-sql-release-v0.151.0

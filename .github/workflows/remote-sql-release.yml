@@ -5,7 +5,7 @@ on:
     branches:
       - "**"
     tags:
-      - v0.151.0-remote-sql-copy.1
+      - v0.151.0-remote-sql-copy.2
   pull_request:
     paths:
       - .github/remote-sql-migrations.sha256
@@ -21,8 +21,9 @@ concurrency:
 permissions: {}
 
 env:
-  EXPECTED_TAG: v0.151.0-remote-sql-copy.1
-  VERSION_BASE: 0.151.0-remote-sql-copy.1
+  EXPECTED_TAG: v0.151.0-remote-sql-copy.2
+  VERSION_BASE: 0.151.0-remote-sql-copy.2
+  LINEAGE_MERGE: 150745544e6841702655579c78e21803f9b2927b
   UPSTREAM_PARENT: 4ee04c0aa5833ac39b1763f6ea44c7bc777c83dd
   REMOTE_SQL_PARENT: 03efbd5ef6b960ae622b1f3fcc4a8e7f178407b2
   HISTORY_PARENT: cee6ff5d0007b1a8e16c6c607143fdb4d0838243
@@ -51,7 +52,7 @@ jobs:
 
   build-release:
     name: Build immutable Linux release
-    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.1'
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.2'
     needs: migration-integrity
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -63,12 +64,13 @@ jobs:
       runtime_version: ${{ steps.identity.outputs.runtime_version }}
       sha12: ${{ steps.identity.outputs.sha12 }}
       source_sha: ${{ steps.identity.outputs.source_sha }}
+      source_parents: ${{ steps.identity.outputs.source_parents }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Lock tag and three-parent lineage
+      - name: Lock tag and inherited three-parent lineage
         id: identity
         shell: bash
         run: |
@@ -76,12 +78,15 @@ jobs:
           test "${GITHUB_REF_NAME}" = "${EXPECTED_TAG}"
           source_sha="$(git rev-list -n 1 "${GITHUB_REF}")"
           test "${source_sha}" = "${GITHUB_SHA}"
-          test "$(git show -s --format=%P "${source_sha}")" = \
+          test "$(git show -s --format=%P "${LINEAGE_MERGE}")" = \
             "${UPSTREAM_PARENT} ${REMOTE_SQL_PARENT} ${HISTORY_PARENT}"
+          git merge-base --is-ancestor "${LINEAGE_MERGE}" "${source_sha}"
+          source_parents="$(git show -s --format=%P "${source_sha}")"
+          test -n "${source_parents}"
           sha12="${source_sha:0:12}"
           runtime_version="${VERSION_BASE}+${sha12}"
-          printf 'source_sha=%s\nsha12=%s\nruntime_version=%s\n' \
-            "${source_sha}" "${sha12}" "${runtime_version}" >> "${GITHUB_OUTPUT}"
+          printf 'source_sha=%s\nsource_parents=%s\nsha12=%s\nruntime_version=%s\n' \
+            "${source_sha}" "${source_parents}" "${sha12}" "${runtime_version}" >> "${GITHUB_OUTPUT}"
       - name: Verify immutable PostgreSQL migrations again at the tag
         run: sha256sum --check --strict .github/remote-sql-migrations.sha256
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -141,6 +146,7 @@ jobs:
           RUNTIME_VERSION: ${{ steps.identity.outputs.runtime_version }}
           SHA12: ${{ steps.identity.outputs.sha12 }}
           SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          SOURCE_PARENTS: ${{ steps.identity.outputs.source_parents }}
         shell: bash
         run: |
           set -euo pipefail
@@ -154,7 +160,9 @@ jobs:
           runtime_version=${RUNTIME_VERSION}
           source_sha=${SOURCE_SHA}
           source_sha12=${SHA12}
-          parents=${UPSTREAM_PARENT} ${REMOTE_SQL_PARENT} ${HISTORY_PARENT}
+          source_parents=${SOURCE_PARENTS}
+          lineage_merge=${LINEAGE_MERGE}
+          lineage_parents=${UPSTREAM_PARENT} ${REMOTE_SQL_PARENT} ${HISTORY_PARENT}
           upstream_parent=${UPSTREAM_PARENT}
           remote_sql_parent=${REMOTE_SQL_PARENT}
           history_recovery_parent=${HISTORY_PARENT}
@@ -203,7 +211,7 @@ jobs:
 
   draft-release:
     name: Create authenticated draft Release
-    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.1'
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.2'
     needs: build-release
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -217,6 +225,7 @@ jobs:
       - name: Create or refresh only the draft Release
         env:
           ARCHIVE_NAME: ${{ needs.build-release.outputs.archive_name }}
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -254,7 +263,7 @@ jobs:
 
   deploy-copy-workspace:
     name: Deploy draft asset and run fail-closed smoke
-    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.1'
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.2'
     needs:
       - build-release
       - draft-release
@@ -273,9 +282,14 @@ jobs:
       RUNTIME_VERSION: ${{ needs.build-release.outputs.runtime_version }}
       SOURCE_SHA: ${{ needs.build-release.outputs.source_sha }}
     steps:
+      - name: Keep self-hosted checkout on HTTP/1.1
+        run: git config --global http.version HTTP/1.1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          sparse-checkout: |
+            .github
+            codex-rs/postgres-thread-store/migrations
       - name: Initialize runner-local deployment state paths
         shell: bash
         run: |
@@ -424,7 +438,7 @@ jobs:
 
   publish-release:
     name: Publish only after deployment evidence passes
-    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.1'
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.2'
     needs:
       - build-release
       - deploy-copy-workspace
@@ -437,6 +451,7 @@ jobs:
     steps:
       - name: Re-download and verify the exact draft assets
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -523,6 +538,7 @@ jobs:
           test "${before_assets}" = "${after_assets}"
       - name: Publish the re-verified draft
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail

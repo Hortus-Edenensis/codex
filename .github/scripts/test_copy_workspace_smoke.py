@@ -204,9 +204,11 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
                 "kimi",
             )
 
-    def test_resolve_known_scans_filesystem_even_when_fixed_id_is_readable(self) -> None:
+    def test_resolve_known_scans_filesystem_and_validates_resume(self) -> None:
         context = mock.MagicMock()
-        context.__enter__.return_value = mock.MagicMock()
+        client = mock.MagicMock()
+        client.request.return_value = {"thread": {"id": "fixed", "path": None}}
+        context.__enter__.return_value = client
         args = SimpleNamespace(
             namespace="namespace",
             pod="pod",
@@ -225,6 +227,37 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
         scan.assert_called_once_with(
             context.__enter__.return_value, use_state_db_only=False
         )
+        client.request.assert_called_once_with(
+            "thread/resume", {"threadId": "fixed", "excludeTurns": True}
+        )
+
+    def test_resolve_known_skips_history_that_cannot_resume(self) -> None:
+        context = mock.MagicMock()
+        client = mock.MagicMock()
+        client.request.side_effect = [
+            smoke.SmokeError("legacy resume failed"),
+            {"thread": {"id": "fallback", "path": None}},
+        ]
+        context.__enter__.return_value = client
+        args = SimpleNamespace(
+            namespace="namespace",
+            pod="pod",
+            container="workspace",
+            resume_thread_id="fixed",
+            request_timeout_seconds=1,
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            smoke, "ProxyWebSocketClient", return_value=context
+        ), mock.patch.object(
+            smoke, "paginated_threads", return_value=[{"id": "fallback"}]
+        ), mock.patch.object(
+            smoke, "turns_page", return_value=[{"id": "turn"}]
+        ), mock.patch("sys.stdout", new=output):
+            smoke.resolve_known(args)
+        summary = json.loads(output.getvalue())
+        self.assertEqual(summary["threadId"], "fallback")
+        self.assertTrue(summary["fallbackUsed"])
 
     def test_all_thread_ids_rejects_duplicates(self) -> None:
         client = FakeClient(

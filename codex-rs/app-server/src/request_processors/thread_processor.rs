@@ -4688,7 +4688,7 @@ impl ThreadRequestProcessor {
 
     async fn load_resume_initial_history_from_stored_thread(
         &self,
-        stored_thread: StoredThread,
+        mut stored_thread: StoredThread,
     ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
         if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
             let model_context = self
@@ -4707,12 +4707,28 @@ impl ThreadRequestProcessor {
             return Ok((history, stored_thread));
         }
 
-        let thread_id = stored_thread.thread_id.to_string();
-        let rollout_path = stored_thread.rollout_path.clone().ok_or_else(|| {
-            internal_error(format!(
-                "thread {thread_id} did not include a rollout path for resume"
-            ))
-        })?;
+        if stored_thread.rollout_path.is_none() {
+            if stored_thread.history.is_none() {
+                stored_thread = self
+                    .thread_store
+                    .read_thread(StoreReadThreadParams {
+                        thread_id: stored_thread.thread_id,
+                        include_archived: true,
+                        include_history: true,
+                    })
+                    .await
+                    .map_err(thread_store_resume_read_error)?;
+            }
+            let history = self
+                .stored_thread_to_initial_history(&mut stored_thread)
+                .await?;
+            return Ok((history, stored_thread));
+        }
+
+        let rollout_path = stored_thread
+            .rollout_path
+            .clone()
+            .expect("legacy path presence checked above");
         let (history_items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path)
             .await
             .map_err(|err| {

@@ -19,6 +19,7 @@ from urllib.request import urlopen
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$")
+RUNTIME_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$")
 DATABASE_URL_RE = re.compile(r"postgres(?:ql)?://[^\s'\"]+", re.IGNORECASE)
 STATE_VERSION = 1
 MIGRATION_PATHS = [
@@ -86,6 +87,13 @@ def require_safe_name(label: str, value: str) -> str:
     if not SAFE_NAME_RE.fullmatch(value):
         raise DeployError(f"{label} is not a safe release identifier")
     return value
+
+
+def runtime_version_from_output(version_output: str) -> str:
+    parts = version_output.strip().split()
+    if not parts or not RUNTIME_VERSION_RE.fullmatch(parts[-1]):
+        raise DeployError("saved release version output is invalid")
+    return parts[-1]
 
 
 def positive_int_arg(value: str) -> int:
@@ -1557,16 +1565,15 @@ def rollback(args: argparse.Namespace) -> None:
     old_pod = select_ready_pod(
         args, deployment, old_release, timeout=args.rollout_timeout
     )
+    old_runtime = runtime_version_from_output(str(state.get("oldVersionOutput", "")))
     verify_selected_release(
         args,
         old_pod,
         old_release,
         str(state["oldBinarySha256"]),
-        old_release,
+        old_runtime,
     )
-    if old_release not in str(state.get("oldVersionOutput", "")):
-        raise DeployError("saved rollback version does not match the old selector")
-    verify_daemon_running(args, old_pod, old_release)
+    verify_daemon_running(args, old_pod, old_runtime)
     verify_known_resume(args, old_pod)
     state["stage"] = "rolledBack"
     state["rollbackPod"] = old_pod

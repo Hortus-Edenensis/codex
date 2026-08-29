@@ -27,6 +27,7 @@ use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::RequestId;
@@ -371,7 +372,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
 }
 
 #[tokio::test]
-async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
+async fn cold_legacy_thread_resume_reuses_non_local_history_probe() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     let store_id = Uuid::new_v4().to_string();
@@ -393,7 +394,10 @@ async fn cold_thread_resume_reuses_non_local_history_probe() -> Result<()> {
     let response = client
         .request(ClientRequest::ThreadStart {
             request_id: RequestId::Integer(1),
-            params: ThreadStartParams::default(),
+            params: ThreadStartParams {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..Default::default()
+            },
         })
         .await?
         .expect("thread/start should succeed");
@@ -495,7 +499,10 @@ async fn start_in_process_client(
                 title: None,
                 version: "0.1.0".to_string(),
             },
-            capabilities: None,
+            capabilities: Some(InitializeCapabilities {
+                experimental_api: true,
+                ..Default::default()
+            }),
         },
         channel_capacity: in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     })

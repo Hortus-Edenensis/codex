@@ -230,6 +230,61 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertEqual(inspected["BINARY_SHA256"], digest)
         self.assertEqual(inspected["VERSION_OUTPUT"], version)
 
+    def test_rollback_runtime_comes_from_version_output_not_selector(self) -> None:
+        selector = "copy-workspace-0.142.5-build-x86_64-unknown-linux-gnu"
+        output = "codex-cli 0.142.5-remote-sql-copy.56+03efbd5ef6b9"
+        self.assertNotIn(selector, output)
+        self.assertEqual(
+            deploy.runtime_version_from_output(output),
+            "0.142.5-remote-sql-copy.56+03efbd5ef6b9",
+        )
+        with self.assertRaisesRegex(deploy.DeployError, "version output"):
+            deploy.runtime_version_from_output("codex-cli invalid")
+
+    def test_rollback_verifies_saved_runtime_instead_of_packaging_selector(self) -> None:
+        old_selector = "copy-workspace-0.142.5-build-x86_64-unknown-linux-gnu"
+        old_runtime = "0.142.5-remote-sql-copy.56+03efbd5ef6b9"
+        document = deployment_document(old_selector)
+        with tempfile.TemporaryDirectory() as raw:
+            args = common_args(Path(raw) / "state.json")
+            state = {
+                "stateVersion": 1,
+                "stage": "activated",
+                "deployment": args.deployment,
+                "deploymentUid": "uid-1",
+                "container": args.container,
+                "releaseVariable": args.release_variable,
+                "commandIndex": args.command_index,
+                "releaseAnnotation": args.release_annotation,
+                "knownResumeThreadId": args.resume_thread_id,
+                "oldReleaseSelector": old_selector,
+                "newReleaseSelector": "0.151.0-remote-sql-copy.2+abcdef123456",
+                "oldAnnotations": deploy.annotation_snapshot(
+                    document, args.release_annotation
+                ),
+                "oldBinarySha256": "a" * 64,
+                "oldVersionOutput": f"codex-cli {old_runtime}",
+                "releaseDirectory": "/releases/new",
+                "postgresBackup": {"directory": "/backups/new"},
+            }
+            deploy.atomic_write_json(args.state_file, state)
+            with mock.patch.object(
+                deploy, "deployment_document", return_value=document
+            ), mock.patch.object(
+                deploy, "select_ready_pod", return_value="old-pod"
+            ), mock.patch.object(
+                deploy, "verify_selected_release"
+            ) as verify_release, mock.patch.object(
+                deploy, "verify_daemon_running"
+            ) as verify_daemon, mock.patch.object(
+                deploy, "verify_known_resume"
+            ), mock.patch("sys.stdout", new=io.StringIO()):
+                deploy.rollback(args)
+            verify_release.assert_called_once_with(
+                args, "old-pod", old_selector, "a" * 64, old_runtime
+            )
+            verify_daemon.assert_called_once_with(args, "old-pod", old_runtime)
+
     def test_migration_manifest_locks_sha256_and_derives_sqlx_sha384(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

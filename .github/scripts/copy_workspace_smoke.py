@@ -1055,6 +1055,13 @@ def resolve_known(args: argparse.Namespace) -> None:
         for candidate_id in candidate_ids:
             try:
                 turns_page(client, candidate_id)
+                require_thread(
+                    client.request(
+                        "thread/resume",
+                        {"threadId": candidate_id, "excludeTurns": True},
+                    ),
+                    candidate_id,
+                )
             except SmokeError:
                 continue
             selected = candidate_id
