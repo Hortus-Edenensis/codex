@@ -307,6 +307,26 @@ class ReleaseScriptTests(unittest.TestCase):
                 deploy.expected_sqlx_migrations(root, manifest), expected
             )
 
+    def test_live_sqlx_migrations_may_be_a_locked_release_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            live = root / "live.txt"
+            expected = root / "expected.txt"
+            live.write_text("1:aaa\n2:bbb\n", encoding="utf-8")
+            expected.write_text("1:aaa\n2:bbb\n3:ccc\n", encoding="utf-8")
+            deploy.require_sqlx_migration_prefix(live, expected)
+
+    def test_live_sqlx_migration_prefix_rejects_drift_and_extra_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            live = root / "live.txt"
+            expected = root / "expected.txt"
+            expected.write_text("1:aaa\n2:bbb\n", encoding="utf-8")
+            for content in ("", "1:aaa\n2:changed\n", "1:aaa\n2:bbb\n3:ccc\n"):
+                live.write_text(content, encoding="utf-8")
+                with self.assertRaises(deploy.DeployError):
+                    deploy.require_sqlx_migration_prefix(live, expected)
+
     def test_archive_rejects_traversal_and_extra_members(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

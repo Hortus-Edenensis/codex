@@ -649,6 +649,15 @@ def parse_safe_output(text: str, required: set[str]) -> dict[str, str]:
     return values
 
 
+def require_sqlx_migration_prefix(live_path: Path, expected_path: Path) -> None:
+    live = live_path.read_text(encoding="utf-8").splitlines()
+    expected = expected_path.read_text(encoding="utf-8").splitlines()
+    if not live or len(live) > len(expected) or live != expected[: len(live)]:
+        raise DeployError(
+            "live SQLx migrations are not a checksum-locked prefix of release sources"
+        )
+
+
 def install_immutable_release(
     args: argparse.Namespace,
     pod: str,
@@ -803,7 +812,7 @@ pg_restore --list "${dump}" > "${restore_list}" || fail pg_restore_list
 PGPASSWORD="${POSTGRES_PASSWORD}" psql \
   -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
   -XAtq -v ON_ERROR_STOP=1 \
-  -c "SELECT version::text || ':' || encode(checksum, 'hex') FROM _sqlx_migrations WHERE version BETWEEN 1 AND 7 AND success ORDER BY version" \
+  -c "SELECT version::text || ':' || encode(checksum, 'hex') FROM _sqlx_migrations WHERE success ORDER BY version" \
   > "${live_migrations}" || fail sqlx_migrations
 [ -s "${dump}" ] || fail empty_dump
 [ -s "${restore_list}" ] || fail empty_restore_list
@@ -849,7 +858,12 @@ for name in \
   source-postgres-dump.sha256; do
   [ -s "${stage}/${name}" ]
 done
-cmp -s "${stage}/expected-sqlx-migrations.txt" "${stage}/live-sqlx-migrations.txt"
+expected_migration_count="$(wc -l < "${stage}/expected-sqlx-migrations.txt" | tr -d ' ')"
+live_migration_count="$(wc -l < "${stage}/live-sqlx-migrations.txt" | tr -d ' ')"
+[ "${live_migration_count}" -gt 0 ]
+[ "${live_migration_count}" -le "${expected_migration_count}" ]
+head -n "${live_migration_count}" "${stage}/expected-sqlx-migrations.txt" \
+  | cmp -s - "${stage}/live-sqlx-migrations.txt"
 expected_dump_sha="$(cat "${stage}/source-postgres-dump.sha256")"
 case "${expected_dump_sha}" in *[!0-9a-f]*|'') exit 1 ;; esac
 [ "${#expected_dump_sha}" = 64 ]
@@ -919,11 +933,10 @@ printf 'RESTORE_LIST_ENTRIES=%s\n' "${list_entries}"
                     postgres_paths[name],
                     local_paths[name],
                 )
-            if (
-                local_paths["live-sqlx-migrations.txt"].read_bytes()
-                != local_paths["expected-sqlx-migrations.txt"].read_bytes()
-            ):
-                raise DeployError("live SQLx migrations did not match release sources")
+            require_sqlx_migration_prefix(
+                local_paths["live-sqlx-migrations.txt"],
+                local_paths["expected-sqlx-migrations.txt"],
+            )
             source_dump_sha = local_paths[
                 "source-postgres-dump.sha256"
             ].read_text(encoding="utf-8").strip()
