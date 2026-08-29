@@ -68,6 +68,18 @@ def common_args(state_file: Path) -> argparse.Namespace:
 
 
 class ReleaseScriptTests(unittest.TestCase):
+    def test_deployment_lock_rejects_a_second_state_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            state_file = Path(raw) / "deploy-state.json"
+            with deploy.deployment_lock(state_file):
+                with self.assertRaisesRegex(
+                    deploy.DeployError, "another release operation"
+                ):
+                    with deploy.deployment_lock(state_file):
+                        self.fail("second state writer acquired the deployment lock")
+            lock_file = state_file.with_name(f"{state_file.name}.lock")
+            self.assertEqual(lock_file.stat().st_mode & 0o777, 0o600)
+
     def test_workflow_stops_at_authenticated_draft_without_self_hosted_jobs(
         self,
     ) -> None:

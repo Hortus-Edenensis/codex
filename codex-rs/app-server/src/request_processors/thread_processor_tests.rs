@@ -800,6 +800,13 @@ mod thread_processor_behavior_tests {
         }
     }
 
+    fn test_stored_thread_with_id(thread_id: &str) -> StoredThread {
+        StoredThread {
+            thread_id: ThreadId::from_string(thread_id).expect("valid thread"),
+            ..test_stored_thread(/*model*/ None, /*reasoning_effort*/ None)
+        }
+    }
+
     #[test]
     fn summary_from_thread_metadata_formats_protocol_timestamps_as_seconds() -> Result<()> {
         let mut metadata =
@@ -1057,6 +1064,26 @@ mod thread_processor_behavior_tests {
             ),
             Some(vec!["openai".to_string()])
         );
+    }
+
+    #[test]
+    fn append_unique_threads_skips_duplicates_and_preserves_first_seen_order() {
+        let first = test_stored_thread_with_id("00000000-0000-0000-0000-000000000001");
+        let second = test_stored_thread_with_id("00000000-0000-0000-0000-000000000002");
+        let duplicate_first = first.clone();
+        let third = test_stored_thread_with_id("00000000-0000-0000-0000-000000000003");
+
+        let mut items = vec![first.clone()];
+        let mut seen_thread_ids = std::collections::HashSet::from([first.thread_id.clone()]);
+
+        append_unique_threads(
+            &mut items,
+            &mut seen_thread_ids,
+            vec![duplicate_first, second.clone(), third],
+            2,
+        );
+
+        assert_eq!(items, vec![first, second]);
     }
 
     #[test]

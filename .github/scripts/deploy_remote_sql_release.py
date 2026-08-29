@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -12,6 +14,7 @@ import tarfile
 import tempfile
 import time
 from typing import Any
+from typing import Iterator
 from urllib.error import HTTPError
 from urllib.request import Request
 from urllib.request import urlopen
@@ -36,6 +39,34 @@ MIGRATION_PATHS = [
 
 class DeployError(RuntimeError):
     pass
+
+
+@contextmanager
+def deployment_lock(state_file: Path) -> Iterator[None]:
+    lock_path = state_file.with_name(f"{state_file.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(
+        lock_path,
+        os.O_CLOEXEC | os.O_CREAT | os.O_RDWR,
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise DeployError(
+                f"another release operation holds {lock_path}"
+            ) from exc
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, f"{os.getpid()}\n".encode())
+        os.fsync(descriptor)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def redact(text: str) -> str:
@@ -1704,20 +1735,22 @@ def main() -> int:
     args = parse_args()
     if args.command_index < 0:
         raise DeployError("command index must be non-negative")
-    if args.command == "prepare":
-        if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha):
-            raise DeployError("source SHA must be a full lowercase Git SHA")
-        prepare(args)
-    elif args.command == "current-pod":
+    if args.command == "current-pod":
         current_pod(args)
-    elif args.command == "activate":
-        activate(args)
-    elif args.command == "rollback":
-        rollback(args)
-    elif args.command == "restart-daemon":
-        restart_daemon(args)
     else:
-        raise DeployError(f"unsupported command {args.command}")
+        with deployment_lock(args.state_file):
+            if args.command == "prepare":
+                if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha):
+                    raise DeployError("source SHA must be a full lowercase Git SHA")
+                prepare(args)
+            elif args.command == "activate":
+                activate(args)
+            elif args.command == "rollback":
+                rollback(args)
+            elif args.command == "restart-daemon":
+                restart_daemon(args)
+            else:
+                raise DeployError(f"unsupported command {args.command}")
     return 0
 
 

@@ -168,10 +168,6 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    pub(crate) fn new(ts: OffsetDateTime) -> Self {
-        Self { ts, id: None }
-    }
-
     pub(crate) fn with_thread_id(ts: OffsetDateTime, id: ThreadId) -> Self {
         Self { ts, id: Some(id) }
     }
@@ -191,6 +187,7 @@ impl Cursor {
 /// pagination.
 struct AnchorState {
     ts: OffsetDateTime,
+    id: Option<Uuid>,
     passed: bool,
 }
 
@@ -199,24 +196,40 @@ impl AnchorState {
         match anchor {
             Some(cursor) => Self {
                 ts: cursor.ts,
+                id: cursor
+                    .id
+                    .and_then(|thread_id| Uuid::parse_str(&thread_id.to_string()).ok()),
                 passed: false,
             },
             None => Self {
                 ts: OffsetDateTime::UNIX_EPOCH,
+                id: None,
                 passed: true,
             },
         }
     }
 
-    fn should_skip(&mut self, ts: OffsetDateTime, _id: Uuid) -> bool {
+    fn should_skip(&mut self, ts: OffsetDateTime, id: Uuid) -> bool {
         if self.passed {
             return false;
         }
-        if ts < self.ts {
-            self.passed = true;
-            false
-        } else {
-            true
+        match self.id {
+            Some(anchor_id) => {
+                if ts < self.ts || (ts == self.ts && id < anchor_id) {
+                    self.passed = true;
+                    false
+                } else {
+                    true
+                }
+            }
+            None => {
+                if ts < self.ts {
+                    self.passed = true;
+                    false
+                } else {
+                    true
+                }
+            }
         }
     }
 }
@@ -772,13 +785,10 @@ fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cu
             OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
         }
     };
-    match sort_key {
-        ThreadSortKey::RecencyAt => Some(Cursor::with_thread_id(
-            ts,
-            ThreadId::from_string(&id.to_string()).ok()?,
-        )),
-        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => Some(Cursor::new(ts)),
-    }
+    Some(Cursor::with_thread_id(
+        ts,
+        ThreadId::from_string(&id.to_string()).ok()?,
+    ))
 }
 
 async fn build_thread_item(

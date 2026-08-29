@@ -27,6 +27,7 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
+use std::fs::FileTimes;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -137,6 +138,13 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
     });
     writeln!(file, "{user_event}")?;
     Ok(path)
+}
+
+fn set_modified_time(path: &Path, modified: std::time::SystemTime) -> std::io::Result<()> {
+    File::options()
+        .write(true)
+        .open(path)?
+        .set_times(FileTimes::new().set_modified(modified))
 }
 
 #[test]
@@ -1161,6 +1169,128 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
     .await?;
     assert_eq!(page2.items.len(), 1);
     assert_eq!(page2.items[0].path, middle);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_from_files_created_at_cursor_keeps_equal_timestamp_threads_stable()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let newer = write_session_file(
+        home.path(),
+        "2025-01-03T12-00-00",
+        Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_9002),
+    )?;
+    let older = write_session_file(
+        home.path(),
+        "2025-01-03T12-00-00",
+        Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_9001),
+    )?;
+
+    let page1 = RolloutRecorder::list_threads(
+        /*state_db_ctx*/ None,
+        &config,
+        /*page_size*/ 1,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(page1.items.len(), 1);
+    assert_eq!(page1.items[0].path, newer);
+    let cursor = page1.next_cursor.clone().expect("cursor should be present");
+    assert_eq!(
+        cursor.thread_id(),
+        Some(
+            ThreadId::from_string("00000000-0000-0000-0000-000000009002").expect("valid thread id")
+        )
+    );
+
+    let page2 = RolloutRecorder::list_threads(
+        /*state_db_ctx*/ None,
+        &config,
+        /*page_size*/ 1,
+        Some(&cursor),
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(page2.items.len(), 1);
+    assert_eq!(page2.items[0].path, older);
+    assert_eq!(page2.next_cursor, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_from_files_updated_at_cursor_keeps_equal_timestamp_threads_stable_in_asc()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let later_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000009102").expect("valid thread id");
+    let earlier_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000009101").expect("valid thread id");
+    let later = write_session_file(
+        home.path(),
+        "2025-01-03T12-00-00",
+        Uuid::parse_str(&later_id.to_string()).expect("valid uuid"),
+    )?;
+    let earlier = write_session_file(
+        home.path(),
+        "2025-01-03T12-00-00",
+        Uuid::parse_str(&earlier_id.to_string()).expect("valid uuid"),
+    )?;
+    let modified = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    set_modified_time(&later, modified)?;
+    set_modified_time(&earlier, modified)?;
+
+    let page1 = RolloutRecorder::list_threads(
+        /*state_db_ctx*/ None,
+        &config,
+        /*page_size*/ 1,
+        /*cursor*/ None,
+        ThreadSortKey::UpdatedAt,
+        SortDirection::Asc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(page1.items.len(), 1);
+    assert_eq!(page1.items[0].thread_id, Some(earlier_id));
+    let cursor = page1.next_cursor.clone().expect("cursor should be present");
+    assert_eq!(cursor.thread_id(), Some(earlier_id));
+
+    let page2 = RolloutRecorder::list_threads(
+        /*state_db_ctx*/ None,
+        &config,
+        /*page_size*/ 1,
+        Some(&cursor),
+        ThreadSortKey::UpdatedAt,
+        SortDirection::Asc,
+        &[],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(page2.items.len(), 1);
+    assert_eq!(page2.items[0].path, later);
+    assert_eq!(page2.next_cursor, None);
     Ok(())
 }
 

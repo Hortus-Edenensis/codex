@@ -50,7 +50,7 @@ pub enum ThreadRelationFilter {
 pub struct Anchor {
     /// The timestamp component of the anchor.
     pub ts: DateTime<Utc>,
-    /// The thread ID component used to disambiguate equal recency timestamps.
+    /// The thread ID component used to disambiguate equal sort timestamps.
     pub id: Option<ThreadId>,
 }
 
@@ -646,9 +646,7 @@ pub(crate) fn anchor_from_item(
     };
     Some(Anchor {
         ts,
-        id: (include_thread_id_tiebreaker
-            || matches!(sort_key, SortKey::RecencyAt | SortKey::SectionPosition))
-        .then_some(item.id),
+        id: include_thread_id_tiebreaker.then_some(item.id),
     })
 }
 
@@ -691,8 +689,11 @@ pub struct BackfillStats {
 
 #[cfg(test)]
 mod tests {
+    use super::Anchor;
     use super::ThreadMetadata;
     use super::ThreadRow;
+    use crate::SortKey;
+    use crate::model::anchor_from_item;
     use chrono::DateTime;
     use chrono::Utc;
     use codex_protocol::SanitizedGitUrl;
@@ -823,5 +824,25 @@ mod tests {
         reconciled.prefer_existing_git_info(&existing);
 
         assert_eq!(reconciled, expected);
+    }
+
+    #[test]
+    fn anchor_from_item_includes_thread_id_for_created_and_updated_keyset_pagination() {
+        let metadata = expected_thread_metadata(/*reasoning_effort*/ None);
+
+        assert_eq!(
+            anchor_from_item(&metadata, SortKey::CreatedAt, true),
+            Some(Anchor {
+                ts: metadata.created_at,
+                id: Some(metadata.id),
+            })
+        );
+        assert_eq!(
+            anchor_from_item(&metadata, SortKey::UpdatedAt, true),
+            Some(Anchor {
+                ts: metadata.updated_at,
+                id: Some(metadata.id),
+            })
+        );
     }
 }

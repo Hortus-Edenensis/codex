@@ -26,6 +26,7 @@ use codex_rollout::RolloutRecorder;
 #[cfg(test)]
 use codex_state::ThreadMetadata;
 use codex_thread_store::PersistContext;
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -111,6 +112,23 @@ where
     match serde_json::to_vec(value) {
         Ok(serialized) => serialized.hash(hasher),
         Err(err) => err.to_string().hash(hasher),
+    }
+}
+
+fn append_unique_threads(
+    items: &mut Vec<StoredThread>,
+    seen_thread_ids: &mut HashSet<ThreadId>,
+    page_items: impl IntoIterator<Item = StoredThread>,
+    remaining: usize,
+) {
+    for thread in page_items {
+        if !seen_thread_ids.insert(thread.thread_id.clone()) {
+            continue;
+        }
+        items.push(thread);
+        if items.len() >= remaining {
+            break;
+        }
     }
 }
 
@@ -5785,6 +5803,7 @@ impl ThreadRequestProcessor {
         let mut last_cursor = cursor_obj.clone();
         let mut remaining = requested_page_size;
         let mut items = Vec::with_capacity(requested_page_size);
+        let mut seen_thread_ids = HashSet::with_capacity(requested_page_size);
         let mut next_cursor: Option<String> = None;
 
         let uses_postgres_thread_store = matches!(
@@ -5848,12 +5867,14 @@ impl ThreadRequestProcessor {
                     })
                 {
                     filtered.push(it);
-                    if filtered.len() >= remaining {
-                        break;
-                    }
                 }
             }
-            items.extend(filtered);
+            append_unique_threads(
+                &mut items,
+                &mut seen_thread_ids,
+                filtered,
+                requested_page_size,
+            );
             remaining = requested_page_size.saturating_sub(items.len());
 
             next_cursor = page.next_cursor;

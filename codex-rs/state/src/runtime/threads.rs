@@ -567,20 +567,14 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 sort_direction: SortDirection::Desc,
                 search_term: None,
             },
-            matches!(
-                sort_key,
-                crate::SortKey::RecencyAt | crate::SortKey::SectionPosition
-            ),
+            sort_key_uses_thread_id_tiebreaker(sort_key),
         );
         push_thread_order_and_limit(
             &mut builder,
             sort_key,
             SortDirection::Desc,
             OrderByIndex::Enabled,
-            matches!(
-                sort_key,
-                crate::SortKey::RecencyAt | crate::SortKey::SectionPosition
-            ),
+            sort_key_uses_thread_id_tiebreaker(sort_key),
             limit,
         );
 
@@ -1221,11 +1215,8 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
         ),
         None => builder.push(" FROM threads"),
     };
-    let include_thread_id_tiebreaker = relation_filter.is_some()
-        || matches!(
-            filters.sort_key,
-            SortKey::RecencyAt | SortKey::SectionPosition
-        );
+    let include_thread_id_tiebreaker =
+        relation_filter.is_some() || sort_key_uses_thread_id_tiebreaker(filters.sort_key);
     push_thread_filters_with_preview(
         builder,
         filters,
@@ -1310,6 +1301,13 @@ SELECT
     threads.git_origin_url
 "#,
     );
+}
+
+fn sort_key_uses_thread_id_tiebreaker(sort_key: SortKey) -> bool {
+    matches!(
+        sort_key,
+        SortKey::CreatedAt | SortKey::UpdatedAt | SortKey::RecencyAt | SortKey::SectionPosition
+    )
 }
 
 pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
@@ -2092,7 +2090,7 @@ mod tests {
             Some(Anchor {
                 ts: DateTime::<Utc>::from_timestamp_millis(1_700_000_200_000)
                     .expect("valid timestamp"),
-                id: None,
+                id: Some(newer_id),
             })
         );
 
@@ -2184,7 +2182,7 @@ mod tests {
             Some(Anchor {
                 ts: DateTime::<Utc>::from_timestamp_millis(1_700_000_300_000)
                     .expect("valid timestamp"),
-                id: None,
+                id: Some(second_id),
             })
         );
 
@@ -2537,6 +2535,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![grandchild_id, second_child_id, first_child_id]
         );
+    }
+
+    #[tokio::test]
+    async fn list_threads_created_at_pagination_uses_thread_id_tiebreaker_globally() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let lower_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000011").expect("valid thread id");
+        let higher_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000012").expect("valid thread id");
+        let created_at =
+            DateTime::<Utc>::from_timestamp(1_700_000_200, 0).expect("valid timestamp");
+
+        for thread_id in [lower_id, higher_id] {
+            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            metadata.created_at = created_at;
+            metadata.first_user_message = Some("hello".to_string());
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("thread insert should succeed");
+        }
+
+        let filters = |anchor| ThreadFilterOptions {
+            archived_only: false,
+            allowed_sources: &[],
+            model_providers: None,
+            cwd_filters: None,
+            section: None,
+            project_id: None,
+            anchor,
+            sort_key: SortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            search_term: None,
+        };
+        let first_page = runtime
+            .list_threads(/*page_size*/ 1, filters(None))
+            .await
+            .expect("first page should succeed");
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![higher_id]
+        );
+        assert_eq!(
+            first_page.next_anchor,
+            Some(Anchor {
+                ts: created_at,
+                id: Some(higher_id),
+            })
+        );
+
+        let second_page = runtime
+            .list_threads(
+                /*page_size*/ 1,
+                filters(first_page.next_anchor.as_ref()),
+            )
+            .await
+            .expect("second page should succeed");
+        assert_eq!(
+            second_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![lower_id]
+        );
+        assert_eq!(second_page.next_anchor, None);
     }
 
     #[tokio::test]

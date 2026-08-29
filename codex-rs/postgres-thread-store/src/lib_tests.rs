@@ -90,6 +90,63 @@ fn generated_memory_history_mode_keys_include_legacy_and_paginated() {
 }
 
 #[test]
+fn thread_list_cursor_decodes_legacy_offsets() {
+    assert_eq!(
+        decode_thread_list_cursor(Some(r#"{"offset":42}"#)).expect("legacy cursor"),
+        ThreadListCursor::LegacyOffset(42)
+    );
+}
+
+#[test]
+fn thread_list_keyset_cursor_round_trips() {
+    let thread = sample_stored_thread();
+    let encoded = encode_keyset_cursor(
+        KeysetCursorValue::Timestamp(thread.updated_at),
+        thread.thread_id.clone(),
+        ThreadSortKey::UpdatedAt,
+        SortDirection::Desc,
+    )
+    .expect("encode cursor");
+
+    let decoded = decode_thread_list_cursor(Some(&encoded)).expect("decode cursor");
+    assert_eq!(
+        decoded,
+        ThreadListCursor::Keyset(KeysetCursor {
+            version: 1,
+            sort_key: ThreadSortKey::UpdatedAt,
+            sort_direction: SortDirection::Desc,
+            value: KeysetCursorValue::Timestamp(thread.updated_at),
+            thread_id: thread.thread_id,
+        })
+    );
+}
+
+#[test]
+fn thread_list_keyset_cursor_rejects_a_different_sort_order() {
+    let thread = sample_stored_thread();
+    let encoded = encode_keyset_cursor(
+        KeysetCursorValue::Timestamp(thread.updated_at),
+        thread.thread_id.clone(),
+        ThreadSortKey::UpdatedAt,
+        SortDirection::Desc,
+    )
+    .expect("encode cursor");
+    let ThreadListCursor::Keyset(cursor) =
+        decode_thread_list_cursor(Some(&encoded)).expect("decode cursor")
+    else {
+        panic!("expected keyset cursor");
+    };
+
+    let error = validate_keyset_cursor(&cursor, ThreadSortKey::CreatedAt, SortDirection::Desc)
+        .expect_err("sort-key mismatch must fail");
+    assert!(matches!(
+        error,
+        ThreadStoreError::InvalidRequest { message }
+            if message.contains("does not match the requested sort order")
+    ));
+}
+
+#[test]
 fn stored_thread_json_with_memory_mode_sets_canonical_field() {
     let value = stored_thread_json_with_memory_mode_key(
         &sample_stored_thread(),

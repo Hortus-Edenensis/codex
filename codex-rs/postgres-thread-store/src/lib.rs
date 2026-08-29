@@ -42,10 +42,12 @@ use codex_thread_store::ReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::SearchThreadsParams;
+use codex_thread_store::SortDirection;
 use codex_thread_store::StoredThread;
 use codex_thread_store::StoredThreadHistory;
 use codex_thread_store::ThreadPage;
 use codex_thread_store::ThreadSearchPage;
+use codex_thread_store::ThreadSortKey;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::ThreadStoreFuture;
@@ -148,6 +150,30 @@ impl Default for MigrationGate {
 #[derive(Debug, Deserialize, Serialize)]
 struct OffsetCursor {
     offset: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeysetCursor {
+    version: u8,
+    sort_key: ThreadSortKey,
+    sort_direction: SortDirection,
+    value: KeysetCursorValue,
+    thread_id: ThreadId,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+enum KeysetCursorValue {
+    Timestamp(DateTime<Utc>),
+    SectionPosition(i64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ThreadListCursor {
+    Start,
+    LegacyOffset(usize),
+    Keyset(KeysetCursor),
 }
 
 impl std::fmt::Debug for PostgresThreadStore {
@@ -765,7 +791,10 @@ VALUES ($1, $2, $3, $4)
         Box::pin(async move {
             self.ensure_migrated().await?;
             let (pool, workspace_id) = self.pool_and_workspace()?;
-            let offset = decode_offset_cursor(params.cursor.as_deref())?;
+            let cursor = decode_thread_list_cursor(params.cursor.as_deref())?;
+            if let ThreadListCursor::Keyset(cursor) = &cursor {
+                validate_keyset_cursor(cursor, params.sort_key, params.sort_direction)?;
+            }
             if matches!(params.cwd_filters.as_ref(), Some(filters) if filters.is_empty()) {
                 return Ok(ThreadPage {
                     items: Vec::new(),
@@ -774,9 +803,21 @@ VALUES ($1, $2, $3, $4)
             }
 
             let page_size = params.page_size.max(1);
-            let mut builder = QueryBuilder::<Postgres>::new(
-                "SELECT stored_thread_json FROM threads WHERE workspace_id = ",
-            );
+            let sort_column = match params.sort_key {
+                ThreadSortKey::CreatedAt => "created_at",
+                ThreadSortKey::UpdatedAt => "updated_at",
+                ThreadSortKey::RecencyAt => "recency_at",
+                ThreadSortKey::SectionPosition => {
+                    "((stored_thread_json ->> 'section_position')::bigint)"
+                }
+            };
+            let sort_direction = match params.sort_direction {
+                SortDirection::Asc => "ASC",
+                SortDirection::Desc => "DESC",
+            };
+            let mut builder = QueryBuilder::<Postgres>::new("SELECT stored_thread_json, ");
+            builder.push(sort_column);
+            builder.push(" AS cursor_sort_value FROM threads WHERE workspace_id = ");
             builder.push_bind(workspace_id);
             if params.archived {
                 builder.push(" AND archived_at IS NOT NULL");
@@ -868,26 +909,19 @@ VALUES ($1, $2, $3, $4)
                     }
                 }
             }
-            let sort_column = match params.sort_key {
-                codex_thread_store::ThreadSortKey::CreatedAt => "created_at",
-                codex_thread_store::ThreadSortKey::UpdatedAt => "updated_at",
-                codex_thread_store::ThreadSortKey::RecencyAt => "recency_at",
-                codex_thread_store::ThreadSortKey::SectionPosition => {
-                    "((stored_thread_json ->> 'section_position')::bigint)"
-                }
-            };
-            let sort_direction = match params.sort_direction {
-                codex_thread_store::SortDirection::Asc => "ASC",
-                codex_thread_store::SortDirection::Desc => "DESC",
-            };
+            if let ThreadListCursor::Keyset(cursor) = &cursor {
+                push_keyset_cursor_filter(&mut builder, cursor, sort_column, params.sort_direction);
+            }
             builder.push(" ORDER BY ");
             builder.push(sort_column);
             builder.push(" ");
             builder.push(sort_direction);
             builder.push(", id ");
             builder.push(sort_direction);
-            builder.push(" OFFSET ");
-            builder.push_bind(offset as i64);
+            if let ThreadListCursor::LegacyOffset(offset) = cursor {
+                builder.push(" OFFSET ");
+                builder.push_bind(offset as i64);
+            }
             builder.push(" LIMIT ");
             builder.push_bind((page_size + 1) as i64);
             let rows = builder
@@ -901,14 +935,20 @@ VALUES ($1, $2, $3, $4)
                 .take(page_size)
                 .map(stored_thread_from_row)
                 .collect::<ThreadStoreResult<Vec<_>>>()?;
-            Ok(ThreadPage {
-                items,
-                next_cursor: if has_next_page {
-                    Some(encode_offset_cursor(offset + page_size)?)
-                } else {
-                    None
-                },
-            })
+            let next_cursor = if has_next_page {
+                match (rows.get(page_size - 1), items.last()) {
+                    (Some(row), Some(thread)) => Some(encode_keyset_cursor(
+                        keyset_cursor_value_from_row(row, params.sort_key)?,
+                        thread.thread_id.clone(),
+                        params.sort_key,
+                        params.sort_direction,
+                    )?),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            Ok(ThreadPage { items, next_cursor })
         })
     }
 
@@ -2238,19 +2278,118 @@ fn push_unique_key(keys: &mut Vec<String>, key: String) {
     }
 }
 
-fn decode_offset_cursor(cursor: Option<&str>) -> ThreadStoreResult<usize> {
+fn decode_thread_list_cursor(cursor: Option<&str>) -> ThreadStoreResult<ThreadListCursor> {
     let Some(cursor) = cursor else {
-        return Ok(0);
+        return Ok(ThreadListCursor::Start);
     };
-    serde_json::from_str::<OffsetCursor>(cursor)
-        .map(|cursor| cursor.offset)
-        .map_err(|err| ThreadStoreError::InvalidRequest {
-            message: format!("invalid cursor: {err}"),
-        })
+    let value = serde_json::from_str::<Value>(cursor).map_err(invalid_cursor)?;
+    if value.get("offset").is_some() {
+        return serde_json::from_value::<OffsetCursor>(value)
+            .map(|cursor| ThreadListCursor::LegacyOffset(cursor.offset))
+            .map_err(invalid_cursor);
+    }
+    serde_json::from_value::<KeysetCursor>(value)
+        .map(ThreadListCursor::Keyset)
+        .map_err(invalid_cursor)
 }
 
-fn encode_offset_cursor(offset: usize) -> ThreadStoreResult<String> {
-    serde_json::to_string(&OffsetCursor { offset }).map_err(internal_error)
+fn invalid_cursor(err: impl std::fmt::Display) -> ThreadStoreError {
+    ThreadStoreError::InvalidRequest {
+        message: format!("invalid cursor: {err}"),
+    }
+}
+
+fn validate_keyset_cursor(
+    cursor: &KeysetCursor,
+    sort_key: ThreadSortKey,
+    sort_direction: SortDirection,
+) -> ThreadStoreResult<()> {
+    if cursor.version != 1 || cursor.sort_key != sort_key || cursor.sort_direction != sort_direction
+    {
+        return Err(invalid_cursor(
+            "cursor does not match the requested sort order",
+        ));
+    }
+    match (sort_key, &cursor.value) {
+        (
+            ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt,
+            KeysetCursorValue::Timestamp(_),
+        )
+        | (ThreadSortKey::SectionPosition, KeysetCursorValue::SectionPosition(_)) => Ok(()),
+        _ => Err(invalid_cursor(
+            "cursor value does not match the requested sort key",
+        )),
+    }
+}
+
+fn push_keyset_cursor_filter(
+    builder: &mut QueryBuilder<Postgres>,
+    cursor: &KeysetCursor,
+    sort_column: &str,
+    sort_direction: SortDirection,
+) {
+    let operator = match sort_direction {
+        SortDirection::Asc => ">",
+        SortDirection::Desc => "<",
+    };
+    builder.push(" AND (");
+    builder.push(sort_column);
+    builder.push(" ");
+    builder.push(operator);
+    builder.push(" ");
+    match &cursor.value {
+        KeysetCursorValue::Timestamp(value) => {
+            builder.push_bind(value.to_owned());
+            builder.push(" OR (");
+            builder.push(sort_column);
+            builder.push(" = ");
+            builder.push_bind(value.to_owned());
+        }
+        KeysetCursorValue::SectionPosition(value) => {
+            builder.push_bind(*value);
+            builder.push(" OR (");
+            builder.push(sort_column);
+            builder.push(" = ");
+            builder.push_bind(*value);
+        }
+    }
+    builder.push(" AND id ");
+    builder.push(operator);
+    builder.push(" ");
+    builder.push_bind(cursor.thread_id.to_string());
+    builder.push("))");
+}
+
+fn keyset_cursor_value_from_row(
+    row: &sqlx::postgres::PgRow,
+    sort_key: ThreadSortKey,
+) -> ThreadStoreResult<KeysetCursorValue> {
+    match sort_key {
+        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => row
+            .try_get::<DateTime<Utc>, _>("cursor_sort_value")
+            .map(KeysetCursorValue::Timestamp)
+            .map_err(internal_error),
+        ThreadSortKey::SectionPosition => row
+            .try_get::<i64, _>("cursor_sort_value")
+            .map(KeysetCursorValue::SectionPosition)
+            .map_err(internal_error),
+    }
+}
+
+fn encode_keyset_cursor(
+    value: KeysetCursorValue,
+    thread_id: ThreadId,
+    sort_key: ThreadSortKey,
+    sort_direction: SortDirection,
+) -> ThreadStoreResult<String> {
+    serde_json::to_string(&KeysetCursor {
+        version: 1,
+        sort_key,
+        sort_direction,
+        value,
+        thread_id,
+    })
+    .map_err(internal_error)
 }
 
 fn graph_status(status: ThreadSpawnEdgeStatus) -> &'static str {
