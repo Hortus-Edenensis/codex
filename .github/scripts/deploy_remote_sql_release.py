@@ -472,7 +472,14 @@ def remote_exec(
     )
 
 
-def copy_to_pod(args: argparse.Namespace, pod: str, source: Path, destination: str) -> None:
+def copy_to_pod(
+    args: argparse.Namespace,
+    pod: str,
+    source: Path,
+    destination: str,
+    *,
+    timeout: int = 1800,
+) -> None:
     kubectl(
         args,
         "cp",
@@ -480,7 +487,7 @@ def copy_to_pod(args: argparse.Namespace, pod: str, source: Path, destination: s
         f"{pod}:{destination}",
         "-c",
         args.container,
-        timeout=1800,
+        timeout=timeout,
     )
 
 
@@ -524,6 +531,99 @@ def postgres_exec(
         input_text=script,
         timeout=timeout,
     )
+
+
+def stream_pod_file(
+    args: argparse.Namespace,
+    source_pod: str,
+    source_container: str,
+    source_path: str,
+    destination_pod: str,
+    destination_container: str,
+    destination_path: str,
+) -> None:
+    source_command = [
+        "kubectl",
+        "-n",
+        args.namespace,
+        "exec",
+        source_pod,
+        "-c",
+        source_container,
+        "--",
+        "cat",
+        source_path,
+    ]
+    destination_script = r'''set -eu
+umask 077
+destination="$1"
+[ ! -e "${destination}" ]
+cat > "${destination}"
+[ -s "${destination}" ]
+'''
+    destination_command = [
+        "kubectl",
+        "-n",
+        args.namespace,
+        "exec",
+        "-i",
+        destination_pod,
+        "-c",
+        destination_container,
+        "--",
+        "sh",
+        "-c",
+        destination_script,
+        "sh",
+        destination_path,
+    ]
+    try:
+        source = subprocess.Popen(
+            source_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise DeployError("failed to start PostgreSQL backup source stream") from exc
+    if source.stdout is None:
+        source.terminate()
+        source.wait(timeout=5)
+        raise DeployError("source Pod stream did not expose stdout")
+    try:
+        destination = subprocess.Popen(
+            destination_command,
+            stdin=source.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        source.stdout.close()
+        source.terminate()
+        source.wait(timeout=5)
+        raise DeployError("failed to start PostgreSQL backup destination stream") from exc
+    source.stdout.close()
+    try:
+        destination_stdout, destination_stderr = destination.communicate(
+            timeout=args.pg_backup_timeout
+        )
+        source_returncode = source.wait(timeout=60)
+        source_stderr = source.stderr.read() if source.stderr is not None else b""
+    except subprocess.TimeoutExpired as exc:
+        for process in (destination, source):
+            process.terminate()
+        for process in (destination, source):
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        raise DeployError("PostgreSQL backup stream timed out") from exc
+    if destination.returncode != 0 or source_returncode != 0:
+        diagnostic = destination_stderr or source_stderr or destination_stdout
+        raise DeployError(
+            "PostgreSQL backup stream failed: "
+            + redact(diagnostic.decode("utf-8", errors="replace").strip())
+        )
 
 
 def parse_safe_output(text: str, required: set[str]) -> dict[str, str]:
@@ -651,36 +751,23 @@ def backup_postgres(
         "backup name",
         f"{args.release_selector}-run{args.run_id}-attempt{args.run_attempt}",
     )
-    with tempfile.TemporaryDirectory(prefix="codex-remote-sql-backup-") as raw_dir:
-        directory = Path(raw_dir)
-        deployment_path = directory / "deployment.json"
-        metadata_path = directory / "backup-metadata.json"
-        expected_migrations_path = directory / "expected-sqlx-migrations.txt"
-        dump_path = directory / "postgres.dump"
-        restore_list_path = directory / "pg_restore.list"
-        live_migrations_path = directory / "live-sqlx-migrations.txt"
-        deployment_path.write_text(
-            json.dumps(deployment, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        metadata_path.write_text(
-            json.dumps(backup_metadata, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        expected_migrations_path.write_text(
-            "".join(f"{version}:{checksum}\n" for version, checksum in sqlx_checksums),
-            encoding="utf-8",
-        )
-        postgres_base = f"/tmp/codex-pg-backup-{os.getpid()}-{int(time.time())}"
-        postgres_dump = f"{postgres_base}.dump"
-        postgres_list = f"{postgres_base}.list"
-        postgres_migrations = f"{postgres_base}.migrations"
-        create_script = r'''set -eu
+    destination = f"{args.pg_backup_root}/{backup_name}"
+    stage = f"{args.pg_backup_root}/.staging-{backup_name}-{os.getpid()}"
+    postgres_base = f"/tmp/codex-pg-backup-{os.getpid()}-{int(time.time())}"
+    postgres_paths = {
+        "postgres.dump": f"{postgres_base}.dump",
+        "pg_restore.list": f"{postgres_base}.list",
+        "live-sqlx-migrations.txt": f"{postgres_base}.migrations",
+        "source-postgres-dump.sha256": f"{postgres_base}.sha256",
+    }
+    create_script = r'''set -eu
 umask 077
 dump="$1"
 restore_list="$2"
 live_migrations="$3"
+dump_sha="$4"
 cleanup() {
-  rm -f "${dump}" "${restore_list}" "${live_migrations}"
+  rm -f "${dump}" "${restore_list}" "${live_migrations}" "${dump_sha}"
 }
 trap cleanup EXIT HUP INT TERM
 command -v pg_dump >/dev/null 2>&1
@@ -702,123 +789,53 @@ PGPASSWORD="${POSTGRES_PASSWORD}" psql \
 [ -s "${dump}" ]
 [ -s "${restore_list}" ]
 [ -s "${live_migrations}" ]
+sha256sum "${dump}" | awk '{print $1}' > "${dump_sha}"
+[ "$(wc -l < "${dump_sha}" | tr -d ' ')" = 1 ]
 trap - EXIT HUP INT TERM
 printf 'POSTGRES_BACKUP_READY=1\n'
 '''
-        cleanup_script = r'''set -eu
-rm -f "$1" "$2" "$3"
+    cleanup_postgres_script = r'''set -eu
+rm -f "$1" "$2" "$3" "$4"
 '''
-        postgres_exec(
-            args,
-            create_script,
-            [postgres_dump, postgres_list, postgres_migrations],
-            timeout=args.pg_backup_timeout,
-        )
-        try:
-            copy_from_pod(
-                args,
-                args.postgres_pod,
-                args.postgres_container,
-                postgres_dump,
-                dump_path,
-            )
-            copy_from_pod(
-                args,
-                args.postgres_pod,
-                args.postgres_container,
-                postgres_list,
-                restore_list_path,
-            )
-            copy_from_pod(
-                args,
-                args.postgres_pod,
-                args.postgres_container,
-                postgres_migrations,
-                live_migrations_path,
-            )
-        finally:
-            postgres_exec(
-                args,
-                cleanup_script,
-                [postgres_dump, postgres_list, postgres_migrations],
-                timeout=120,
-            )
-        if live_migrations_path.read_bytes() != expected_migrations_path.read_bytes():
-            raise DeployError("live SQLx migrations did not match the release sources")
-        if dump_path.stat().st_size <= 0 or restore_list_path.stat().st_size <= 0:
-            raise DeployError("PostgreSQL backup output was empty")
-        remote_base = f"/tmp/codex-backup-{os.getpid()}-{int(time.time())}"
-        remote_paths = {
-            "deployment.json": f"{remote_base}.deployment",
-            "backup-metadata.json": f"{remote_base}.metadata",
-            "expected-sqlx-migrations.txt": f"{remote_base}.expected-migrations",
-            "live-sqlx-migrations.txt": f"{remote_base}.live-migrations",
-            "pg_restore.list": f"{remote_base}.restore-list",
-            "postgres.dump": f"{remote_base}.dump",
-        }
-        local_paths = {
-            "deployment.json": deployment_path,
-            "backup-metadata.json": metadata_path,
-            "expected-sqlx-migrations.txt": expected_migrations_path,
-            "live-sqlx-migrations.txt": live_migrations_path,
-            "pg_restore.list": restore_list_path,
-            "postgres.dump": dump_path,
-        }
-        try:
-            for name, source in local_paths.items():
-                copy_to_pod(args, pod, source, remote_paths[name])
-        except Exception:
-            kubectl(
-                args,
-                "exec",
-                pod,
-                "-c",
-                args.container,
-                "--",
-                "rm",
-                "-f",
-                *remote_paths.values(),
-                timeout=120,
-                check=False,
-            )
-            raise
-    script = r'''set -eu
+    initialize_stage_script = r'''set -eu
 umask 077
 backup_root="$1"
-backup_name="$2"
-source_deployment="$3"
-source_metadata="$4"
-source_expected_migrations="$5"
-source_live_migrations="$6"
-source_restore_list="$7"
-source_dump="$8"
-destination="${backup_root}/${backup_name}"
-stage="${backup_root}/.staging-${backup_name}-$$"
-cleanup() {
-  rm -rf "${stage}"
-  rm -f \
-    "${source_deployment}" \
-    "${source_metadata}" \
-    "${source_expected_migrations}" \
-    "${source_live_migrations}" \
-    "${source_restore_list}" \
-    "${source_dump}"
-}
-trap cleanup EXIT HUP INT TERM
+destination="$2"
+stage="$3"
 [ ! -e "${destination}" ]
+[ ! -e "${stage}" ]
 mkdir -p "${backup_root}"
 chmod 0700 "${backup_root}"
-mkdir -p "${stage}"
+mkdir "${stage}"
 chmod 0700 "${stage}"
-install -m 0600 "${source_deployment}" "${stage}/deployment.json"
-install -m 0600 "${source_metadata}" "${stage}/backup-metadata.json"
-install -m 0600 "${source_expected_migrations}" "${stage}/expected-sqlx-migrations.txt"
-install -m 0600 "${source_live_migrations}" "${stage}/live-sqlx-migrations.txt"
-install -m 0600 "${source_restore_list}" "${stage}/pg_restore.list"
-install -m 0600 "${source_dump}" "${stage}/postgres.dump"
+printf 'BACKUP_STAGE=%s\n' "${stage}"
+'''
+    cleanup_stage_script = r'''set -eu
+stage="$1"
+case "${stage}" in */.staging-*) rm -rf "${stage}" ;; *) exit 1 ;; esac
+'''
+    finalize_script = r'''set -eu
+umask 077
+stage="$1"
+destination="$2"
+[ -d "${stage}" ]
+[ ! -e "${destination}" ]
+for name in \
+  backup-metadata.json \
+  deployment.json \
+  expected-sqlx-migrations.txt \
+  live-sqlx-migrations.txt \
+  pg_restore.list \
+  postgres.dump \
+  source-postgres-dump.sha256; do
+  [ -s "${stage}/${name}" ]
+done
 cmp -s "${stage}/expected-sqlx-migrations.txt" "${stage}/live-sqlx-migrations.txt"
-[ -s "${stage}/postgres.dump" ]
-[ -s "${stage}/pg_restore.list" ]
+expected_dump_sha="$(cat "${stage}/source-postgres-dump.sha256")"
+case "${expected_dump_sha}" in *[!0-9a-f]*|'') exit 1 ;; esac
+[ "${#expected_dump_sha}" = 64 ]
+actual_dump_sha="$(sha256sum "${stage}/postgres.dump" | awk '{print $1}')"
+[ "${actual_dump_sha}" = "${expected_dump_sha}" ]
 (
   cd "${stage}"
   sha256sum \
@@ -827,60 +844,128 @@ cmp -s "${stage}/expected-sqlx-migrations.txt" "${stage}/live-sqlx-migrations.tx
     expected-sqlx-migrations.txt \
     live-sqlx-migrations.txt \
     pg_restore.list \
-    postgres.dump > SHA256SUMS.txt
+    postgres.dump \
+    source-postgres-dump.sha256 > SHA256SUMS.txt
   sha256sum --check --strict SHA256SUMS.txt >/dev/null
 )
-dump_sha="$(awk '$2 == "postgres.dump" {print $1}' "${stage}/SHA256SUMS.txt")"
 dump_bytes="$(wc -c < "${stage}/postgres.dump" | tr -d ' ')"
 list_entries="$(wc -l < "${stage}/pg_restore.list" | tr -d ' ')"
 mv "${stage}" "${destination}"
 chmod 0700 "${destination}"
 find "${destination}" -type f -exec chmod 0600 {} +
-trap - EXIT HUP INT TERM
-rm -f \
-  "${source_deployment}" \
-  "${source_metadata}" \
-  "${source_expected_migrations}" \
-  "${source_live_migrations}" \
-  "${source_restore_list}" \
-  "${source_dump}"
 printf 'BACKUP_DIR=%s\n' "${destination}"
-printf 'BACKUP_SHA256=%s\n' "${dump_sha}"
+printf 'BACKUP_SHA256=%s\n' "${actual_dump_sha}"
 printf 'BACKUP_BYTES=%s\n' "${dump_bytes}"
 printf 'RESTORE_LIST_ENTRIES=%s\n' "${list_entries}"
 '''
-    try:
-        result = remote_exec(
+    with tempfile.TemporaryDirectory(prefix="codex-remote-sql-backup-") as raw_dir:
+        directory = Path(raw_dir)
+        local_paths = {
+            "deployment.json": directory / "deployment.json",
+            "backup-metadata.json": directory / "backup-metadata.json",
+            "expected-sqlx-migrations.txt": directory
+            / "expected-sqlx-migrations.txt",
+            "live-sqlx-migrations.txt": directory / "live-sqlx-migrations.txt",
+            "pg_restore.list": directory / "pg_restore.list",
+            "source-postgres-dump.sha256": directory
+            / "source-postgres-dump.sha256",
+        }
+        local_paths["deployment.json"].write_text(
+            json.dumps(deployment, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        local_paths["backup-metadata.json"].write_text(
+            json.dumps(backup_metadata, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        local_paths["expected-sqlx-migrations.txt"].write_text(
+            "".join(f"{version}:{checksum}\n" for version, checksum in sqlx_checksums),
+            encoding="utf-8",
+        )
+        postgres_exec(
             args,
-            pod,
-            script,
-            [
-                args.pg_backup_root,
-                backup_name,
-                remote_paths["deployment.json"],
-                remote_paths["backup-metadata.json"],
-                remote_paths["expected-sqlx-migrations.txt"],
-                remote_paths["live-sqlx-migrations.txt"],
-                remote_paths["pg_restore.list"],
-                remote_paths["postgres.dump"],
-            ],
+            create_script,
+            list(postgres_paths.values()),
             timeout=args.pg_backup_timeout,
         )
-    except Exception:
-        kubectl(
-            args,
-            "exec",
-            pod,
-            "-c",
-            args.container,
-            "--",
-            "rm",
-            "-f",
-            *remote_paths.values(),
-            timeout=120,
-            check=False,
-        )
-        raise
+        try:
+            for name in (
+                "pg_restore.list",
+                "live-sqlx-migrations.txt",
+                "source-postgres-dump.sha256",
+            ):
+                copy_from_pod(
+                    args,
+                    args.postgres_pod,
+                    args.postgres_container,
+                    postgres_paths[name],
+                    local_paths[name],
+                )
+            if (
+                local_paths["live-sqlx-migrations.txt"].read_bytes()
+                != local_paths["expected-sqlx-migrations.txt"].read_bytes()
+            ):
+                raise DeployError("live SQLx migrations did not match release sources")
+            source_dump_sha = local_paths[
+                "source-postgres-dump.sha256"
+            ].read_text(encoding="utf-8").strip()
+            if not SHA256_RE.fullmatch(source_dump_sha):
+                raise DeployError("PostgreSQL source dump returned an invalid SHA-256")
+            if local_paths["pg_restore.list"].stat().st_size <= 0:
+                raise DeployError("PostgreSQL restore list was empty")
+            stage_result = remote_exec(
+                args,
+                pod,
+                initialize_stage_script,
+                [args.pg_backup_root, destination, stage],
+                timeout=120,
+            )
+            stage_values = parse_safe_output(stage_result.stdout, {"BACKUP_STAGE"})
+            if stage_values["BACKUP_STAGE"] != stage:
+                raise DeployError("workspace returned an unexpected backup stage")
+            try:
+                for name, source in local_paths.items():
+                    copy_to_pod(
+                        args,
+                        pod,
+                        source,
+                        f"{stage}/{name}",
+                        timeout=args.pg_backup_timeout,
+                    )
+                stream_pod_file(
+                    args,
+                    args.postgres_pod,
+                    args.postgres_container,
+                    postgres_paths["postgres.dump"],
+                    pod,
+                    args.container,
+                    f"{stage}/postgres.dump",
+                )
+                result = remote_exec(
+                    args,
+                    pod,
+                    finalize_script,
+                    [stage, destination],
+                    timeout=args.pg_backup_timeout,
+                )
+            except Exception:
+                try:
+                    remote_exec(
+                        args,
+                        pod,
+                        cleanup_stage_script,
+                        [stage],
+                        timeout=120,
+                    )
+                except DeployError:
+                    pass
+                raise
+        finally:
+            postgres_exec(
+                args,
+                cleanup_postgres_script,
+                list(postgres_paths.values()),
+                timeout=120,
+            )
     values = parse_safe_output(
         result.stdout,
         {"BACKUP_DIR", "BACKUP_SHA256", "BACKUP_BYTES", "RESTORE_LIST_ENTRIES"},

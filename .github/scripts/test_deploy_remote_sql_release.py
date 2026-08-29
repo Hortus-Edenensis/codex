@@ -356,10 +356,10 @@ class ReleaseScriptTests(unittest.TestCase):
             source: str,
             destination: Path,
         ) -> None:
-            if source.endswith(".dump"):
-                destination.write_bytes(b"custom-dump")
-            elif source.endswith(".list"):
+            if source.endswith(".list"):
                 destination.write_text("restore-entry\n", encoding="utf-8")
+            elif source.endswith(".sha256"):
+                destination.write_text("b" * 64 + "\n", encoding="utf-8")
             else:
                 destination.write_text(f"1:{checksum}\n", encoding="utf-8")
 
@@ -371,11 +371,22 @@ class ReleaseScriptTests(unittest.TestCase):
                 + "\nBACKUP_BYTES=11\nRESTORE_LIST_ENTRIES=1\n"
             )
         )
+        def remote_result(
+            _args: argparse.Namespace,
+            _pod: str,
+            script: str,
+            script_args: list[str],
+            **_kwargs: object,
+        ) -> mock.Mock:
+            if "BACKUP_STAGE=" in script:
+                return mock.Mock(stdout=f"BACKUP_STAGE={script_args[2]}\n")
+            return safe
+
         with mock.patch.object(deploy, "postgres_exec") as postgres_exec, mock.patch.object(
             deploy, "copy_from_pod", side_effect=materialize
         ) as copy_from, mock.patch.object(deploy, "copy_to_pod") as copy_to, mock.patch.object(
-            deploy, "remote_exec", return_value=safe
-        ):
+            deploy, "remote_exec", side_effect=remote_result
+        ) as remote_exec, mock.patch.object(deploy, "stream_pod_file") as stream:
             result = deploy.backup_postgres(
                 args,
                 "workspace-pod",
@@ -387,6 +398,44 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertEqual(postgres_exec.call_count, 2)
         self.assertEqual(copy_from.call_count, 3)
         self.assertEqual(copy_to.call_count, 6)
+        self.assertEqual(remote_exec.call_count, 2)
+        stream.assert_called_once()
+
+    def test_stream_pod_file_pipes_without_runner_staging(self) -> None:
+        args = argparse.Namespace(
+            namespace="codex-internal",
+            pg_backup_timeout=60,
+        )
+        source_stdout = mock.Mock()
+        source_stderr = mock.Mock()
+        source_stderr.read.return_value = b""
+        source = mock.Mock(
+            stdout=source_stdout,
+            stderr=source_stderr,
+            returncode=0,
+        )
+        source.wait.return_value = 0
+        destination = mock.Mock(returncode=0)
+        destination.communicate.return_value = (b"", b"")
+        with mock.patch.object(
+            deploy.subprocess, "Popen", side_effect=[source, destination]
+        ) as popen:
+            deploy.stream_pod_file(
+                args,
+                "postgres-pod",
+                "postgres",
+                "/tmp/source.dump",
+                "workspace-pod",
+                "workspace",
+                "/backups/.staging/postgres.dump",
+            )
+        self.assertEqual(popen.call_count, 2)
+        self.assertIs(
+            popen.call_args_list[1].kwargs["stdin"],
+            source_stdout,
+        )
+        destination.communicate.assert_called_once_with(timeout=60)
+        source_stdout.close.assert_called_once()
 
     def test_parse_args_accepts_positive_release_id_for_prepare(self) -> None:
         argv = [
