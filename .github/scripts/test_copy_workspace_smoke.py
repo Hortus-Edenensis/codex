@@ -166,6 +166,8 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
         self.assertIn("PGPASSWORD", script)
         self.assertIn("-h 127.0.0.1", script)
         self.assertIn("${POSTGRES_DB}", script)
+        self.assertIn("id = '${thread_id}'", script)
+        self.assertNotIn(":'thread_id'", script)
         self.assertNotIn("CODEX_REMOTE_SQL_URL", script)
 
     def test_turns_page_fails_closed_on_empty_history(self) -> None:

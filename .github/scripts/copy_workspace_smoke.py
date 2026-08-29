@@ -555,8 +555,8 @@ case "${thread_id}" in ''|*[!0-9a-f-]*) exit 1 ;; esac
 mode="$(PGPASSWORD="${POSTGRES_PASSWORD}" psql \
   -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
   -XAtq \
-  -v ON_ERROR_STOP=1 -v thread_id="${thread_id}" \
-  -c "SELECT memory_mode FROM threads WHERE id = :'thread_id'")"
+  -v ON_ERROR_STOP=1 \
+  -c "SELECT memory_mode FROM threads WHERE id = '${thread_id}'")"
 case "${mode}" in enabled|disabled) ;; *) exit 1 ;; esac
 printf 'MEMORY_MODE=%s\n' "${mode}"
 '''
