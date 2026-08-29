@@ -721,7 +721,8 @@ binary_sha="$(sha256sum "${binary}" | awk '{print $1}')"
 selected_sha="$(sha256sum "${selected}" | awk '{print $1}')"
 [ "${binary_sha}" = "${selected_sha}" ]
 version_output="$("${binary}" --version)"
-case "${version_output}" in *"${release_selector}"*) ;; *) exit 1 ;; esac
+[ -n "${version_output}" ]
+printf 'SELECTED_RELEASE_MATCH=1\n'
 printf 'BINARY_SHA256=%s\n' "${binary_sha}"
 printf 'VERSION_OUTPUT=%s\n' "${version_output}"
 '''
@@ -732,11 +733,14 @@ printf 'VERSION_OUTPUT=%s\n' "${version_output}"
         [args.release_root, release_selector],
         timeout=120,
     )
-    values = parse_safe_output(result.stdout, {"BINARY_SHA256", "VERSION_OUTPUT"})
+    values = parse_safe_output(
+        result.stdout,
+        {"SELECTED_RELEASE_MATCH", "BINARY_SHA256", "VERSION_OUTPUT"},
+    )
+    if values["SELECTED_RELEASE_MATCH"] != "1":
+        raise DeployError("selected release did not match its immutable directory")
     if not SHA256_RE.fullmatch(values["BINARY_SHA256"]):
         raise DeployError("selected release returned an invalid SHA-256")
-    if release_selector not in values["VERSION_OUTPUT"]:
-        raise DeployError("selected release returned an unexpected version")
     return values
 
 

@@ -209,6 +209,27 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertEqual(parts[:2], ("rollout", "status"))
         self.assertEqual(parts.count("rollout"), 1)
 
+    def test_selected_release_identity_uses_binary_sha_not_directory_name(self) -> None:
+        selector = "copy-workspace-0.142.5-build-x86_64-unknown-linux-gnu"
+        version = "codex-cli 0.142.5-remote-sql-copy.56+03efbd5ef6b9"
+        digest = "a" * 64
+        result = mock.Mock(
+            stdout=(
+                "SELECTED_RELEASE_MATCH=1\n"
+                f"BINARY_SHA256={digest}\n"
+                f"VERSION_OUTPUT={version}\n"
+            )
+        )
+        args = argparse.Namespace(
+            namespace="codex-internal",
+            container="workspace",
+            release_root="/releases",
+        )
+        with mock.patch.object(deploy, "remote_exec", return_value=result):
+            inspected = deploy.inspect_selected_release(args, "workspace-pod", selector)
+        self.assertEqual(inspected["BINARY_SHA256"], digest)
+        self.assertEqual(inspected["VERSION_OUTPUT"], version)
+
     def test_migration_manifest_locks_sha256_and_derives_sqlx_sha384(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
