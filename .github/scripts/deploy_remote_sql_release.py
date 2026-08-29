@@ -1133,6 +1133,7 @@ def rollback_annotation_patch(
 def prepare(args: argparse.Namespace) -> None:
     require_safe_name("release selector", args.release_selector)
     deployment = deployment_document(args)
+    print("PREPARE_STAGE=deployment_loaded", flush=True)
     metadata = deployment.get("metadata", {})
     uid = metadata.get("uid")
     resource_version = metadata.get("resourceVersion")
@@ -1144,6 +1145,7 @@ def prepare(args: argparse.Namespace) -> None:
     old_release = release_from_script(old_command_script, args.release_variable)
     if old_release == args.release_selector:
         raise DeployError("deployment already selects the requested release")
+    print("PREPARE_STAGE=old_selector_loaded", flush=True)
     new_command_script = replace_release_in_script(
         old_command_script,
         args.release_variable,
@@ -1156,11 +1158,15 @@ def prepare(args: argparse.Namespace) -> None:
             raise DeployError(
                 "release annotations disagree with the startup script selector"
             )
+    print("PREPARE_STAGE=old_annotations_verified", flush=True)
     old_pod = select_ready_pod(args, deployment, old_release)
+    print("PREPARE_STAGE=old_pod_selected", flush=True)
     old_release_info = inspect_selected_release(args, old_pod, old_release)
+    print("PREPARE_STAGE=old_release_verified", flush=True)
     sqlx_checksums = expected_sqlx_migrations(
         args.repository_root.resolve(), args.migration_manifest.resolve()
     )
+    print("PREPARE_STAGE=migration_sources_verified", flush=True)
     with tempfile.TemporaryDirectory(prefix="codex-remote-sql-release-") as raw_dir:
         directory = Path(raw_dir)
         assets = release_assets(args, directory)
@@ -1196,6 +1202,7 @@ def prepare(args: argparse.Namespace) -> None:
             assets[args.sums_name],
             sums["codex"],
         )
+    print("PREPARE_STAGE=immutable_release_ready", flush=True)
     deployment_annotations = metadata.get("annotations")
     deployment_revision = (
         deployment_annotations.get("deployment.kubernetes.io/revision")
@@ -1225,6 +1232,7 @@ def prepare(args: argparse.Namespace) -> None:
         "runAttempt": args.run_attempt,
         "knownResumeThreadId": args.resume_thread_id,
     }
+    print("PREPARE_STAGE=postgres_backup_start", flush=True)
     backup = backup_postgres(
         args,
         old_pod,
@@ -1232,6 +1240,7 @@ def prepare(args: argparse.Namespace) -> None:
         backup_metadata,
         sqlx_checksums,
     )
+    print("PREPARE_STAGE=postgres_backup_ready", flush=True)
     state = {
         "stateVersion": STATE_VERSION,
         "stage": "prepared",
