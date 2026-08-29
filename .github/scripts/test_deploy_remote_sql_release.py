@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -251,6 +252,7 @@ class ReleaseScriptTests(unittest.TestCase):
         args = argparse.Namespace(
             github_token_env="GITHUB_TOKEN",
             repository="owner/repository",
+            release_id=42,
             release_tag="v0.151.0-remote-sql-copy.1",
             archive_name="release.tar.gz",
             sums_name="SHA256SUMS.txt",
@@ -263,6 +265,7 @@ class ReleaseScriptTests(unittest.TestCase):
             "unexpected.txt",
         ]
         release = {
+            "id": args.release_id,
             "draft": True,
             "tag_name": args.release_tag,
             "assets": [
@@ -277,6 +280,143 @@ class ReleaseScriptTests(unittest.TestCase):
                 with self.assertRaisesRegex(deploy.DeployError, "asset set"):
                     deploy.release_assets(args, Path(raw))
         download.assert_not_called()
+
+    def test_release_download_uses_release_id_endpoint(self) -> None:
+        args = argparse.Namespace(
+            github_token_env="GITHUB_TOKEN",
+            repository="owner/repository",
+            release_id=42,
+            release_tag="v0.151.0-remote-sql-copy.1",
+            archive_name="release.tar.gz",
+            sums_name="SHA256SUMS.txt",
+            provenance_name="PROVENANCE.txt",
+        )
+        release = {
+            "id": args.release_id,
+            "draft": True,
+            "tag_name": args.release_tag,
+            "assets": [
+                {"id": 1, "name": args.archive_name},
+                {"id": 2, "name": args.sums_name},
+                {"id": 3, "name": args.provenance_name},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            with mock.patch.dict(deploy.os.environ, {"GITHUB_TOKEN": "test-token"}), mock.patch.object(
+                deploy, "github_json", return_value=release
+            ) as github_json, mock.patch.object(deploy, "download_url"):
+                deploy.release_assets(args, Path(raw))
+        github_json.assert_called_once_with(
+            "https://api.github.com/repos/owner/repository/releases/42",
+            "test-token",
+        )
+
+    def test_release_download_rejects_mismatched_release_id(self) -> None:
+        args = argparse.Namespace(
+            github_token_env="GITHUB_TOKEN",
+            repository="owner/repository",
+            release_id=42,
+            release_tag="v0.151.0-remote-sql-copy.1",
+            archive_name="release.tar.gz",
+            sums_name="SHA256SUMS.txt",
+            provenance_name="PROVENANCE.txt",
+        )
+        release = {
+            "id": 43,
+            "draft": True,
+            "tag_name": args.release_tag,
+            "assets": [],
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            with mock.patch.dict(deploy.os.environ, {"GITHUB_TOKEN": "test-token"}), mock.patch.object(
+                deploy, "github_json", return_value=release
+            ), mock.patch.object(deploy, "download_url") as download:
+                with self.assertRaisesRegex(deploy.DeployError, "Release id"):
+                    deploy.release_assets(args, Path(raw))
+        download.assert_not_called()
+
+    def test_parse_args_accepts_positive_release_id_for_prepare(self) -> None:
+        argv = [
+            "deploy_remote_sql_release.py",
+            "prepare",
+            "--namespace",
+            "codex-internal",
+            "--deployment",
+            "codex-workspace-copy",
+            "--container",
+            "workspace",
+            "--release-root",
+            "/releases",
+            "--pg-backup-root",
+            "/backups",
+            "--state-file",
+            "/tmp/state.json",
+            "--resume-thread-id",
+            "known-thread",
+            "--repository",
+            "owner/repository",
+            "--release-tag",
+            "v0.151.0-remote-sql-copy.1",
+            "--release-id",
+            "42",
+            "--runtime-version",
+            "0.151.0-remote-sql-copy.1+150745544e68",
+            "--source-sha",
+            "150745544e6841702655579c78e21803f9b2927b",
+            "--release-selector",
+            "copy-workspace-0.151.0",
+            "--archive-name",
+            "release.tar.gz",
+            "--run-id",
+            "123",
+            "--run-attempt",
+            "1",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            args = deploy.parse_args()
+        self.assertEqual(args.release_id, 42)
+
+    def test_parse_args_rejects_non_positive_release_id_for_prepare(self) -> None:
+        base_argv = [
+            "deploy_remote_sql_release.py",
+            "prepare",
+            "--namespace",
+            "codex-internal",
+            "--deployment",
+            "codex-workspace-copy",
+            "--container",
+            "workspace",
+            "--release-root",
+            "/releases",
+            "--pg-backup-root",
+            "/backups",
+            "--state-file",
+            "/tmp/state.json",
+            "--resume-thread-id",
+            "known-thread",
+            "--repository",
+            "owner/repository",
+            "--release-tag",
+            "v0.151.0-remote-sql-copy.1",
+            "--runtime-version",
+            "0.151.0-remote-sql-copy.1+150745544e68",
+            "--source-sha",
+            "150745544e6841702655579c78e21803f9b2927b",
+            "--release-selector",
+            "copy-workspace-0.151.0",
+            "--archive-name",
+            "release.tar.gz",
+            "--run-id",
+            "123",
+            "--run-attempt",
+            "1",
+        ]
+        for invalid in ("0", "-1", "abc"):
+            with self.subTest(release_id=invalid):
+                argv = [*base_argv, "--release-id", invalid]
+                with mock.patch.object(sys, "argv", argv):
+                    with self.assertRaises(SystemExit):
+                        deploy.parse_args()
 
 
 if __name__ == "__main__":

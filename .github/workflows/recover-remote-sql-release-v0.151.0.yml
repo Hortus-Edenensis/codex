@@ -1,0 +1,357 @@
+name: recover-remote-sql-release-v0.151.0
+
+on:
+  push:
+    branches:
+      - ci/recover-v0.151.0-remote-sql-copy.1
+
+concurrency:
+  group: recover-remote-sql-release-v0.151.0
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  EXPECTED_TAG: v0.151.0-remote-sql-copy.1
+  EXPECTED_RELEASE_ID: "378845254"
+  ARCHIVE_NAME: codex-0.151.0-remote-sql-copy.1-150745544e68-x86_64-unknown-linux-gnu.tar.gz
+  RUNTIME_VERSION: 0.151.0-remote-sql-copy.1+150745544e68
+  SOURCE_SHA: 150745544e6841702655579c78e21803f9b2927b
+
+jobs:
+  deploy-copy-workspace:
+    name: Recover deployment from the verified draft asset
+    runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
+    timeout-minutes: 55
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    env:
+      COPY_CONTAINER: ${{ vars.COPY_WORKSPACE_CONTAINER || 'workspace' }}
+      COPY_DEPLOYMENT: ${{ vars.COPY_WORKSPACE_DEPLOYMENT || 'codex-workspace-copy' }}
+      COPY_NAMESPACE: ${{ vars.COPY_WORKSPACE_NAMESPACE || 'codex-internal' }}
+      COPY_RELEASE_ROOT: ${{ vars.COPY_WORKSPACE_RELEASE_ROOT || '/workspace/shared-state/.git/codex-persist/codex-standalone/releases' }}
+      COPY_BACKUP_ROOT: ${{ vars.COPY_WORKSPACE_BACKUP_ROOT || '/workspace/shared-state/.git/codex-persist/private-backups/codex-workspace-copy' }}
+      COPY_RESUME_THREAD_ID: ${{ vars.COPY_WORKSPACE_RESUME_THREAD_ID || '019f1846-9419-7853-b035-f2ba0fad3d72' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Resolve the exact authenticated draft Release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_id="$(
+            gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              | python3 -c '
+          import json
+          import os
+          import sys
+
+          pages = json.load(sys.stdin)
+          releases = [release for page in pages for release in page]
+          matches = [
+              release
+              for release in releases
+              if release.get("draft") is True
+              and release.get("tag_name") == os.environ["EXPECTED_TAG"]
+          ]
+          if len(matches) != 1:
+              raise SystemExit(f"expected one matching draft Release, found {len(matches)}")
+          release = matches[0]
+          if str(release.get("id")) != os.environ["EXPECTED_RELEASE_ID"]:
+              raise SystemExit("draft Release id mismatch")
+          expected = {os.environ["ARCHIVE_NAME"], "SHA256SUMS.txt", "PROVENANCE.txt"}
+          names = [asset.get("name") for asset in release.get("assets", [])]
+          if len(names) != len(expected) or set(names) != expected:
+              raise SystemExit(f"draft Release asset set mismatch: {sorted(names)}")
+          print(release["id"])
+          '
+          )"
+          test "${release_id}" = "${EXPECTED_RELEASE_ID}"
+          printf 'release_id=%s\n' "${release_id}" >> "${GITHUB_OUTPUT}"
+      - name: Lock the annotated tag to the built source commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${EXPECTED_TAG}" \
+            --jq '.object.type + ":" + .object.sha')"
+          test "${tag_object%%:*}" = tag
+          tag_sha="${tag_object#*:}"
+          target="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" \
+            --jq '.object.type + ":" + .object.sha')"
+          test "${target}" = "commit:${SOURCE_SHA}"
+      - name: Initialize runner-local deployment state paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'DEPLOY_STATE=%s\nSMOKE_STATE=%s\n' \
+            "${RUNNER_TEMP}/remote-sql-deploy-state.json" \
+            "${RUNNER_TEMP}/remote-sql-smoke-state.json" >> "${GITHUB_ENV}"
+      - name: Recheck migration source on the deployment runner
+        run: sha256sum --check --strict .github/remote-sql-migrations.sha256
+      - name: Resolve the one ready old-release Pod
+        id: current
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_json="$(python3 .github/scripts/deploy_remote_sql_release.py current-pod \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}")"
+          pod="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pod"])' <<<"${current_json}")"
+          test -n "${pod}"
+          printf 'pod=%s\n' "${pod}" >> "${GITHUB_OUTPUT}"
+      - name: Wait up to 15 minutes for all existing work to become idle
+        run: |
+          python3 .github/scripts/copy_workspace_smoke.py wait-idle \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.current.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --idle-timeout-seconds 900
+      - name: Resolve and record an existing nonempty historical thread
+        id: known
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolved="$(python3 .github/scripts/copy_workspace_smoke.py resolve-known \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.current.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}")"
+          thread_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["threadId"])' <<<"${resolved}")"
+          test -n "${thread_id}"
+          printf '%s\n' "${resolved}"
+          printf 'COPY_RESUME_THREAD_ID=%s\n' "${thread_id}" >> "${GITHUB_ENV}"
+          printf 'thread_id=%s\n' "${thread_id}" >> "${GITHUB_OUTPUT}"
+      - name: Download draft assets, install immutable directory, and back up PostgreSQL
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/deploy_remote_sql_release.py prepare \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --release-id "${{ steps.draft.outputs.release_id }}" \
+            --release-tag "${EXPECTED_TAG}" \
+            --runtime-version "${RUNTIME_VERSION}" \
+            --source-sha "${SOURCE_SHA}" \
+            --release-selector "${RUNTIME_VERSION}" \
+            --archive-name "${ARCHIVE_NAME}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --repository-root "${GITHUB_WORKSPACE}" \
+            --migration-manifest "${GITHUB_WORKSPACE}/.github/remote-sql-migrations.sha256"
+      - name: Recheck the idle gate immediately before selector CAS
+        run: |
+          python3 .github/scripts/copy_workspace_smoke.py wait-idle \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.current.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --idle-timeout-seconds 900
+      - name: Dry-run and apply the command plus annotation CAS
+        id: activate
+        run: |
+          python3 .github/scripts/deploy_remote_sql_release.py activate \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}"
+      - name: Read the activated Pod from deployment state
+        id: activated
+        shell: bash
+        run: |
+          set -euo pipefail
+          pod="$(python3 -c 'import json,os; print(json.load(open(os.environ["DEPLOY_STATE"]))["newPod"])')"
+          test -n "${pod}"
+          printf 'pod=%s\n' "${pod}" >> "${GITHUB_OUTPUT}"
+      - name: Verify known resume, Kimi turn, goal, memory, and fork deduplication
+        id: smoke-pre
+        run: |
+          python3 .github/scripts/copy_workspace_smoke.py pre-restart \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.activated.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --state-file "${SMOKE_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}" \
+            --model kimi-k3 \
+            --model-provider kimi \
+            --cwd /workspace/repo
+      - name: Restart the managed app-server daemon
+        run: |
+          python3 .github/scripts/deploy_remote_sql_release.py restart-daemon \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}"
+      - name: Verify persistence after daemon restart
+        run: |
+          python3 .github/scripts/copy_workspace_smoke.py post-restart \
+            --namespace "${COPY_NAMESPACE}" \
+            --pod "${{ steps.activated.outputs.pod }}" \
+            --container "${COPY_CONTAINER}" \
+            --state-file "${SMOKE_STATE}"
+      - name: Remove only release-created smoke threads
+        if: always()
+        continue-on-error: true
+        run: |
+          if test -f "${SMOKE_STATE}" && test -n "${{ steps.activated.outputs.pod }}"; then
+            python3 .github/scripts/copy_workspace_smoke.py cleanup \
+              --namespace "${COPY_NAMESPACE}" \
+              --pod "${{ steps.activated.outputs.pod }}" \
+              --container "${COPY_CONTAINER}" \
+              --state-file "${SMOKE_STATE}"
+          fi
+      - name: CAS rollback on any failed deployment or smoke gate
+        if: failure() && steps.prepare.outcome == 'success'
+        run: |
+          python3 .github/scripts/deploy_remote_sql_release.py rollback \
+            --namespace "${COPY_NAMESPACE}" \
+            --deployment "${COPY_DEPLOYMENT}" \
+            --container "${COPY_CONTAINER}" \
+            --release-root "${COPY_RELEASE_ROOT}" \
+            --pg-backup-root "${COPY_BACKUP_ROOT}" \
+            --state-file "${DEPLOY_STATE}" \
+            --resume-thread-id "${COPY_RESUME_THREAD_ID}"
+
+  publish-release:
+    name: Publish the draft only after recovered deployment evidence passes
+    needs: deploy-copy-workspace
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_ID: ${{ needs.deploy-copy-workspace.outputs.release_id }}
+    steps:
+      - name: Re-download and verify the exact draft assets by release id
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          verify_dir="${RUNNER_TEMP}/publish-release-verify"
+          rm -rf "${verify_dir}"
+          mkdir -p "${verify_dir}"
+          asset_fingerprint() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              | python3 -c '
+          import json
+          import os
+          import sys
+
+          release = json.load(sys.stdin)
+          if release.get("draft") is not True:
+              raise SystemExit("Release is no longer a draft")
+          if release.get("tag_name") != os.environ["EXPECTED_TAG"]:
+              raise SystemExit("Release tag mismatch")
+          expected = {os.environ["ARCHIVE_NAME"], "SHA256SUMS.txt", "PROVENANCE.txt"}
+          assets = release.get("assets", [])
+          names = [asset.get("name") for asset in assets]
+          if len(names) != len(expected) or set(names) != expected:
+              raise SystemExit(f"draft Release asset set mismatch: {sorted(names)}")
+          print("\n".join(
+              ":".join(str(asset[key]) for key in ("name", "id", "size", "updated_at"))
+              for asset in sorted(assets, key=lambda item: item["name"])
+          ))
+          '
+          }
+          before_assets="$(asset_fingerprint)"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            | python3 -c '
+          import json
+          import sys
+
+          release = json.load(sys.stdin)
+          for asset in release["assets"]:
+              print("{}\t{}".format(asset["name"], asset["id"]))
+          ' \
+            | while IFS=$'\t' read -r name asset_id; do
+                gh api \
+                  -H 'Accept: application/octet-stream' \
+                  "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                  > "${verify_dir}/${name}"
+              done
+          python3 - "${verify_dir}" "${ARCHIVE_NAME}" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          root = Path(sys.argv[1])
+          archive_name = sys.argv[2]
+          expected_names = {archive_name, "PROVENANCE.txt", "codex"}
+          sums = {}
+          for line in (root / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, name = line.split(maxsplit=1)
+              name = name.lstrip("*")
+              if name in sums or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                  raise SystemExit("invalid SHA256SUMS.txt")
+              sums[name] = digest
+          if set(sums) != expected_names:
+              raise SystemExit("SHA256SUMS.txt entry set mismatch")
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          archive_bytes = (root / archive_name).read_bytes()
+          standalone_provenance = (root / "PROVENANCE.txt").read_bytes()
+          if sha256(archive_bytes) != sums[archive_name]:
+              raise SystemExit("archive SHA-256 mismatch")
+          if sha256(standalone_provenance) != sums["PROVENANCE.txt"]:
+              raise SystemExit("standalone provenance SHA-256 mismatch")
+          with tarfile.open(root / archive_name, "r:gz") as bundle:
+              members = bundle.getmembers()
+              names = [member.name for member in members]
+              if len(names) != 2 or set(names) != {"codex", "PROVENANCE.txt"}:
+                  raise SystemExit("archive member set mismatch")
+              if not all(member.isfile() for member in members):
+                  raise SystemExit("archive contains a non-file member")
+              codex = bundle.extractfile("codex")
+              provenance = bundle.extractfile("PROVENANCE.txt")
+              if codex is None or provenance is None:
+                  raise SystemExit("archive member could not be read")
+              codex_bytes = codex.read()
+              bundled_provenance = provenance.read()
+          if sha256(codex_bytes) != sums["codex"]:
+              raise SystemExit("archive codex SHA-256 mismatch")
+          if bundled_provenance != standalone_provenance:
+              raise SystemExit("bundled and standalone provenance differ")
+          PY
+          after_assets="$(asset_fingerprint)"
+          test "${before_assets}" = "${after_assets}"
+      - name: Publish the re-verified draft by release id
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false \
+            -F prerelease=true \
+            -f make_latest=false \
+            --jq '.draft == false and .prerelease == true and .tag_name == "v0.151.0-remote-sql-copy.1"' \
+            | grep -qx true

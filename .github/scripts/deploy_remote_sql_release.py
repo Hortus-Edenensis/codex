@@ -88,6 +88,16 @@ def require_safe_name(label: str, value: str) -> str:
     return value
 
 
+def positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def deployment_document(args: argparse.Namespace) -> dict[str, Any]:
     deployment = kubectl_json(args, "get", "deployment", args.deployment)
     require_supported_deployment_shape(deployment)
@@ -399,8 +409,10 @@ def release_assets(args: argparse.Namespace, directory: Path) -> dict[str, Path]
         raise DeployError(f"{args.github_token_env} is not set")
     api_root = "https://api.github.com"
     release = github_json(
-        f"{api_root}/repos/{args.repository}/releases/tags/{args.release_tag}", token
+        f"{api_root}/repos/{args.repository}/releases/{args.release_id}", token
     )
+    if release.get("id") != args.release_id:
+        raise DeployError("GitHub Release id did not match the requested release")
     if release.get("draft") is not True:
         raise DeployError("deployment requires an authenticated draft GitHub Release")
     if release.get("tag_name") != args.release_tag:
@@ -1358,6 +1370,7 @@ def parse_args() -> argparse.Namespace:
     add_common_arguments(prepare_parser)
     prepare_parser.add_argument("--repository", required=True)
     prepare_parser.add_argument("--release-tag", required=True)
+    prepare_parser.add_argument("--release-id", type=positive_int_arg, required=True)
     prepare_parser.add_argument("--runtime-version", required=True)
     prepare_parser.add_argument("--source-sha", required=True)
     prepare_parser.add_argument("--release-selector", required=True)
