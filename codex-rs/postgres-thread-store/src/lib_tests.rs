@@ -231,13 +231,29 @@ async fn unconfigured_store_rejects_remote_control_persistence_requests() {
 }
 
 #[test]
-fn postgres_store_defaults_to_paginated_history() {
+fn postgres_store_defaults_to_legacy_history_without_paginated_lists() {
     let store = PostgresThreadStore::unconfigured("missing database url".to_string());
 
     assert_eq!(
         ThreadStore::default_history_mode(&store),
-        ThreadHistoryMode::Paginated
+        ThreadHistoryMode::Legacy
     );
+    assert!(!ThreadStore::supports_paginated_history_lists(&store));
+}
+
+#[test]
+fn stored_paginated_history_is_normalized_to_legacy_on_read() {
+    let stored = StoredThread {
+        history_mode: ThreadHistoryMode::Paginated,
+        ..sample_stored_thread()
+    };
+
+    let restored = stored_thread_from_value(
+        serde_json::to_value(stored).expect("serialize paginated stored thread"),
+    )
+    .expect("deserialize stored thread");
+
+    assert_eq!(restored.history_mode, ThreadHistoryMode::Legacy);
 }
 
 #[derive(Default)]

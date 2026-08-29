@@ -479,7 +479,8 @@ impl ThreadStore for PostgresThreadStore {
     }
 
     fn default_history_mode(&self) -> ThreadHistoryMode {
-        ThreadHistoryMode::Paginated
+        // PostgreSQL persists rollout items but does not implement the paginated turn/item lists.
+        ThreadHistoryMode::Legacy
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
@@ -2006,7 +2007,15 @@ fn thread_history_mode_key(history_mode: ThreadHistoryMode) -> &'static str {
 
 fn stored_thread_from_row(row: &sqlx::postgres::PgRow) -> ThreadStoreResult<StoredThread> {
     let value: serde_json::Value = row.try_get("stored_thread_json").map_err(internal_error)?;
-    serde_json::from_value(value).map_err(internal_error)
+    stored_thread_from_value(value)
+}
+
+fn stored_thread_from_value(value: Value) -> ThreadStoreResult<StoredThread> {
+    let mut stored: StoredThread = serde_json::from_value(value).map_err(internal_error)?;
+    // Older releases labeled rows as paginated even though this store never supported the
+    // paginated history primitives. Normalize at the store boundary so those rows replay safely.
+    stored.history_mode = ThreadHistoryMode::Legacy;
+    Ok(stored)
 }
 
 fn push_exclude_empty_shell_threads(builder: &mut QueryBuilder<Postgres>) {
