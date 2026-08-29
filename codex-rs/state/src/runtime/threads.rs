@@ -524,12 +524,14 @@ ON CONFLICT(child_thread_id) DO NOTHING
             items.push(item);
         }
         let num_scanned_rows = items.len();
+        let include_thread_id_tiebreaker =
+            relation_filter.is_some() || sort_key_uses_thread_id_tiebreaker(filters.sort_key);
         let next_anchor = if items.len() > page_size {
             if let Some(overflow_item) = items.pop() {
                 parent_thread_ids.remove(&overflow_item.id);
             }
             items.last().and_then(|item| {
-                anchor_from_item(item, filters.sort_key, relation_filter.is_some())
+                anchor_from_item(item, filters.sort_key, include_thread_id_tiebreaker)
             })
         } else {
             None
