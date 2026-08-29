@@ -38,8 +38,16 @@ jobs:
       COPY_POSTGRES_CONTAINER: ${{ vars.COPY_WORKSPACE_POSTGRES_CONTAINER || 'postgres' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: http.version
+          GIT_CONFIG_VALUE_0: HTTP/1.1
         with:
           persist-credentials: false
+          show-progress: false
+          sparse-checkout: |
+            .github
+            codex-rs/postgres-thread-store/migrations
       - name: Resolve the exact authenticated draft Release
         id: draft
         env:
