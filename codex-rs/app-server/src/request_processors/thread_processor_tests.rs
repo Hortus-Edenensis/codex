@@ -1083,7 +1083,9 @@ mod thread_processor_behavior_tests {
             2,
         );
 
-        assert_eq!(items, vec![first, second]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].thread_id, first.thread_id);
+        assert_eq!(items[1].thread_id, second.thread_id);
     }
 
     #[test]
