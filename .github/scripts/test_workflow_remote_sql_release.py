@@ -24,10 +24,13 @@ class RemoteSqlReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(runner_lines, ["runs-on: ubuntu-22.04"] * 3)
         self.assertNotIn("self-hosted", self.workflow)
 
-    def test_release_tag_is_locked_to_copy_five(self) -> None:
-        tag = "v0.151.0-remote-sql-copy.5"
+    def test_release_tag_is_locked_to_copy_six(self) -> None:
+        tag = "v0.151.0-remote-sql-copy.6"
 
         self.assertGreaterEqual(self.workflow.count(tag), 3)
+
+    def test_sqlite_migrations_trigger_release_validation(self) -> None:
+        self.assertIn("- codex-rs/state/migrations/**", self.workflow)
 
     def test_draft_lookup_uses_authenticated_release_collection(self) -> None:
         self.assertIn(
