@@ -24,8 +24,8 @@ class RemoteSqlReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(runner_lines, ["runs-on: ubuntu-22.04"] * 3)
         self.assertNotIn("self-hosted", self.workflow)
 
-    def test_release_tag_is_locked_to_copy_seven(self) -> None:
-        tag = "v0.151.0-remote-sql-copy.7"
+    def test_release_tag_is_locked_to_copy_eight(self) -> None:
+        tag = "v0.151.0-remote-sql-copy.8"
 
         self.assertGreaterEqual(self.workflow.count(tag), 3)
 

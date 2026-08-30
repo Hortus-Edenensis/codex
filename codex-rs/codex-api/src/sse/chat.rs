@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parses_kimi_reasoning_content_and_text() {
+    async fn parses_compatible_chat_reasoning_content_and_text() {
         let events = collect_events(&[
             "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
             "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",

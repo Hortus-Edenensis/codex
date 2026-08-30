@@ -342,7 +342,7 @@ mod tests {
                     body: serde_json::to_vec(&json!({
                         "object": "list",
                         "data": [{
-                            "id": "kimi-k3",
+                            "id": "chat-reasoning-model",
                             "context_length": 1_048_576,
                             "supports_image_in": true,
                             "supports_reasoning": true,
@@ -364,7 +364,7 @@ mod tests {
             }
         }
 
-        let provider = provider("https://api.moonshot.cn/v1");
+        let provider = provider("https://chat.example.com/v1");
         let request_url = ModelsClient::<CompatibleTransport>::request_url(&provider, "0.142.5");
         let client = ModelsClient::new(CompatibleTransport, provider, Arc::new(DummyAuth));
 
@@ -374,7 +374,7 @@ mod tests {
             .expect("compatible models response should parse");
 
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "kimi-k3");
+        assert_eq!(models[0].id, "chat-reasoning-model");
         assert_eq!(models[0].context_length, Some(1_048_576));
         assert!(models[0].supports_dynamic_tools);
         assert_eq!(

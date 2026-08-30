@@ -222,7 +222,7 @@ jobs:
           pod="$(python3 -c 'import json,os; print(json.load(open(os.environ["DEPLOY_STATE"]))["newPod"])')"
           test -n "${pod}"
           printf 'pod=%s\n' "${pod}" >> "${GITHUB_OUTPUT}"
-      - name: Verify known resume, Kimi turn, goal, memory, and fork deduplication
+      - name: Verify known resume, native turn, goal, memory, and fork deduplication
         id: smoke-pre
         run: |
           python3 .github/scripts/copy_workspace_smoke.py pre-restart \
@@ -231,8 +231,6 @@ jobs:
             --container "${COPY_CONTAINER}" \
             --state-file "${SMOKE_STATE}" \
             --resume-thread-id "${COPY_RESUME_THREAD_ID}" \
-            --model kimi-k3 \
-            --model-provider kimi \
             --cwd /workspace/repo
       - name: Restart the managed app-server daemon
         run: |

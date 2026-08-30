@@ -5,7 +5,7 @@ on:
     branches:
       - "**"
     tags:
-      - v0.151.0-remote-sql-copy.7
+      - v0.151.0-remote-sql-copy.8
   pull_request:
     paths:
       - .github/remote-sql-migrations.sha256
@@ -22,8 +22,8 @@ concurrency:
 permissions: {}
 
 env:
-  EXPECTED_TAG: v0.151.0-remote-sql-copy.7
-  VERSION_BASE: 0.151.0-remote-sql-copy.7
+  EXPECTED_TAG: v0.151.0-remote-sql-copy.8
+  VERSION_BASE: 0.151.0-remote-sql-copy.8
   LINEAGE_MERGE: 150745544e6841702655579c78e21803f9b2927b
   UPSTREAM_PARENT: 4ee04c0aa5833ac39b1763f6ea44c7bc777c83dd
   REMOTE_SQL_PARENT: 03efbd5ef6b960ae622b1f3fcc4a8e7f178407b2
@@ -53,7 +53,7 @@ jobs:
 
   build-release:
     name: Build immutable Linux release
-    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.7'
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.8'
     needs: migration-integrity
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -212,7 +212,7 @@ jobs:
 
   draft-release:
     name: Create authenticated draft Release
-    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.7'
+    if: github.ref == 'refs/tags/v0.151.0-remote-sql-copy.8'
     needs: build-release
     runs-on: ubuntu-22.04
     timeout-minutes: 15

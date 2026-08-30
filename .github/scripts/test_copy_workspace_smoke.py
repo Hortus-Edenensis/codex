@@ -175,7 +175,7 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
             smoke.turns_page(FakeClient([{"data": [], "nextCursor": None}]), "known")
 
     def test_exact_agent_message_requires_one_exact_sentinel(self) -> None:
-        sentinel = "KIMI_SMOKE_OK:abc"
+        sentinel = "NATIVE_SMOKE_OK:abc"
         exact = {"items": [{"type": "agentMessage", "text": sentinel}]}
         extra = {
             "items": [
@@ -197,7 +197,7 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
                 first, {"id": "fork-2", "forkedFromId": "source"}, "source"
             )
 
-    def test_model_list_must_advertise_requested_kimi_model(self) -> None:
+    def test_model_list_must_advertise_requested_model(self) -> None:
         smoke.require_model_available(
             FakeClient(
                 [
@@ -206,41 +206,65 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
                         "nextCursor": "page-2",
                     },
                     {
-                        "data": [{"id": "kimi-k3", "model": "kimi-k3"}],
+                        "data": [{"id": "native-model", "model": "native-model"}],
                         "nextCursor": None,
                     },
                 ]
             ),
-            "kimi-k3",
+            "native-model",
         )
         with self.assertRaisesRegex(smoke.SmokeError, "does not advertise"):
             smoke.require_model_available(
-                FakeClient([{"data": [], "nextCursor": None}]), "kimi-k3"
+                FakeClient([{"data": [], "nextCursor": None}]), "native-model"
             )
+
+    def test_model_list_without_explicit_model_requires_any_advertised_model(self) -> None:
+        smoke.require_model_available(
+            FakeClient([{"data": [{"id": "native-model"}], "nextCursor": None}]), None
+        )
+        with self.assertRaisesRegex(smoke.SmokeError, "did not advertise any models"):
+            smoke.require_model_available(FakeClient([{"data": [], "nextCursor": None}]), None)
 
     def test_thread_start_must_confirm_desktop_history_fallback(self) -> None:
         response = {
-            "model": "kimi-k3",
-            "modelProvider": "kimi",
+            "model": "native-model",
+            "modelProvider": "openai",
             "thread": {"id": "thread-1", "historyMode": "legacy"},
         }
         self.assertEqual(
             smoke.require_desktop_compatible_thread_start(
-                response, "kimi-k3", "kimi"
+                response, "native-model", "openai"
             ),
             response["thread"],
         )
         with self.assertRaisesRegex(smoke.SmokeError, "model provider"):
             smoke.require_desktop_compatible_thread_start(
                 {**response, "modelProvider": "other"},
-                "kimi-k3",
-                "kimi",
+                "native-model",
+                "openai",
             )
         with self.assertRaisesRegex(smoke.SmokeError, "history fallback"):
             smoke.require_desktop_compatible_thread_start(
                 {**response, "thread": {"id": "thread-1", "historyMode": "paginated"}},
-                "kimi-k3",
-                "kimi",
+                "native-model",
+                "openai",
+            )
+
+    def test_thread_start_without_explicit_model_requires_selected_model_and_provider(self) -> None:
+        response = {
+            "model": "native-model",
+            "modelProvider": "openai",
+            "thread": {"id": "thread-1", "historyMode": "legacy"},
+        }
+        self.assertEqual(
+            smoke.require_desktop_compatible_thread_start(response, None, None),
+            response["thread"],
+        )
+        with self.assertRaisesRegex(smoke.SmokeError, "selected model provider"):
+            smoke.require_desktop_compatible_thread_start(
+                {**response, "modelProvider": ""},
+                None,
+                None,
             )
 
     def test_resolve_known_scans_filesystem_and_validates_resume(self) -> None:

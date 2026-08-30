@@ -1091,16 +1091,16 @@ mod thread_processor_behavior_tests {
     #[test]
     fn resume_model_metadata_patch_clears_stale_reasoning_effort() {
         let metadata = ResumeModelMetadata {
-            model: Some("kimi-k3".to_string()),
-            model_provider: Some("kimi".to_string()),
+            model: Some("historical-chat-model".to_string()),
+            model_provider: Some("historical-chat-provider".to_string()),
             reasoning_effort: None,
             reasoning_effort_observed: true,
         };
 
         let patch = resume_model_metadata_patch(
             &metadata,
-            Some("kimi-k3"),
-            Some("kimi"),
+            Some("historical-chat-model"),
+            Some("historical-chat-provider"),
             Some(&ReasoningEffort::High),
         )
         .expect("canonical null effort should clear stale stored effort");

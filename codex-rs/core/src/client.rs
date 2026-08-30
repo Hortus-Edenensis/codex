@@ -224,36 +224,11 @@ fn reasoning_effort_for_request(
 }
 
 fn chat_reasoning_effort(
-    model: &str,
+    _model: &str,
     effort: Option<&ReasoningEffortConfig>,
     default_effort: Option<&ReasoningEffortConfig>,
 ) -> Option<String> {
-    let effort = effort.or(default_effort);
-    if model == "kimi-k3" {
-        return Some(
-            match effort {
-                Some(
-                    ReasoningEffortConfig::None
-                    | ReasoningEffortConfig::Minimal
-                    | ReasoningEffortConfig::Low,
-                ) => "low",
-                Some(ReasoningEffortConfig::Medium | ReasoningEffortConfig::High) => "high",
-                Some(
-                    ReasoningEffortConfig::XHigh
-                    | ReasoningEffortConfig::Max
-                    | ReasoningEffortConfig::Ultra
-                    | ReasoningEffortConfig::Persistent,
-                )
-                | None => "max",
-                Some(ReasoningEffortConfig::Custom(value)) => match value.as_str() {
-                    "low" | "high" | "max" => value,
-                    _ => "max",
-                },
-            }
-            .to_string(),
-        );
-    }
-    effort.map(ToString::to_string)
+    effort.or(default_effort).map(ToString::to_string)
 }
 
 fn session_telemetry_for_request(

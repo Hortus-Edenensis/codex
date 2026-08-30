@@ -466,10 +466,10 @@ mod tests {
     fn chat_model_provider_proto_roundtrips_through_domain_type() {
         let mut expected = expected_provider();
         expected.wire_api = WireApi::Chat;
-        let proto = model_provider_to_proto("kimi", expected.clone());
+        let proto = model_provider_to_proto("chat-compatible", expected.clone());
         let (id, actual) = model_provider_from_proto(proto).expect("model provider from proto");
 
-        assert_eq!(id, "kimi");
+        assert_eq!(id, "chat-compatible");
         assert_eq!(actual, expected);
     }
 

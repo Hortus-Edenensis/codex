@@ -11,7 +11,7 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chat_provider_uses_native_endpoint_and_kimi_k3_effort() {
+async fn compatible_chat_provider_uses_native_endpoint_and_generic_effort() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -33,7 +33,7 @@ async fn chat_provider_uses_native_endpoint_and_kimi_k3_effort() {
         .await;
 
     let provider = ModelProviderInfo {
-        name: "Kimi".to_string(),
+        name: "Compatible Chat".to_string(),
         base_url: Some(format!("{}/v1", server.uri())),
         env_key: Some("PATH".to_string()),
         env_key_instructions: None,
@@ -54,9 +54,9 @@ async fn chat_provider_uses_native_endpoint_and_kimi_k3_effort() {
     };
 
     let test = test_codex()
-        .with_model("kimi-k3")
+        .with_model("chat-reasoning-model")
         .with_config(move |config| {
-            config.model_provider_id = "kimi".to_string();
+            config.model_provider_id = "chat-compatible".to_string();
             config.model_provider = provider;
             config.model_reasoning_effort = Some(ReasoningEffort::XHigh);
         })
@@ -64,18 +64,18 @@ async fn chat_provider_uses_native_endpoint_and_kimi_k3_effort() {
         .await
         .expect("build test Codex");
 
-    test.submit_turn("hello kimi").await.expect("submit turn");
+    test.submit_turn("hello chat").await.expect("submit turn");
 
     let requests = server.received_requests().await.expect("requests");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].url.path(), "/v1/chat/completions");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("request JSON");
-    assert_eq!(body["model"], "kimi-k3");
-    assert_eq!(body["reasoning_effort"], "max");
-    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["model"], "chat-reasoning-model");
+    assert_eq!(body["reasoning_effort"], "xhigh");
+    assert!(body.get("thinking").is_none());
     assert!(body["messages"].as_array().is_some_and(|messages| {
         messages
             .iter()
-            .any(|message| message["content"] == "hello kimi")
+            .any(|message| message["content"] == "hello chat")
     }));
 }

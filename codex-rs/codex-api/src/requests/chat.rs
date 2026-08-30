@@ -86,7 +86,7 @@ impl<'a> ChatRequestBuilder<'a> {
         self
     }
 
-    pub fn build(self, provider: &Provider) -> Result<ChatRequest, ApiError> {
+    pub fn build(self, _provider: &Provider) -> Result<ChatRequest, ApiError> {
         let mut messages = Vec::new();
         if !self.instructions.trim().is_empty() {
             messages.push(json!({"role": "system", "content": self.instructions}));
@@ -96,9 +96,9 @@ impl<'a> ChatRequestBuilder<'a> {
         for (index, item) in self.input.iter().enumerate() {
             match item {
                 ResponseItem::Message { role, content, .. } => {
-                    // Chat Completions providers such as Kimi do not accept
-                    // OpenAI's newer `developer` role. Preserve its instruction
-                    // priority by sending it as another system message.
+                    // Compatible Chat Completions providers may not accept the
+                    // newer `developer` role, so preserve its priority as
+                    // another system message.
                     let chat_role = if role == "developer" { "system" } else { role };
                     let mut text = String::new();
                     let mut parts = Vec::new();
@@ -262,12 +262,8 @@ impl<'a> ChatRequestBuilder<'a> {
             "messages": messages,
             "stream": true,
         });
-        let reasoning_enabled = self.reasoning_effort.is_some();
         if let Some(reasoning_effort) = self.reasoning_effort {
             payload["reasoning_effort"] = json!(reasoning_effort);
-        }
-        if reasoning_enabled && uses_kimi_thinking_parameter(provider) {
-            payload["thinking"] = json!({"type": "enabled"});
         }
         if let Some(output_schema) = self.output_schema {
             payload["response_format"] = json!({
@@ -294,14 +290,6 @@ impl<'a> ChatRequestBuilder<'a> {
             headers,
         })
     }
-}
-
-fn uses_kimi_thinking_parameter(provider: &Provider) -> bool {
-    provider.name.eq_ignore_ascii_case("kimi")
-        || provider
-            .base_url
-            .to_ascii_lowercase()
-            .contains("moonshot.cn")
 }
 
 fn collect_reasoning_by_anchor(input: &[ResponseItem]) -> HashMap<usize, String> {
@@ -410,8 +398,8 @@ mod tests {
 
     fn provider() -> Provider {
         Provider {
-            name: "Kimi".to_string(),
-            base_url: "https://api.moonshot.cn/v1".to_string(),
+            name: "Compatible Chat".to_string(),
+            base_url: "https://chat.example.com/v1".to_string(),
             query_params: None,
             headers: HeaderMap::new(),
             retry: RetryConfig {
@@ -426,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_kimi_tool_loop_with_preserved_reasoning() {
+    fn builds_generic_chat_tool_loop_with_preserved_reasoning() {
         let input = vec![
             ResponseItem::Message {
                 id: None,
@@ -465,7 +453,7 @@ mod tests {
             },
         ];
 
-        let request = ChatRequestBuilder::new("kimi-k2.7-code", "be useful", &input, &[])
+        let request = ChatRequestBuilder::new("chat-reasoning-model", "be useful", &input, &[])
             .reasoning_effort(Some("max".to_string()))
             .build(&provider())
             .expect("request");
@@ -473,7 +461,7 @@ mod tests {
 
         assert!(request.body.get("max_tokens").is_none());
         assert_eq!(request.body["reasoning_effort"], "max");
-        assert_eq!(request.body["thinking"]["type"], "enabled");
+        assert!(request.body.get("thinking").is_none());
         assert_eq!(messages[2]["reasoning_content"], "need the file");
         assert_eq!(messages[2]["tool_calls"][0]["id"], "call-a");
         assert_eq!(messages[3]["tool_call_id"], "call-a");
@@ -492,7 +480,7 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         }];
 
-        let request = ChatRequestBuilder::new("kimi-k3", "", &input, &[])
+        let request = ChatRequestBuilder::new("chat-model", "", &input, &[])
             .build(&provider())
             .expect("request");
 
@@ -509,7 +497,7 @@ mod tests {
             "additionalProperties": false,
         });
 
-        let request = ChatRequestBuilder::new("kimi-k3", "", &[], &[])
+        let request = ChatRequestBuilder::new("chat-model", "", &[], &[])
             .output_schema(Some(&schema), true)
             .build(&provider())
             .expect("request");
@@ -530,14 +518,10 @@ mod tests {
     }
 
     #[test]
-    fn does_not_add_kimi_thinking_parameter_for_other_chat_providers() {
-        let mut generic_provider = provider();
-        generic_provider.name = "Compatible".to_string();
-        generic_provider.base_url = "https://example.com/v1".to_string();
-
+    fn preserves_generic_reasoning_effort_without_provider_extensions() {
         let request = ChatRequestBuilder::new("reasoning-model", "", &[], &[])
             .reasoning_effort(Some("high".to_string()))
-            .build(&generic_provider)
+            .build(&provider())
             .expect("request");
 
         assert_eq!(request.body["reasoning_effort"], "high");

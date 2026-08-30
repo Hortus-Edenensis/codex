@@ -100,12 +100,12 @@ const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 #[test]
 fn chat_reasoning_uses_model_default_when_turn_has_no_override() {
     assert_eq!(
-        chat_reasoning_effort("kimi-k2.7-code", None, Some(&ReasoningEffort::High),),
+        chat_reasoning_effort("chat-reasoning-model", None, Some(&ReasoningEffort::High),),
         Some("high".to_string()),
     );
     assert_eq!(
         chat_reasoning_effort(
-            "kimi-k2.7-code",
+            "chat-reasoning-model",
             Some(&ReasoningEffort::Low),
             Some(&ReasoningEffort::High),
         ),

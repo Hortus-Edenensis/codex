@@ -639,10 +639,13 @@ def turns_page(client: ProxyWebSocketClient, thread_id: str) -> list[dict[str, A
     return data
 
 
-def require_model_available(client: ProxyWebSocketClient, model_name: str) -> None:
+def require_model_available(
+    client: ProxyWebSocketClient, model_name: str | None
+) -> None:
     cursor: str | None = None
     seen_cursors: set[str] = set()
     matches: list[dict[str, Any]] = []
+    saw_any_model = False
     while True:
         params: dict[str, Any] = {"limit": 100, "includeHidden": True}
         if cursor is not None:
@@ -651,10 +654,12 @@ def require_model_available(client: ProxyWebSocketClient, model_name: str) -> No
         data = page.get("data")
         if not isinstance(data, list):
             raise SmokeError("model/list returned non-list data")
+        saw_any_model = saw_any_model or bool(data)
         matches.extend(
             model
             for model in data
             if isinstance(model, dict)
+            and model_name is not None
             and (model.get("id") == model_name or model.get("model") == model_name)
         )
         next_cursor = page.get("nextCursor")
@@ -664,16 +669,28 @@ def require_model_available(client: ProxyWebSocketClient, model_name: str) -> No
             raise SmokeError("model/list returned an invalid pagination cursor")
         seen_cursors.add(next_cursor)
         cursor = next_cursor
+    if model_name is None:
+        if not saw_any_model:
+            raise SmokeError("model/list did not advertise any models")
+        return
     if not matches:
         raise SmokeError(f"model/list does not advertise {model_name}")
 
 
 def require_desktop_compatible_thread_start(
-    response: dict[str, Any], model_name: str, model_provider: str
+    response: dict[str, Any], model_name: str | None, model_provider: str | None
 ) -> dict[str, Any]:
-    if response.get("model") != model_name:
+    actual_model = response.get("model")
+    if model_name is None:
+        if not isinstance(actual_model, str) or not actual_model:
+            raise SmokeError("thread/start omitted the selected model")
+    elif actual_model != model_name:
         raise SmokeError("thread/start used an unexpected model")
-    if response.get("modelProvider") != model_provider:
+    actual_provider = response.get("modelProvider")
+    if model_provider is None:
+        if not isinstance(actual_provider, str) or not actual_provider:
+            raise SmokeError("thread/start omitted the selected model provider")
+    elif actual_provider != model_provider:
         raise SmokeError("thread/start used an unexpected model provider")
     thread = require_thread(response)
     if thread.get("historyMode") != "legacy":
@@ -786,7 +803,7 @@ def pre_restart(args: argparse.Namespace) -> None:
     if not args.resume_thread_id:
         raise SmokeError("--resume-thread-id is required")
     nonce = secrets.token_hex(12)
-    sentinel = f"KIMI_SMOKE_OK:{nonce}"
+    sentinel = f"NATIVE_SMOKE_OK:{nonce}"
     objective = f"remote SQL restart smoke {nonce}"
     created_threads: list[str] = []
     partial_state: dict[str, Any] = {
@@ -812,18 +829,18 @@ def pre_restart(args: argparse.Namespace) -> None:
             raise SmokeError("known thread goal response omitted goal")
         require_model_available(client, args.model)
 
-        started = client.request(
-            "thread/start",
-            {
-                "model": args.model,
-                "modelProvider": args.model_provider,
-                "cwd": args.cwd,
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "personality": "none",
-                "historyMode": "paginated",
-            },
-        )
+        start_params: dict[str, Any] = {
+            "cwd": args.cwd,
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "personality": "none",
+            "historyMode": "paginated",
+        }
+        if args.model is not None:
+            start_params["model"] = args.model
+        if args.model_provider is not None:
+            start_params["modelProvider"] = args.model_provider
+        started = client.request("thread/start", start_params)
         smoke_thread = require_desktop_compatible_thread_start(
             started, args.model, args.model_provider
         )
@@ -850,7 +867,7 @@ def pre_restart(args: argparse.Namespace) -> None:
         wait_for_turn(client, turn_id, sentinel, args.turn_timeout_seconds)
         persisted_turns = turns_page(client, smoke_thread_id)
         if not any(turn.get("id") == turn_id for turn in persisted_turns):
-            raise SmokeError("Kimi turn was not persisted")
+            raise SmokeError("native smoke turn was not persisted")
 
         set_goal = client.request(
             "thread/goal/set",
@@ -926,7 +943,7 @@ def pre_restart(args: argparse.Namespace) -> None:
                 "status": "preRestartPassed",
                 "knownNonemptyResume": True,
                 "newTask": True,
-                "kimiTurn": True,
+                "nativeTurn": True,
                 "goal": True,
                 "memoryModePersisted": True,
                 "repeatedForkDeduplicated": True,
@@ -955,7 +972,7 @@ def post_restart(args: argparse.Namespace) -> None:
         if not isinstance(matching_turn, dict) or not turn_contains_exact_message(
             matching_turn, sentinel
         ):
-            raise SmokeError("Kimi turn content did not survive daemon restart")
+            raise SmokeError("native smoke turn content did not survive daemon restart")
         goal = client.request(
             "thread/goal/get", {"threadId": smoke_thread_id}
         ).get("goal")
@@ -999,7 +1016,7 @@ def post_restart(args: argparse.Namespace) -> None:
                 "status": "postRestartPassed",
                 "knownNonemptyResume": True,
                 "newTaskResume": True,
-                "kimiTurnPersisted": True,
+                "nativeTurnPersisted": True,
                 "goalPersisted": True,
                 "memoryModePersistedAfterRestart": True,
                 "deduplicatedForkPersisted": True,
@@ -1120,8 +1137,8 @@ def parse_args() -> argparse.Namespace:
     add_postgres_arguments(pre)
     pre.add_argument("--state-file", type=Path, required=True)
     pre.add_argument("--resume-thread-id", required=True)
-    pre.add_argument("--model", default="kimi-k3")
-    pre.add_argument("--model-provider", default="kimi")
+    pre.add_argument("--model")
+    pre.add_argument("--model-provider")
     pre.add_argument("--cwd", default="/workspace/repo")
     pre.add_argument("--turn-timeout-seconds", type=float, default=300.0)
 

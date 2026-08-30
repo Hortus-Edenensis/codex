@@ -45,8 +45,6 @@ use crate::provider::enforce_managed_residency;
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPATIBLE_MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 const MODELS_ENDPOINT: &str = "/models";
-const KIMI_CODEX_BEHAVIOR_PROFILE: &str = "gpt-5.5";
-
 /// Provider-owned OpenAI-compatible `/models` endpoint.
 #[derive(Debug)]
 pub(crate) struct OpenAiModelsEndpoint {
@@ -116,7 +114,6 @@ impl OpenAiModelsEndpoint {
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
             if self.provider_info.wire_api == WireApi::Chat {
-                let behavior_profile = kimi_codex_behavior_profile(&self.provider_info);
                 let (models, etag) = client
                     .list_compatible_models(request_url, HeaderMap::new())
                     .await
@@ -125,9 +122,7 @@ impl OpenAiModelsEndpoint {
                     models
                         .into_iter()
                         .enumerate()
-                        .map(|(priority, model)| {
-                            compatible_model_info(model, priority, behavior_profile.as_ref())
-                        })
+                        .map(|(priority, model)| compatible_model_info(model, priority, None))
                         .collect(),
                     etag,
                 ))
@@ -217,25 +212,6 @@ fn compatible_model_info(
         .collect();
     }
     info
-}
-
-fn kimi_codex_behavior_profile(provider_info: &ModelProviderInfo) -> Option<ModelInfo> {
-    if !is_kimi_provider(provider_info) {
-        return None;
-    }
-    codex_models_manager::bundled_models_response()
-        .ok()?
-        .models
-        .into_iter()
-        .find(|model| model.slug == KIMI_CODEX_BEHAVIOR_PROFILE)
-}
-
-fn is_kimi_provider(provider_info: &ModelProviderInfo) -> bool {
-    provider_info.name.eq_ignore_ascii_case("kimi")
-        || provider_info.base_url.as_deref().is_some_and(|base_url| {
-            let base_url = base_url.to_ascii_lowercase();
-            base_url.contains("moonshot.cn") || base_url.contains("moonshot.ai")
-        })
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
@@ -511,10 +487,10 @@ mod tests {
     }
 
     #[test]
-    fn compatible_model_metadata_preserves_kimi_capabilities() {
+    fn compatible_model_metadata_preserves_reasoning_capabilities() {
         let model = compatible_model_info(
             CompatibleModelInfo {
-                id: "kimi-k3".to_string(),
+                id: "chat-reasoning-model".to_string(),
                 context_length: Some(1_048_576),
                 supports_image_in: true,
                 supports_reasoning: true,
@@ -533,7 +509,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(model.slug, "kimi-k3");
+        assert_eq!(model.slug, "chat-reasoning-model");
         assert_eq!(model.visibility, ModelVisibility::List);
         assert_eq!(model.context_window, Some(1_048_576));
         assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::Max));
@@ -546,18 +522,10 @@ mod tests {
     }
 
     #[test]
-    fn kimi_models_inherit_native_codex_behavior_without_tool_metadata() {
-        let provider_info = ModelProviderInfo {
-            name: "Kimi".to_string(),
-            base_url: Some("https://api.moonshot.cn/v1".to_string()),
-            wire_api: WireApi::Chat,
-            ..ModelProviderInfo::create_openai_provider(None)
-        };
-        let behavior_profile =
-            kimi_codex_behavior_profile(&provider_info).expect("Kimi behavior profile");
+    fn compatible_models_keep_generic_metadata_without_behavior_overrides() {
         let model = compatible_model_info(
             CompatibleModelInfo {
-                id: "kimi-k3".to_string(),
+                id: "chat-compatible-model".to_string(),
                 context_length: Some(1_048_576),
                 supports_image_in: false,
                 supports_reasoning: true,
@@ -565,17 +533,12 @@ mod tests {
                 reasoning_efforts: None,
             },
             0,
-            Some(&behavior_profile),
+            None,
         );
 
-        assert_eq!(model.model_messages, behavior_profile.model_messages);
         assert_eq!(model.apply_patch_tool_type, None);
         assert_eq!(model.context_window, Some(1_048_576));
-        assert_eq!(model.tool_mode, behavior_profile.tool_mode);
-        assert_eq!(
-            model.multi_agent_version,
-            behavior_profile.multi_agent_version
-        );
+        assert_eq!(model.visibility, ModelVisibility::List);
     }
 
     #[test]
@@ -594,10 +557,10 @@ mod tests {
     }
 
     #[test]
-    fn kimi_reasoning_models_without_effort_metadata_default_to_thinking() {
+    fn compatible_reasoning_models_without_effort_metadata_default_to_generic_levels() {
         let model = compatible_model_info(
             CompatibleModelInfo {
-                id: "kimi-k2.7-code".to_string(),
+                id: "chat-reasoning-model".to_string(),
                 context_length: Some(262_144),
                 supports_image_in: false,
                 supports_reasoning: true,
