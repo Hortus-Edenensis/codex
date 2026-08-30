@@ -11,7 +11,7 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compatible_chat_provider_uses_native_endpoint_and_generic_effort() {
+async fn compatible_chat_provider_uses_native_endpoint_without_extensions() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -71,7 +71,7 @@ async fn compatible_chat_provider_uses_native_endpoint_and_generic_effort() {
     assert_eq!(requests[0].url.path(), "/v1/chat/completions");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("request JSON");
     assert_eq!(body["model"], "chat-reasoning-model");
-    assert_eq!(body["reasoning_effort"], "xhigh");
+    assert!(body.get("reasoning_effort").is_none());
     assert!(body.get("thinking").is_none());
     assert!(body["messages"].as_array().is_some_and(|messages| {
         messages
