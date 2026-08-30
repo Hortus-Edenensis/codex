@@ -92,6 +92,9 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertIn('gh release create "${EXPECTED_TAG}"', draft)
         self.assertIn("--draft", draft)
         self.assertIn('gh release upload "${EXPECTED_TAG}" --clobber', draft)
+        self.assertIn(
+            "printf '%s\\n' \"${release_json}\" | python3 -c '", draft
+        )
         self.assertIn("draft Release asset set mismatch", draft)
         self.assertIn("external SSH deployment and verification", draft)
 

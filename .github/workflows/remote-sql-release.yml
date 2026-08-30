@@ -284,7 +284,7 @@ jobs:
             release-bundle/SHA256SUMS.txt \
             release-bundle/PROVENANCE.txt
           release_json="$(wait_for_draft_release)"
-          python3 -c '
+          printf '%s\n' "${release_json}" | python3 -c '
           import json
           import os
           import sys
