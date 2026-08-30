@@ -2295,6 +2295,57 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_resume_falls_back_when_persisted_provider_is_unavailable() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Vec::new(),
+        Some("retired_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        thread,
+        model_provider,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    assert_eq!(thread.id, conversation_id);
+    assert_eq!(thread.preview, "Saved user message");
+    assert_eq!(model_provider, "mock_provider");
+
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
+    let metadata = state_db
+        .get_thread(ThreadId::from_string(&conversation_id)?)
+        .await?
+        .expect("thread metadata should exist");
+    assert_eq!(metadata.model_provider, "retired_provider");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<()> {
     for client_name in ["codex_chatgpt_android_remote", "codex_chatgpt_ios_remote"] {
         let remote_resume = resume_redaction_fixture(Some(client_name)).await?;

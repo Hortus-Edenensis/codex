@@ -4022,20 +4022,65 @@ impl ThreadRequestProcessor {
             )
             .await;
 
-        // Derive a Config using the same logic as new conversation, honoring overrides if provided.
-        let mut config = match self
-            .config_manager
-            .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
-            .await
-        {
-            Ok(config) => config,
-            Err(err) => {
-                let error = config_load_error(&err);
-                self.outgoing.send_error(request_id, error).await;
-                return Ok(());
+        let fallback_config = if !has_explicit_model_resume_override {
+            if let Some(persisted_provider) = persisted_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.model_provider.as_deref())
+            {
+                let mut fallback_request_overrides = request_overrides.clone();
+                let mut fallback_typesafe_overrides = typesafe_overrides.clone();
+                fallback_typesafe_overrides.model = None;
+                fallback_typesafe_overrides.model_provider = None;
+                if !has_explicit_reasoning_effort_resume_override
+                    && let Some(overrides) = fallback_request_overrides.as_mut()
+                {
+                    overrides.remove("model_reasoning_effort");
+                }
+                match self
+                    .config_manager
+                    .load_for_cwd(
+                        fallback_request_overrides,
+                        fallback_typesafe_overrides,
+                        history_cwd.clone(),
+                    )
+                    .await
+                {
+                    Ok(config) if !config.model_providers.contains_key(persisted_provider) => {
+                        warn!(
+                            provider = persisted_provider,
+                            fallback_provider = config.model_provider_id,
+                            "persisted model provider is unavailable; resuming with configured defaults"
+                        );
+                        Some(config)
+                    }
+                    Ok(_) | Err(_) => None,
+                }
+            } else {
+                None
             }
+        } else {
+            None
         };
-        if !has_explicit_model_resume_override
+        let used_persisted_model_metadata = fallback_config.is_none();
+
+        // Derive a Config using the same logic as new conversation, honoring overrides if provided.
+        let mut config = match fallback_config {
+            Some(config) => config,
+            None => match self
+                .config_manager
+                .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
+                .await
+            {
+                Ok(config) => config,
+                Err(err) => {
+                    let error = config_load_error(&err);
+                    self.outgoing.send_error(request_id, error).await;
+                    return Ok(());
+                }
+            },
+        };
+        if used_persisted_model_metadata
+            && !has_explicit_model_resume_override
             && !has_explicit_reasoning_effort_resume_override
             && persisted_metadata
                 .as_ref()
@@ -4153,16 +4198,28 @@ impl ThreadRequestProcessor {
                     /*has_live_in_progress_turn*/ false,
                 );
                 let config_snapshot = codex_thread.config_snapshot().await;
-                self.backfill_resume_model_metadata(
-                    thread_id,
+                let resume_metadata_patch = if used_persisted_model_metadata {
                     StoreThreadMetadataPatch {
                         model_provider: Some(session_configured.model_provider_id.clone()),
                         model: Some(session_configured.model.clone()),
                         reasoning_effort: Some(session_configured.reasoning_effort.clone()),
                         ..Default::default()
-                    },
-                )
-                .await;
+                    }
+                } else {
+                    persisted_metadata.as_ref().map_or_else(
+                        StoreThreadMetadataPatch::default,
+                        |metadata| StoreThreadMetadataPatch {
+                            model_provider: metadata.model_provider.clone(),
+                            model: metadata.model.clone(),
+                            reasoning_effort: metadata
+                                .reasoning_effort_observed
+                                .then(|| metadata.reasoning_effort.clone()),
+                            ..Default::default()
+                        },
+                    )
+                };
+                self.backfill_resume_model_metadata(thread_id, resume_metadata_patch)
+                    .await;
                 let (turns_backwards_cursor, items_backwards_cursor) =
                     if matches!(config_snapshot.history_mode, ThreadHistoryMode::Paginated) {
                         match Self::paginated_resume_backwards_cursors(

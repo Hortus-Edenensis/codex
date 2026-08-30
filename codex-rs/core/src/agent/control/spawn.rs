@@ -378,7 +378,6 @@ impl AgentControl {
                 return Ok(());
             }
         }
-        config.model_reasoning_effort = stored_reasoning_effort;
         if let Some(role_name) = session_source.get_agent_role() {
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
@@ -416,20 +415,22 @@ impl AgentControl {
                 })?;
         }
         config.service_tier = self.root_service_tier();
-        if let Some(model) = stored_model {
-            config.model = Some(model);
-        }
-        if config.model_provider_id != stored_model_provider {
-            config.model_provider = config
-                .model_providers
-                .get(&stored_model_provider)
-                .cloned()
-                .ok_or_else(|| {
-                    CodexErr::InvalidRequest(format!(
-                        "Model provider `{stored_model_provider}` not found"
-                    ))
-                })?;
+        let stored_provider = if config.model_provider_id == stored_model_provider {
+            Some(config.model_provider.clone())
+        } else {
+            config.model_providers.get(&stored_model_provider).cloned()
+        };
+        if let Some(stored_provider) = stored_provider {
+            config.model = stored_model;
+            config.model_reasoning_effort = stored_reasoning_effort;
+            config.model_provider = stored_provider;
             config.model_provider_id = stored_model_provider;
+        } else {
+            warn!(
+                provider = stored_model_provider,
+                fallback_provider = config.model_provider_id,
+                "persisted agent model provider is unavailable; resuming with configured defaults"
+            );
         }
         let parent_thread_id = owner_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id())
