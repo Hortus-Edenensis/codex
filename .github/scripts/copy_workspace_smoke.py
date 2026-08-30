@@ -758,7 +758,7 @@ def wait_for_turn(
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise SmokeError("Kimi smoke turn did not complete before timeout")
+            raise SmokeError("native smoke turn did not complete before timeout")
         for message in list(client.inbox):
             if message.get("method") == "item/completed":
                 client.inbox.remove(message)
@@ -772,12 +772,12 @@ def wait_for_turn(
         )
         turn = completed["params"]["turn"]
         if turn.get("status") != "completed":
-            raise SmokeError(f"Kimi smoke turn ended with status {turn.get('status')!r}")
+            raise SmokeError(f"native smoke turn ended with status {turn.get('status')!r}")
         summary_message = turn.get("finalOutput")
         if isinstance(summary_message, str):
             messages.append(summary_message)
         if messages != [sentinel] and not turn_contains_exact_message(turn, sentinel):
-            raise SmokeError("Kimi smoke turn did not return the exact sentinel")
+            raise SmokeError("native smoke turn did not return the exact sentinel")
         return
 
 
