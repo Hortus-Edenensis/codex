@@ -29,7 +29,6 @@ use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
-use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadDeleteParams;
@@ -189,7 +188,7 @@ async fn thread_start_defaults_to_legacy_without_history_list_support() -> Resul
 }
 
 #[tokio::test]
-async fn thread_start_rejects_paginated_history_without_list_support() -> Result<()> {
+async fn thread_start_downgrades_paginated_history_without_list_support() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     let store_id = Uuid::new_v4().to_string();
@@ -198,35 +197,17 @@ async fn thread_start_rejects_paginated_history_without_list_support() -> Result
     let _in_memory_store = InMemoryThreadStoreId { store_id };
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.initialize_with_client_info(ClientInfo {
-            name: "codex-app-server-tests".to_string(),
-            title: None,
-            version: "0.1.0".to_string(),
-        }),
-    )
-    .await??;
-    let request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
             history_mode: Some(ThreadHistoryMode::Paginated),
             ..Default::default()
         })
         .await?;
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
 
-    assert_eq!(error.error.code, -32600);
-    assert_eq!(
-        error.error.message,
-        "paginated threads require thread/turns/list and thread/items/list support"
-    );
-
+    assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
     Ok(())
 }
 

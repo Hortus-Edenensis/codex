@@ -668,13 +668,17 @@ def require_model_available(client: ProxyWebSocketClient, model_name: str) -> No
         raise SmokeError(f"model/list does not advertise {model_name}")
 
 
-def require_started_model_provider(
+def require_desktop_compatible_thread_start(
     response: dict[str, Any], model_name: str, model_provider: str
-) -> None:
+) -> dict[str, Any]:
     if response.get("model") != model_name:
         raise SmokeError("thread/start used an unexpected model")
     if response.get("modelProvider") != model_provider:
         raise SmokeError("thread/start used an unexpected model provider")
+    thread = require_thread(response)
+    if thread.get("historyMode") != "legacy":
+        raise SmokeError("thread/start did not apply the remote-store history fallback")
+    return thread
 
 
 def require_thread(response: dict[str, Any], thread_id: str | None = None) -> dict[str, Any]:
@@ -817,10 +821,12 @@ def pre_restart(args: argparse.Namespace) -> None:
                 "approvalPolicy": "never",
                 "sandbox": "read-only",
                 "personality": "none",
+                "historyMode": "paginated",
             },
         )
-        require_started_model_provider(started, args.model, args.model_provider)
-        smoke_thread = require_thread(started)
+        smoke_thread = require_desktop_compatible_thread_start(
+            started, args.model, args.model_provider
+        )
         smoke_thread_id = str(smoke_thread["id"])
         created_threads.append(smoke_thread_id)
         partial_state["createdThreadIds"] = created_threads

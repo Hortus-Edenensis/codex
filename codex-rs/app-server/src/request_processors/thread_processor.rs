@@ -1396,15 +1396,16 @@ impl ThreadRequestProcessor {
             project_id,
             environments,
         } = params;
-        if matches!(
-            history_mode,
+        // Desktop clients request paginated history eagerly, so older remote stores must fall back
+        // before Core chooses a rollout format that those stores cannot hydrate.
+        let history_mode = match history_mode {
             Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)
-        ) && !self.thread_store.supports_paginated_history_lists()
-        {
-            return Err(invalid_request(
-                "paginated threads require thread/turns/list and thread/items/list support",
-            ));
-        }
+                if !self.thread_store.supports_paginated_history_lists() =>
+            {
+                Some(codex_app_server_protocol::ThreadHistoryMode::Legacy)
+            }
+            history_mode => history_mode,
+        };
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",

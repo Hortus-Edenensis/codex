@@ -218,12 +218,27 @@ class CopyWorkspaceSmokeTests(unittest.TestCase):
                 FakeClient([{"data": [], "nextCursor": None}]), "kimi-k3"
             )
 
-    def test_thread_start_must_confirm_kimi_provider(self) -> None:
-        response = {"model": "kimi-k3", "modelProvider": "kimi"}
-        smoke.require_started_model_provider(response, "kimi-k3", "kimi")
+    def test_thread_start_must_confirm_desktop_history_fallback(self) -> None:
+        response = {
+            "model": "kimi-k3",
+            "modelProvider": "kimi",
+            "thread": {"id": "thread-1", "historyMode": "legacy"},
+        }
+        self.assertEqual(
+            smoke.require_desktop_compatible_thread_start(
+                response, "kimi-k3", "kimi"
+            ),
+            response["thread"],
+        )
         with self.assertRaisesRegex(smoke.SmokeError, "model provider"):
-            smoke.require_started_model_provider(
-                {"model": "kimi-k3", "modelProvider": "other"},
+            smoke.require_desktop_compatible_thread_start(
+                {**response, "modelProvider": "other"},
+                "kimi-k3",
+                "kimi",
+            )
+        with self.assertRaisesRegex(smoke.SmokeError, "history fallback"):
+            smoke.require_desktop_compatible_thread_start(
+                {**response, "thread": {"id": "thread-1", "historyMode": "paginated"}},
                 "kimi-k3",
                 "kimi",
             )
