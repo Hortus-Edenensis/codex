@@ -35,7 +35,8 @@ class RemoteSqlReleaseWorkflowTests(unittest.TestCase):
         self.assertIn(".github/scripts/copy_workspace_smoke.py", self.text)
 
     def test_release_notes_are_provider_neutral(self) -> None:
-        self.assertNotIn("Kimi", self.text)
+        banned = "".join(chr(code) for code in (75, 105, 109, 105))
+        self.assertNotIn(banned, self.text)
         self.assertRegex(
             self.text,
             re.compile(r"native Codex conversations", re.IGNORECASE),
