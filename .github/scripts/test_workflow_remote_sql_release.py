@@ -13,9 +13,9 @@ class RemoteSqlReleaseWorkflowTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.text = WORKFLOW.read_text(encoding="utf-8")
 
-    def test_release_tag_and_version_base_match_copy8(self) -> None:
-        self.assertIn("v0.151.0-remote-sql-copy.8", self.text)
-        self.assertIn("VERSION_BASE: 0.151.0-remote-sql-copy.8", self.text)
+    def test_release_tag_and_version_base_match_copy9(self) -> None:
+        self.assertIn("v0.151.0-remote-sql-copy.9", self.text)
+        self.assertIn("VERSION_BASE: 0.151.0-remote-sql-copy.9", self.text)
 
     def test_workflow_never_uses_self_hosted_runner(self) -> None:
         self.assertNotIn("self-hosted", self.text)
