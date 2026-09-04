@@ -1,0 +1,103 @@
+name: mobile-list-release
+
+on:
+  push:
+    tags: ["v0.153.3-mobile-list.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      RUST_MIN_STACK: "8388608"
+      CODEX_BWRAP_SHA256: "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: "1.95.0"
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
+        with:
+          tool: just,cargo-nextest
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends build-essential binutils file libcap-dev libssl-dev pkg-config protobuf-compiler
+      - name: Bind binary version to tag and source
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          version = os.environ['GITHUB_REF_NAME'].removeprefix('v') + '+' + os.environ['GITHUB_SHA'][:12]
+          assert re.fullmatch(r'0\.153\.3-mobile-list\.\d+\+[0-9a-f]{12}', version)
+          manifest = pathlib.Path('codex-rs/Cargo.toml')
+          text, count = re.subn(r'(\[workspace.package\]\nversion = ")0\.153\.3("\n)', rf'\g<1>{version}\2', manifest.read_text())
+          assert count == 1
+          manifest.write_text(text)
+          lock = pathlib.Path('codex-rs/Cargo.lock')
+          text, count = re.subn(r'(\[\[package\]\]\nname = "[^"\n]+"\nversion = ")0\.0\.0("\n)(?!source =)', rf'\g<1>{version}\2', lock.read_text())
+          assert count > 100
+          lock.write_text(text)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'BUILD_VERSION={version}\n')
+          PY
+      - name: Test rollout listing and read repair
+        working-directory: codex-rs
+        run: just test -p codex-rollout --lib --locked --release --target x86_64-unknown-linux-gnu
+      - name: Build Linux x86_64 CLI and App Server
+        working-directory: codex-rs
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu -p codex-cli --bin codex
+      - name: Verify and package binary overlay
+        run: |
+          set -euo pipefail
+          mkdir -p dist/overlay/bin
+          install -m 755 codex-rs/target/x86_64-unknown-linux-gnu/release/codex dist/overlay/bin/codex
+          strip --strip-unneeded dist/overlay/bin/codex
+          test "$(dist/overlay/bin/codex --version)" = "codex-cli ${BUILD_VERSION}"
+          file dist/overlay/bin/codex
+          readelf -h dist/overlay/bin/codex | rg 'Advanced Micro Devices X86-64'
+          readelf -l dist/overlay/bin/codex | rg '/lib64/ld-linux-x86-64.so.2'
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess
+          binary = pathlib.Path('dist/overlay/bin/codex')
+          output = subprocess.check_output(['readelf', '--version-info', str(binary)], text=True)
+          versions = [tuple(map(int, x.split('.'))) for x in re.findall(r'GLIBC_([0-9.]+)', output)]
+          assert versions and max(versions) <= (2, 35), max(versions)
+          record = {'source_commit': os.environ['GITHUB_SHA'], 'upstream_commit': 'b1a547b1f73ce86205d9222ac19cff334b3b7a2e', 'version': os.environ['BUILD_VERSION'], 'target': 'x86_64-unknown-linux-gnu', 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'required_base_release': '0.153.3-x86_64-unknown-linux-musl', 'base_bwrap_sha256': os.environ['CODEX_BWRAP_SHA256'], 'maximum_glibc': '.'.join(map(str, max(versions))), 'tests': 'just test -p codex-rollout --lib --locked --release --target x86_64-unknown-linux-gnu', 'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
+          pathlib.Path('dist/provenance.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+          tar -C dist/overlay -czf "dist/codex-${BUILD_VERSION}-x86_64-unknown-linux-gnu-overlay.tar.gz" bin/codex
+          cd dist
+          sha256sum *.tar.gz provenance.json > SHA256SUMS.txt
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: mobile-list-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/provenance.json
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: mobile-list-linux-x86_64
+          path: dist
+      - name: Publish draft overlay release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "$GITHUB_REF_NAME" --notes 'Linux x86_64 overlay for the official 0.153.3 standalone package. Skip excluded task sources before parsing their history. Requires the exact base package and bwrap digest recorded in provenance.json; preserve all other base resources.' dist/*.tar.gz dist/provenance.json dist/SHA256SUMS.txt

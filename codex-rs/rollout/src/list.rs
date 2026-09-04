@@ -788,7 +788,7 @@ async fn build_thread_item(
 ) -> Option<ThreadItem> {
     // Read head and detect preview-bearing events; goal previews can appear before
     // the first normal user message.
-    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT)
+    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT, allowed_sources)
         .await
         .unwrap_or_default();
     if !allowed_sources.is_empty()
@@ -1110,7 +1110,11 @@ impl<'a> ProviderMatcher<'a> {
     }
 }
 
-async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTailSummary> {
+async fn read_head_summary(
+    path: &Path,
+    head_limit: usize,
+    allowed_sources: &[SessionSource],
+) -> io::Result<HeadTailSummary> {
     let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut summary = HeadTailSummary::default();
     let mut lines_scanned = 0usize;
@@ -1170,6 +1174,11 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                     summary.cli_version = Some(session_meta_line.meta.cli_version);
                     summary.created_at = Some(session_meta_line.meta.timestamp.clone());
                     summary.saw_session_meta = true;
+                    if !allowed_sources.is_empty()
+                        && !allowed_sources.contains(&session_meta_line.meta.source)
+                    {
+                        return Ok(summary);
+                    }
                 }
             }
             RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
@@ -1224,6 +1233,10 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 
     Ok(summary)
 }
+
+#[cfg(test)]
+#[path = "list_tests.rs"]
+mod tests;
 
 /// Read up to `HEAD_RECORD_LIMIT` records from the start of the rollout file at `path`.
 /// This should be enough to produce a summary including the session meta line.
