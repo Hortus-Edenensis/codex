@@ -2,7 +2,7 @@ name: mobile-list-release
 
 on:
   push:
-    tags: ["v0.153.3-mobile-list.*"]
+    tags: ["v0.153.3-mobile-list.*", "v0.153.3-workspace-io.*"]
 
 permissions:
   contents: read
@@ -10,7 +10,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       CARGO_PROFILE_RELEASE_LTO: "false"
@@ -38,7 +38,7 @@ jobs:
           python3 - <<'PY'
           import os, pathlib, re
           version = os.environ['GITHUB_REF_NAME'].removeprefix('v') + '+' + os.environ['GITHUB_SHA'][:12]
-          assert re.fullmatch(r'0\.153\.3-mobile-list\.\d+\+[0-9a-f]{12}', version)
+          assert re.fullmatch(r'0\.153\.3-(?:mobile-list|workspace-io)\.\d+\+[0-9a-f]{12}', version)
           manifest = pathlib.Path('codex-rs/Cargo.toml')
           text, count = re.subn(r'(\[workspace.package\]\nversion = ")0\.153\.3("\n)', rf'\g<1>{version}\2', manifest.read_text())
           assert count == 1
@@ -50,9 +50,19 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as env:
               env.write(f'BUILD_VERSION={version}\n')
           PY
-      - name: Test rollout listing and read repair
+      - name: Test workspace scan guard
+        run: python3 scripts/workspace-rg-guard-tests.py
+      - name: Test search, state, rollout listing and read repair
         working-directory: codex-rs
-        run: just test -p codex-rollout --lib --locked --release --target x86_64-unknown-linux-gnu
+        run: just test -p codex-rollout -p codex-thread-store -p codex-state --lib --locked --release --target x86_64-unknown-linux-gnu
+      - name: Test public search and DB-only listing APIs
+        working-directory: codex-rs
+        run: just test -p codex-app-server --test all --locked --release --target x86_64-unknown-linux-gnu -E 'test(thread_search) | test(thread_list_state_db_only)'
+      - name: Fix scoped lints and reject unrecorded source changes
+        working-directory: codex-rs
+        run: |
+          just fix -p codex-thread-store -p codex-state --lib --locked --release --target x86_64-unknown-linux-gnu
+          git diff --exit-code -- thread-store state
       - name: Build Linux x86_64 CLI and App Server
         working-directory: codex-rs
         run: cargo build --locked --release --target x86_64-unknown-linux-gnu -p codex-cli --bin codex
@@ -68,6 +78,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist/overlay/bin
           install -m 755 codex-rs/target/x86_64-unknown-linux-gnu/release/codex dist/overlay/bin/codex
+          install -m 755 scripts/workspace-rg-guard.py dist/overlay/bin/workspace-rg-guard.py
           strip --strip-unneeded dist/overlay/bin/codex
           test "$(dist/overlay/bin/codex --version)" = "codex-cli ${BUILD_VERSION}"
           file dist/overlay/bin/codex
@@ -79,10 +90,10 @@ jobs:
           output = subprocess.check_output(['readelf', '--version-info', str(binary)], text=True)
           versions = [tuple(map(int, x.split('.'))) for x in re.findall(r'GLIBC_([0-9.]+)', output)]
           assert versions and max(versions) <= (2, 35), max(versions)
-          record = {'source_commit': os.environ['GITHUB_SHA'], 'upstream_commit': 'b1a547b1f73ce86205d9222ac19cff334b3b7a2e', 'version': os.environ['BUILD_VERSION'], 'target': 'x86_64-unknown-linux-gnu', 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'required_base_release': '0.153.3-x86_64-unknown-linux-musl', 'base_bwrap_sha256': os.environ['CODEX_BWRAP_SHA256'], 'maximum_glibc': '.'.join(map(str, max(versions))), 'tests': 'just test -p codex-rollout --lib --locked --release --target x86_64-unknown-linux-gnu', 'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
+          record = {'source_commit': os.environ['GITHUB_SHA'], 'upstream_commit': 'b1a547b1f73ce86205d9222ac19cff334b3b7a2e', 'maintenance_base_commit': '092586815f0185ac46d59299bf7f1b0d3eb9e3fb', 'version': os.environ['BUILD_VERSION'], 'target': 'x86_64-unknown-linux-gnu', 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'guard_sha256': hashlib.sha256(pathlib.Path('dist/overlay/bin/workspace-rg-guard.py').read_bytes()).hexdigest(), 'required_base_release': '0.153.3-x86_64-unknown-linux-musl', 'base_bwrap_sha256': os.environ['CODEX_BWRAP_SHA256'], 'maximum_glibc': '.'.join(map(str, max(versions))), 'tests': 'workspace rg guard; rollout, thread-store and state libraries; public thread_search and thread_list_state_db_only APIs; scoped clippy', 'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
           pathlib.Path('dist/provenance.json').write_text(json.dumps(record, indent=2) + '\n')
           PY
-          tar -C dist/overlay -czf "dist/codex-${BUILD_VERSION}-x86_64-unknown-linux-gnu-overlay.tar.gz" bin/codex
+          tar -C dist/overlay -czf "dist/codex-${BUILD_VERSION}-x86_64-unknown-linux-gnu-overlay.tar.gz" bin/codex bin/workspace-rg-guard.py
           cd dist
           sha256sum *.tar.gz provenance.json > SHA256SUMS.txt
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -108,4 +119,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "$GITHUB_REF_NAME" --notes 'Linux x86_64 overlay for the official 0.153.3 standalone package. Skip excluded task sources before parsing their history. Requires the exact base package and bwrap digest recorded in provenance.json; preserve all other base resources.' dist/*.tar.gz dist/provenance.json dist/SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "$GITHUB_REF_NAME" --notes 'Linux x86_64 workspace maintenance overlay: metadata search, bounded task-content search and a guarded ripgrep entrypoint. Includes the mobile-list source filter. Requires the base package and bwrap digest in provenance.json; preserve all other base resources.' dist/*.tar.gz dist/provenance.json dist/SHA256SUMS.txt
