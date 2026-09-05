@@ -67,7 +67,8 @@ jobs:
         run: just test -p codex-rollout -p codex-thread-store -p codex-state --lib --locked --release --target x86_64-unknown-linux-gnu
       - name: Test public search, listing and task lifecycle APIs
         working-directory: codex-rs
-        run: just test -p codex-app-server --test all --locked --release --target x86_64-unknown-linux-gnu -E 'test(thread_search) | test(thread_list_state_db_only) | test(thread_start_creates_thread_and_emits_started) | test(thread_start_ephemeral_remains_pathless) | test(thread_resume_can_skip_turns_for_metadata_only_resume) | test(thread_resume_keeps_in_flight_turn_streaming)'
+        # The integration harness uses an app-server startup hook gated by debug_assertions.
+        run: just test -p codex-app-server --test all --locked --release --config 'profile.release.package.codex-app-server.debug-assertions=true' --target x86_64-unknown-linux-gnu -E 'test(thread_search) | test(thread_list_state_db_only) | test(thread_start_creates_thread_and_emits_started) | test(thread_start_ephemeral_remains_pathless) | test(thread_resume_can_skip_turns_for_metadata_only_resume) | test(thread_resume_keeps_in_flight_turn_streaming)'
       - name: Fix scoped lints and reject unrecorded source changes
         working-directory: codex-rs
         run: |
