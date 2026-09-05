@@ -33,6 +33,16 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends build-essential binutils file libcap-dev libssl-dev pkg-config protobuf-compiler ripgrep
           rg --version
+      - name: Restore maintenance build cache
+        id: cargo-cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: workspace-io-linux-1.95.0-${{ hashFiles('codex-rs/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: workspace-io-linux-1.95.0-${{ hashFiles('codex-rs/Cargo.lock') }}-
       - name: Bind binary version to tag and source
         run: |
           python3 - <<'PY'
@@ -104,6 +114,15 @@ jobs:
             dist/provenance.json
             dist/SHA256SUMS.txt
           if-no-files-found: error
+      - name: Retain build progress for a corrected maintenance tag
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
   release:
     needs: build
     runs-on: ubuntu-22.04
