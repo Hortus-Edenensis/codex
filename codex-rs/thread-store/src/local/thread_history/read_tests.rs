@@ -871,6 +871,7 @@ async fn lineage_reads_page_across_parent_and_child_segments() {
         )),
         /*next_ordinal*/ 3,
     );
+    index_search_ancestor(&store, root_id).await;
     let db = history_db(&store).await;
     for (thread_id, turn_id, ordinal, first_user, final_agent) in [
         (root_id, "root-1", 1, Some("root-user"), Some("root-agent")),
@@ -1098,6 +1099,7 @@ async fn inherited_search_excludes_turns_created_after_the_fork() {
         )),
         /*next_ordinal*/ 2,
     );
+    index_search_ancestor(&store, source_id).await;
     let db = history_db(&store).await;
     insert_turn(
         db,
@@ -1166,6 +1168,8 @@ async fn lineage_reads_nested_forks() {
         )),
         /*next_ordinal*/ 2,
     );
+    index_search_ancestor(&store, root_id).await;
+    index_search_ancestor(&store, middle_id).await;
     let db = history_db(&store).await;
     for (thread_id, turn_id, ordinal, status, first_user_item_id) in [
         (root_id, "root", 1, "completed", None),
@@ -1280,6 +1284,323 @@ async fn lineage_reads_nested_forks() {
         .await
         .expect("navigate to effective occurrence turn");
     assert_eq!(turn_ids(&occurrence_turn), vec!["shared"]);
+}
+
+#[tokio::test]
+async fn occurrence_search_cancellation_holds_workspace_slot_until_sqlite_stops() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let db = history_db(&store).await;
+    insert_turn(
+        db,
+        thread_id,
+        "turn",
+        /*rollout_ordinal*/ 1,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    sqlx::query("DROP TABLE thread_items")
+        .execute(db)
+        .await
+        .expect("replace items");
+    let view = format!(
+        "CREATE VIEW thread_items AS WITH RECURSIVE n(x) AS (VALUES(2) UNION ALL SELECT x + 1 FROM n WHERE x < 100000000) SELECT '{thread_id}' AS thread_id, 'turn' AS turn_id, CAST(x AS TEXT) AS item_id, x AS rollout_ordinal, CASE WHEN x = 100000000 THEN 'userMessage' ELSE 'other' END AS item_type, '{{}}' AS item_json FROM n"
+    );
+    sqlx::query(&view)
+        .execute(db)
+        .await
+        .expect("slow search view");
+    let searching_store = store.clone();
+    let first = tokio::spawn(async move {
+        searching_store
+            .search_thread_occurrences(SearchThreadOccurrencesParams {
+                thread_id,
+                search_term: "absent".to_string(),
+                cursor: None,
+                page_size: 1,
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match crate::local::search_budget::acquire_slot(home.path()) {
+                Err(ThreadStoreError::Conflict { .. }) => break,
+                Ok(lock) => drop(lock),
+                Err(err) => panic!("unexpected slot error: {err}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("search acquired slot");
+    let other_store = LocalThreadStore::new(store.config.clone(), store.state_db().await);
+    assert!(matches!(
+        other_store
+            .search_thread_occurrences(SearchThreadOccurrencesParams {
+                thread_id,
+                search_term: "other".to_string(),
+                cursor: None,
+                page_size: 1,
+            })
+            .await,
+        Err(ThreadStoreError::Conflict { .. })
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    first.abort();
+    assert!(first.await.expect_err("request cancelled").is_cancelled());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match crate::local::search_budget::acquire_slot(home.path()) {
+                Ok(lock) => {
+                    drop(lock);
+                    break;
+                }
+                Err(ThreadStoreError::Conflict { .. }) => tokio::task::yield_now().await,
+                Err(err) => panic!("unexpected slot error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("SQLite worker stopped and released workspace slot");
+}
+
+async fn index_search_ancestor(store: &LocalThreadStore, thread_id: ThreadId) {
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        rollout_path(&store.config.codex_home, thread_id),
+        Utc::now(),
+        SessionSource::Cli,
+    );
+    builder.history_mode = ThreadHistoryMode::Paginated;
+    store
+        .state_db()
+        .await
+        .expect("state database")
+        .upsert_thread(&builder.build(&store.config.default_model_provider_id))
+        .await
+        .expect("index search ancestor");
+}
+
+#[tokio::test]
+async fn occurrence_search_rejects_unindexed_ancestors_and_legacy() {
+    let (home, store, child_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let root_id = ThreadId::default();
+    let root_path = rollout_path(home.path(), root_id);
+    write_rollout_with_end(
+        &root_path, root_id, /*history_base*/ None, /*next_ordinal*/ 3,
+    );
+    write_rollout(
+        &rollout_path(home.path(), child_id),
+        child_id,
+        Some(history_position(
+            &root_path, root_id, /*end_ordinal_exclusive*/ 2,
+        )),
+    );
+    let error = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id: child_id,
+            search_term: "anything".to_string(),
+            cursor: None,
+            page_size: 1,
+        })
+        .await
+        .expect_err("existing unindexed ancestor must not trigger filesystem fallback");
+    assert!(error.to_string().contains("missing SQLite rollout path"));
+    let (_home, legacy, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    assert!(matches!(
+        legacy
+            .search_thread_occurrences(SearchThreadOccurrencesParams {
+                thread_id,
+                search_term: "anything".to_string(),
+                cursor: None,
+                page_size: 1,
+            })
+            .await,
+        Err(ThreadStoreError::Unsupported { .. })
+    ));
+}
+
+#[tokio::test]
+async fn occurrence_search_rejects_oversized_json_before_deserializing() {
+    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let db = history_db(&store).await;
+    insert_turn(
+        db,
+        thread_id,
+        "turn",
+        /*rollout_ordinal*/ 1,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ Some("item"),
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    insert_item(db, thread_id, "turn", "item", /*rollout_ordinal*/ 2).await;
+    sqlx::query(
+        "UPDATE thread_items SET item_type = 'userMessage', item_json = zeroblob(16777217)",
+    )
+    .execute(db)
+    .await
+    .expect("oversized invalid JSON");
+    let error = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "anything".to_string(),
+            cursor: None,
+            page_size: 1,
+        })
+        .await
+        .expect_err("byte limit");
+    assert!(error.to_string().contains("16 MiB"));
+}
+
+#[tokio::test]
+async fn occurrence_search_pages_early_matches_in_a_thread_over_the_candidate_budget() {
+    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let db = history_db(&store).await;
+    insert_turn(
+        db,
+        thread_id,
+        "turn",
+        /*rollout_ordinal*/ 1,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(2) UNION ALL SELECT x + 1 FROM n WHERE x < 10002) INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms, item_type, item_json) SELECT ?, 'turn', CAST(x AS TEXT), x, x, x, 'userMessage', ? FROM n")
+        .bind(thread_id.to_string())
+        .bind(r#"{"type":"userMessage","id":"item","content":[{"type":"text","text":"needle"}]}"#)
+        .execute(db).await.expect("candidate rows");
+    let first = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "needle".to_string(),
+            cursor: None,
+            page_size: 1,
+        })
+        .await
+        .expect("first matching page");
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2"]
+    );
+    assert!(first.next_cursor.is_some());
+    let second = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "needle".to_string(),
+            cursor: first.next_cursor,
+            page_size: 1,
+        })
+        .await
+        .expect("next matching page");
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["3"]
+    );
+    assert!(second.next_cursor.is_some());
+}
+
+#[tokio::test]
+async fn occurrence_search_rejects_truncated_and_compressed_ancestor_cutoffs() {
+    for compressed in [false, true] {
+        let (home, store, child_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+        let root_id = ThreadId::default();
+        let root_path = rollout_path(home.path(), root_id);
+        write_rollout_with_end(
+            &root_path, root_id, /*history_base*/ None, /*next_ordinal*/ 4,
+        );
+        let cutoff = history_position(&root_path, root_id, /*end_ordinal_exclusive*/ 3);
+        write_rollout(&rollout_path(home.path(), child_id), child_id, Some(cutoff));
+        index_search_ancestor(&store, root_id).await;
+        let bytes = fs::read(&root_path).expect("ancestor contents");
+        if compressed {
+            fs::write(
+                root_path.with_extension("jsonl.zst"),
+                zstd::stream::encode_all(bytes.as_slice(), /*level*/ 0)
+                    .expect("compressed ancestor"),
+            )
+            .expect("write compressed ancestor");
+            fs::remove_file(&root_path).expect("remove plain representation");
+        } else {
+            let metadata_end = bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .expect("metadata line")
+                + 1;
+            fs::write(&root_path, &bytes[..metadata_end])
+                .expect("truncate ancestor after metadata");
+        }
+        let error = store
+            .search_thread_occurrences(SearchThreadOccurrencesParams {
+                thread_id: child_id,
+                search_term: "anything".to_string(),
+                cursor: None,
+                page_size: 1,
+            })
+            .await
+            .expect_err("invalid or unsupported ancestor cutoff");
+        if compressed {
+            assert!(matches!(
+                error,
+                ThreadStoreError::Unsupported {
+                    operation: "thread/searchOccurrences with compressed ancestors"
+                }
+            ));
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("cutoff byte offset is past the source rollout"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn occurrence_search_rejects_candidate_exhaustion() {
+    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let db = history_db(&store).await;
+    insert_turn(
+        db,
+        thread_id,
+        "turn",
+        /*rollout_ordinal*/ 1,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(2) UNION ALL SELECT x + 1 FROM n WHERE x < 10002) INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms, item_type, item_json) SELECT ?, 'turn', CAST(x AS TEXT), x, x, x, 'userMessage', '{\"type\":\"userMessage\",\"id\":\"item\",\"content\":[]}' FROM n")
+        .bind(thread_id.to_string()).execute(db).await.expect("candidate rows");
+    let error = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "absent".to_string(),
+            cursor: None,
+            page_size: 1,
+        })
+        .await
+        .expect_err("candidate budget");
+    assert!(
+        error.to_string().contains("10,000 candidate rows")
+            || error.to_string().contains("5 second deadline"),
+        "{error}"
+    );
 }
 
 async fn store_with_mode(history_mode: ThreadHistoryMode) -> (TempDir, LocalThreadStore, ThreadId) {

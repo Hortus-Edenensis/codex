@@ -5,7 +5,6 @@ use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::strip_user_message_prefix;
-use futures::TryStreamExt;
 use pulldown_cmark::Event;
 use pulldown_cmark::Parser;
 use pulldown_cmark::TagEnd;
@@ -16,7 +15,6 @@ use sqlx::Row;
 use super::super::LocalThreadStore;
 use super::read::CursorScope;
 use super::read::serialize_cursor;
-use super::read::validate_thread_for_paginated_reads;
 use super::sqlite_integer;
 use super::thread_history_error;
 use super::turn_lookup::find_visible_turn;
@@ -26,6 +24,8 @@ use crate::StoredThreadOccurrence;
 use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+
+use super::super::search_budget as budget;
 
 const SNIPPET_CONTEXT_BEFORE_CHARS: usize = 48;
 const SNIPPET_CONTEXT_AFTER_CHARS: usize = 96;
@@ -43,7 +43,6 @@ struct CandidateRow {
     turn_id: String,
     item_id: String,
     rollout_ordinal: i64,
-    item_json: String,
     turn_rollout_ordinal: i64,
 }
 
@@ -51,6 +50,56 @@ pub(in crate::local) async fn search_thread_occurrences(
     store: &LocalThreadStore,
     params: SearchThreadOccurrencesParams,
 ) -> ThreadStoreResult<ThreadOccurrenceSearchPage> {
+    let budget = budget::SearchBudget::new();
+    if store.state_db.is_none() {
+        return Err(ThreadStoreError::Unsupported {
+            operation: "thread/searchOccurrences",
+        });
+    }
+    let lock = budget::acquire_slot(&store.config.codex_home)?;
+    let cancellation = budget::CancelOnDrop(budget.clone());
+    let store = store.clone();
+    // The worker owns the slot until both SQLite workers have stopped, even if the RPC is dropped.
+    let result = tokio::spawn(async move {
+        let _lock = lock;
+        let state_pool = budget
+            .open_pool(&store.config.sqlite, &store.config.sqlite.state_db_path())
+            .await?;
+        let result = async {
+            let lineage = store
+                .resolve_rollout_lineage_for_search(params.thread_id, &state_pool, &budget)
+                .await?;
+            let history_pool = budget
+                .open_pool(
+                    &store.config.sqlite,
+                    &store.config.sqlite.thread_history_db_path(),
+                )
+                .await?;
+            let result = search_bounded(params, &lineage, &history_pool, &budget)
+                .await
+                .map_err(|err| budget.check().err().unwrap_or(err));
+            budget.cancel();
+            history_pool.close().await;
+            result
+        }
+        .await;
+        budget.cancel();
+        state_pool.close().await;
+        result
+    })
+    .await
+    .map_err(thread_history_error)?;
+    drop(cancellation);
+    result
+}
+
+async fn search_bounded(
+    params: SearchThreadOccurrencesParams,
+    lineage: &super::super::rollout_lineage::RolloutLineage,
+    pool: &sqlx::SqlitePool,
+    budget: &budget::SearchBudget,
+) -> ThreadStoreResult<ThreadOccurrenceSearchPage> {
+    budget.check()?;
     if params.search_term.trim().is_empty() {
         return Err(ThreadStoreError::InvalidRequest {
             message: "thread/searchOccurrences requires search_term".to_string(),
@@ -61,20 +110,12 @@ pub(in crate::local) async fn search_thread_occurrences(
             message: "thread/searchOccurrences requires page_size greater than zero".to_string(),
         });
     }
-    validate_thread_for_paginated_reads(
-        store,
-        params.thread_id,
-        /*include_archived*/ true,
-        "thread/searchOccurrences",
-    )
-    .await?;
     let cursor = parse_cursor(
         params.cursor.as_deref(),
         params.thread_id,
         &params.search_term,
     )?;
     let matcher = LiteralMatcher::new(params.search_term.as_str());
-    let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
     let cursor_segment = cursor
         .as_ref()
         .map(|cursor| {
@@ -86,9 +127,9 @@ pub(in crate::local) async fn search_thread_occurrences(
                 .ok_or_else(|| invalid_cursor("position outside thread lineage"))
         })
         .transpose()?;
-    let pool = store.thread_history_db().await?;
-    let mut items = Vec::with_capacity(params.page_size);
+    let mut items = Vec::new();
     let mut effective_turn_ordinals = HashMap::new();
+    let mut candidates = 0_usize;
     for (segment_index, segment) in lineage
         .segments()
         .iter()
@@ -108,15 +149,15 @@ pub(in crate::local) async fn search_thread_occurrences(
             .map(|ordinal| sqlite_integer(ordinal, "rollout ordinal"))
             .transpose()?
             .unwrap_or(i64::MAX);
-        let mut rows = sqlx::query(
+        budget.check()?;
+        let rows = sqlx::query(
             r#"
-SELECT turn_id, item_id, rollout_ordinal, item_json, turn_rollout_ordinal
+SELECT turn_id, item_id, rollout_ordinal, turn_rollout_ordinal
 FROM (
     SELECT
         items.turn_id,
         items.item_id,
         items.rollout_ordinal,
-        items.item_json,
         turns.rollout_ordinal AS turn_rollout_ordinal
     FROM thread_items AS items
     JOIN thread_turns AS turns
@@ -135,7 +176,6 @@ FROM (
         items.turn_id,
         items.item_id,
         items.rollout_ordinal,
-        items.item_json,
         turns.rollout_ordinal AS turn_rollout_ordinal
     FROM thread_turns AS turns
     JOIN thread_items AS items
@@ -150,6 +190,7 @@ FROM (
       AND turns.rollout_ordinal < ?
 )
 ORDER BY rollout_ordinal ASC
+LIMIT ?
         "#,
         )
         .bind(segment.rollout_id().to_string())
@@ -162,18 +203,38 @@ ORDER BY rollout_ordinal ASC
         .bind(end_rollout_ordinal)
         .bind(segment_start_ordinal)
         .bind(end_rollout_ordinal)
-        .fetch(pool);
+        .bind(i64::try_from(budget::MAX_CANDIDATES + 1 - candidates).unwrap_or(i64::MAX))
+        .fetch_all(pool)
+        .await
+        .map_err(|err| budget.query_error(err))?;
 
         let mut matching_rows = Vec::new();
         let mut matching_occurrences = 0_usize;
-        while let Some(row) = rows.try_next().await.map_err(thread_history_error)? {
+        for row in rows {
+            budget.check()?;
+            candidates += 1;
+            if candidates > budget::MAX_CANDIDATES {
+                return Err(budget::limit_error("10,000 candidate rows"));
+            }
             let row = candidate_row(row)?;
-            let item =
-                serde_json::from_str::<ThreadItem>(row.item_json.as_str()).map_err(|err| {
-                    ThreadStoreError::Internal {
-                        message: format!("failed to deserialize stored thread item: {err}"),
-                    }
-                })?;
+            // Check the byte length inside SQLite, before sqlx allocates a Rust String.
+            let item_json = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT CASE WHEN length(CAST(item_json AS BLOB)) <= ? THEN item_json END FROM thread_items WHERE thread_id = ? AND turn_id = ? AND item_id = ?",
+            )
+            .bind(i64::try_from(budget.remaining_bytes()).unwrap_or(i64::MAX))
+            .bind(segment.rollout_id().to_string())
+            .bind(&row.turn_id)
+            .bind(&row.item_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|err| budget.query_error(err))?
+            .ok_or_else(|| budget::limit_error("16 MiB of text"))?;
+            budget.consume_bytes(item_json.len())?;
+            let item = serde_json::from_str::<ThreadItem>(item_json.as_str()).map_err(|err| {
+                ThreadStoreError::Internal {
+                    message: format!("failed to deserialize stored thread item: {err}"),
+                }
+            })?;
             let Some(text) = searchable_text(&item) else {
                 continue;
             };
@@ -204,7 +265,6 @@ ORDER BY rollout_ordinal ASC
                 break;
             }
         }
-        drop(rows);
 
         for (row, text, matches, first_occurrence_index) in matching_rows {
             let turn_rollout_ordinal = if segment_index + 1 == lineage.segments().len() {
@@ -212,7 +272,7 @@ ORDER BY rollout_ordinal ASC
             } else if let Some(ordinal) = effective_turn_ordinals.get(&row.turn_id) {
                 *ordinal
             } else {
-                let ordinal = find_visible_turn(pool, &lineage, row.turn_id.as_str())
+                let ordinal = find_visible_turn(pool, lineage, row.turn_id.as_str())
                     .await?
                     .rollout_ordinal;
                 effective_turn_ordinals.insert(row.turn_id.clone(), ordinal);
@@ -228,6 +288,7 @@ ORDER BY rollout_ordinal ASC
                 matches.into_iter().enumerate().skip(first_occurrence_index)
             {
                 if items.len() == params.page_size {
+                    budget.check()?;
                     return Ok(ThreadOccurrenceSearchPage {
                         items,
                         next_cursor: Some(serialize_cursor_for_search(SearchCursor {
@@ -249,6 +310,7 @@ ORDER BY rollout_ordinal ASC
         }
     }
 
+    budget.check()?;
     Ok(ThreadOccurrenceSearchPage {
         items,
         next_cursor: None,
@@ -267,7 +329,6 @@ fn candidate_row(row: sqlx::sqlite::SqliteRow) -> ThreadStoreResult<CandidateRow
         turn_id: row.try_get("turn_id")?,
         item_id: row.try_get("item_id")?,
         rollout_ordinal,
-        item_json: row.try_get("item_json")?,
         turn_rollout_ordinal,
     })
 }

@@ -30,6 +30,86 @@ pub(super) struct RolloutLineage {
 }
 
 impl LocalThreadStore {
+    pub(super) async fn resolve_rollout_lineage_for_search(
+        &self,
+        requested_thread_id: ThreadId,
+        pool: &sqlx::SqlitePool,
+        budget: &super::search_budget::SearchBudget,
+    ) -> ThreadStoreResult<RolloutLineage> {
+        let mut segments = Vec::new();
+        let mut seen = HashSet::new();
+        let mut next_id = requested_thread_id;
+        let mut end: Option<HistoryPosition> = None;
+        loop {
+            budget.check()?;
+            if !seen.insert(next_id) {
+                return Err(malformed_lineage(requested_thread_id, "cycle detected"));
+            }
+            let (path, mode) = sqlx::query_as::<_, (String, String)>(
+                "SELECT rollout_path, history_mode FROM threads WHERE id = ?",
+            )
+            .bind(next_id.to_string())
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| budget.query_error(err))?
+            .ok_or_else(|| malformed_lineage(next_id, "missing SQLite rollout path"))?;
+            if mode != "paginated" {
+                return Err(ThreadStoreError::Unsupported {
+                    operation: "thread/searchOccurrences",
+                });
+            }
+            let rollout_path = codex_rollout::existing_rollout_path(Path::new(&path))
+                .await
+                .ok_or_else(|| malformed_lineage(next_id, "missing indexed rollout file"))?;
+            let rollout_id = codex_rollout::rollout_id_from_path(&rollout_path)
+                .ok_or_else(|| malformed_lineage(next_id, "invalid indexed rollout filename"))?;
+            if end.is_some() && rollout_id != next_id {
+                return Err(malformed_lineage(
+                    next_id,
+                    "SQLite does not index the frozen ancestor rollout",
+                ));
+            }
+            let path = rollout_path.clone();
+            let read_budget = budget.clone();
+            let meta =
+                tokio::task::spawn_blocking(move || read_search_metadata(&path, &read_budget, end))
+                    .await
+                    .map_err(|err| ThreadStoreError::Internal {
+                        message: format!("failed to join search metadata reader: {err}"),
+                    })??;
+            if meta.meta.id != next_id || meta.meta.history_mode != ThreadHistoryMode::Paginated {
+                return Err(malformed_lineage(
+                    next_id,
+                    "indexed metadata does not match paginated thread",
+                ));
+            }
+            if end.is_some_and(|end| end.end_ordinal_exclusive == 0) {
+                return Err(malformed_lineage(
+                    next_id,
+                    "cutoff includes source session metadata",
+                ));
+            }
+            let start_ordinal = meta
+                .meta
+                .history_base
+                .map_or(Some(1), |base| base.end_ordinal_exclusive.checked_add(1))
+                .ok_or_else(|| malformed_lineage(next_id, "source ordinal overflow"))?;
+            segments.push(RolloutLineageSegment {
+                rollout_id,
+                rollout_path,
+                start_ordinal,
+                end,
+            });
+            let Some(base) = meta.meta.history_base else {
+                break;
+            };
+            next_id = base.thread_id;
+            end = Some(base);
+        }
+        segments.reverse();
+        Ok(RolloutLineage { segments })
+    }
+
     pub(super) async fn resolve_rollout_lineage(
         &self,
         requested_thread_id: ThreadId,
@@ -186,6 +266,78 @@ impl LocalThreadStore {
 
         segments.reverse();
         Ok(RolloutLineage { segments })
+    }
+}
+
+fn read_search_metadata(
+    path: &Path,
+    budget: &super::search_budget::SearchBudget,
+    end: Option<HistoryPosition>,
+) -> ThreadStoreResult<codex_protocol::protocol::SessionMetaLine> {
+    use std::io::BufRead;
+    use std::io::BufReader;
+    use std::io::Read;
+
+    let read_error = |err| ThreadStoreError::Internal {
+        message: format!(
+            "failed to read indexed search metadata {}: {err}",
+            path.display()
+        ),
+    };
+    budget.check()?;
+    let file = std::fs::File::open(path).map_err(read_error)?;
+    let metadata = file.metadata().map_err(read_error)?;
+    if !metadata.is_file() {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "indexed rollout must be a regular file".to_string(),
+        });
+    }
+    let compressed = path.extension().is_some_and(|extension| extension == "zst");
+    if let Some(end) = end {
+        if compressed {
+            return Err(ThreadStoreError::Unsupported {
+                operation: "thread/searchOccurrences with compressed ancestors",
+            });
+        }
+        if end.end_byte_offset > metadata.len() {
+            return Err(malformed_lineage(
+                end.thread_id,
+                "cutoff byte offset is past the source rollout",
+            ));
+        }
+    }
+    let reader: Box<dyn Read> = if compressed {
+        Box::new(zstd::stream::read::Decoder::new(file).map_err(read_error)?)
+    } else {
+        Box::new(file)
+    };
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    loop {
+        budget.check()?;
+        let available = reader.fill_buf().map_err(read_error)?;
+        if available.is_empty() {
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let length = newline.map_or(available.len(), |index| index + 1);
+        budget.consume_bytes(length)?;
+        line.extend_from_slice(&available[..length]);
+        reader.consume(length);
+        if newline.is_some() {
+            break;
+        }
+    }
+    budget.check()?;
+    let rollout: codex_rollout::RolloutLine =
+        serde_json::from_slice(&line).map_err(|err| ThreadStoreError::Internal {
+            message: format!("invalid indexed search metadata: {err}"),
+        })?;
+    match rollout.item {
+        codex_rollout::RolloutItem::SessionMeta(meta) => Ok(meta),
+        _ => Err(ThreadStoreError::InvalidRequest {
+            message: "indexed rollout must start with session metadata".to_string(),
+        }),
     }
 }
 

@@ -15,6 +15,7 @@ mod rollout_migration;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
 mod rollout_lineage;
+mod search_budget;
 mod search_threads;
 mod thread_history;
 mod thread_history_materialization;

@@ -300,6 +300,7 @@ impl SqliteConfig {
             .filename(path)
             .create_if_missing(false)
             .read_only(true)
+            .row_buffer_size(1)
             .log_statements(LevelFilter::Off);
         if let Some(busy_timeout) = busy_timeout {
             options = options.busy_timeout(busy_timeout);
