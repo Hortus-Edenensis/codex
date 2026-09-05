@@ -58,6 +58,7 @@ def main():
 import os, signal, subprocess, sys, time
 assert sys.argv[1:7] == ['--no-config', '--no-mmap', '-j', '2', '--max-filesize', '1M']
 args = sys.argv[7:]
+assert not any(arg in ('--no-config', '--no-mmap', '-j', '--threads', '--max-filesize') or arg.startswith(('--threads=', '--max-filesize=')) for arg in args)
 if 'CHILD' in args:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     child = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'])
@@ -140,10 +141,76 @@ else:
         )
         check(["--threads=99", "MATCH", str(source)], 2, "threads must")
         check(["--max-filesize=2M", "MATCH", str(source)], 2, "at most 1 MiB")
+        check(
+            [
+                "--no-config",
+                "--no-mmap",
+                "-j2",
+                "--max-filesize=1M",
+                "MATCH",
+                str(small),
+            ],
+            0,
+        )
+        normalized = guard.inspect_args(
+            [
+                "--no-config",
+                "--no-mmap",
+                "-nj2",
+                "--threads",
+                "1",
+                "--max-filesize=1M",
+                "--max-filesize",
+                "512K",
+                "-e",
+                "MATCH",
+                str(small),
+            ],
+            source,
+            stat.S_IFCHR,
+            [root],
+            [history],
+        )[2]
+        assert normalized == [
+            "--no-config",
+            "--no-mmap",
+            "-j",
+            "1",
+            "--max-filesize",
+            "512K",
+            "-n",
+            "--regexp=MATCH",
+            str(small),
+        ]
+        check(["--", "--threads", str(small)], 1, real_rg=actual_rg)
         check(["-n", "MATCH", str(root)], 2, "broad directory")
         check(["MATCH"], 2, "broad directory", cwd=str(root))
         check(["MATCH", str(source / "back-to-root")], 2, "broad directory")
         check(["MATCH", str(history / "sessions")], 2, "history directory")
+        for marker_kind in ("directory", "file"):
+            repo = root / f"repo-{marker_kind}"
+            repo_source = repo / "src"
+            repo_source.mkdir(parents=True)
+            if marker_kind == "directory":
+                (repo / ".git").mkdir()
+            else:
+                (repo / ".git").write_text("gitdir: /unused/worktree\n")
+            repo_file = repo / "README.md"
+            repo_file.write_text("hello\n")
+            check(["MATCH", str(repo)], 2, "repository root")
+            check(["MATCH", "."], 2, "repository root", cwd=str(repo))
+            check(["MATCH"], 2, "repository root", cwd=str(repo))
+            check(["--files", str(repo)], 2, "repository root")
+            check(["MATCH", str(repo_source)], 0)
+            check(["hello", str(repo_file)], 0, real_rg=actual_rg)
+        for system_root in ("/tmp", "/var", "/usr", "/etc", "/opt"):
+            if Path(system_root).is_dir():
+                try:
+                    guard.inspect_args(["MATCH", system_root], source, stat.S_IFCHR)
+                except guard.Blocked as error:
+                    assert "broad directory" in str(error)
+                else:
+                    raise AssertionError(f"system root allowed: {system_root}")
         for unsafe in (
             "-uuu",
             "--hidden",
@@ -160,7 +227,7 @@ else:
         with large.open("wb") as stream:
             stream.truncate(guard.MAX_FILE + 1)
         check(["MATCH", str(large)], 2, "exceeds 1 MiB")
-        directory, key = guard.inspect_args(
+        directory, key, forwarded = guard.inspect_args(
             ["-nF", "-e", "not/a/path", "--glob=*.py", str(source)],
             source,
             stat.S_IFCHR,

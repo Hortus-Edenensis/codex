@@ -16,7 +16,26 @@ import sys
 import time
 
 STATE_DIR = Path("/run/codex-workspace-32323-rg")
-BROAD_ROOTS = ("/", "/workspace", "/workspace/repo", "/home", "/home/codex")
+BROAD_ROOTS = (
+    "/",
+    "/workspace",
+    "/workspace/repo",
+    "/workspace/repo/SDGO-server",
+    "/home",
+    "/home/codex",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/tmp",
+    "/var",
+    "/usr",
+    "/etc",
+    "/opt",
+    "/mnt",
+    "/media",
+    "/root",
+)
 HISTORY_ROOTS = ("/home/codex/.codex", "/workspace/repo/.git/codex-persist/codex-home")
 MAX_FILE = 1024 * 1024
 FLAGS = set("nNlqFiSswxvcoHh0Ub")
@@ -95,6 +114,8 @@ def inspect_args(
     args, cwd, stdin_mode, broad_roots=BROAD_ROOTS, history_roots=HISTORY_ROOTS
 ):
     patterns, positional = [], []
+    forwarded = []
+    threads, max_filesize = "2", "1M"
     listing = metadata = False
     index = 0
     after_dash = False
@@ -103,9 +124,11 @@ def inspect_args(
         index += 1
         if arg == "--" and not after_dash:
             after_dash = True
+            forwarded.append(arg)
             continue
         if after_dash or not arg.startswith("-") or arg == "-":
             positional.append(arg)
+            forwarded.append(arg)
             continue
         options = []
         if arg.startswith("--"):
@@ -113,6 +136,8 @@ def inspect_args(
             if name in LONG_FLAGS and not equal:
                 listing |= name == "files"
                 metadata |= name in ("help", "version")
+                if name not in ("no-config", "no-mmap"):
+                    forwarded.append(arg)
                 continue
             if name not in LONG_VALUES:
                 raise Blocked(f"unsupported or unsafe option: --{name}")
@@ -124,6 +149,7 @@ def inspect_args(
                     break
                 if char not in FLAGS:
                     raise Blocked(f"unsupported or unsafe option: -{char}")
+                forwarded.append(f"-{char}")
         for name, value in options:
             if value is None:
                 if index == len(args):
@@ -132,15 +158,29 @@ def inspect_args(
                 index += 1
             if name == "regexp":
                 patterns.append(value)
-            elif name == "threads" and value not in ("1", "2"):
-                raise Blocked("threads must be 1 or 2")
+            if name == "threads":
+                if value not in ("1", "2"):
+                    raise Blocked("threads must be 1 or 2")
+                threads = value
             elif name == "max-filesize":
                 size = re.fullmatch(r"([0-9]+)([KMG]?)", value)
                 units = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}
                 if not size or not 0 < int(size[1]) * units[size[2]] <= MAX_FILE:
                     raise Blocked("max-filesize must be positive and at most 1 MiB")
+                max_filesize = value
+            else:
+                forwarded.append(f"--{name}={value}")
+    forwarded = [
+        "--no-config",
+        "--no-mmap",
+        "-j",
+        threads,
+        "--max-filesize",
+        max_filesize,
+        *forwarded,
+    ]
     if metadata:
-        return False, "metadata"
+        return False, "metadata", forwarded
     if not patterns and not listing:
         if not positional:
             raise Blocked("a pattern or --files is required")
@@ -176,6 +216,10 @@ def inspect_args(
             raise Blocked(f"history directory access is disabled: {path}")
         info = path.stat()
         if stat.S_ISDIR(info.st_mode):
+            if os.path.lexists(path / ".git"):
+                raise Blocked(
+                    f"repository root scan denied; select a source subdirectory: {path}"
+                )
             directory = True
         elif not stat.S_ISREG(info.st_mode):
             raise Blocked(
@@ -185,7 +229,7 @@ def inspect_args(
             raise Blocked(f"explicit file exceeds 1 MiB; narrow the input: {path}")
         canonical.append(str(path))
     signature = json.dumps([sorted(patterns), sorted(set(canonical)), listing])
-    return directory, hashlib.sha256(signature.encode()).hexdigest()
+    return directory, hashlib.sha256(signature.encode()).hexdigest(), forwarded
 
 
 def stop_group(process, grace):
@@ -252,7 +296,7 @@ def run(
     try:
         if parent == 1:
             raise Blocked("caller disconnected before the scan started")
-        directory, key = inspect_args(
+        directory, key, forwarded = inspect_args(
             args, cwd, os.fstat(0).st_mode, broad_roots, history_roots
         )
         # Installation owns the directory; never fall back to an unlocked scan.
@@ -305,16 +349,7 @@ def run(
                 env.pop("RIPGREP_CONFIG_PATH", None)
                 supervisor = os.getpid()
                 process = subprocess.Popen(
-                    [
-                        str(real_rg),
-                        "--no-config",
-                        "--no-mmap",
-                        "-j",
-                        "2",
-                        "--max-filesize",
-                        "1M",
-                        *args,
-                    ],
+                    [str(real_rg), *forwarded],
                     cwd=cwd,
                     env=env,
                     stdout=subprocess.PIPE,
