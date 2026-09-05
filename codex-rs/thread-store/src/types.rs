@@ -329,7 +329,7 @@ pub struct ListThreadsParams {
     pub use_state_db_only: bool,
 }
 
-/// Parameters for searching thread content.
+/// Parameters for searching stored thread metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchThreadsParams {
     /// Maximum number of threads to return.
@@ -344,7 +344,7 @@ pub struct SearchThreadsParams {
     pub allowed_sources: Vec<SessionSource>,
     /// Whether archived threads should be searched instead of active threads.
     pub archived: bool,
-    /// Visible thread content to search for.
+    /// Literal, case-sensitive text to match in the stored name, title, or preview.
     pub search_term: String,
 }
 

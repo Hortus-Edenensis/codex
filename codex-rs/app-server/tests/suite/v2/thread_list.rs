@@ -687,8 +687,32 @@ sqlite = true
     Ok(())
 }
 
+async fn index_search_rollouts(codex_home: &Path, rollouts: &[(&str, &str)]) -> Result<()> {
+    let state = codex_state::StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.abs()),
+        "mock_provider".to_string(),
+    )
+    .await?;
+    for (timestamp, thread_id) in rollouts {
+        codex_rollout::state_db::reconcile_rollout(
+            Some(state.as_ref()),
+            &rollout_path(codex_home, timestamp, thread_id),
+            "mock_provider",
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ None,
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+    }
+    state
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
-async fn thread_search_returns_content_matches() -> Result<()> {
+async fn thread_search_returns_metadata_matches() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_minimal_config(codex_home.path())?;
 
@@ -700,7 +724,7 @@ async fn thread_search_returns_content_matches() -> Result<()> {
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
-    let _non_match = create_fake_rollout(
+    let non_match = create_fake_rollout(
         codex_home.path(),
         "2025-01-02T11-00-00",
         "2025-01-02T11:00:00Z",
@@ -720,11 +744,21 @@ async fn thread_search_returns_content_matches() -> Result<()> {
         codex_home.path(),
         "2025-01-02T12-00-00",
         "2025-01-02T12:00:00Z",
-        "mixed NEEDLE suffix",
+        "mixed needle suffix",
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
 
+    index_search_rollouts(
+        codex_home.path(),
+        &[
+            ("2025-01-02T10-00-00", &older_match),
+            ("2025-01-02T11-00-00", &non_match),
+            ("2025-01-02T11-30-00", &unsectioned_match),
+            ("2025-01-02T12-00-00", &newer_match),
+        ],
+    )
+    .await?;
     let mut mcp = init_mcp(codex_home.path()).await?;
     let request_id = mcp
         .send_thread_search_request(codex_app_server_protocol::ThreadSearchParams {
@@ -754,7 +788,7 @@ async fn thread_search_returns_content_matches() -> Result<()> {
             older_match.as_str(),
         ]
     );
-    assert_eq!(data[0].snippet, "mixed NEEDLE suffix");
+    assert_eq!(data[0].snippet, "mixed needle suffix");
 
     let mut pinned_threads = Vec::new();
     for thread_id in [&older_match, &newer_match] {
@@ -828,7 +862,7 @@ async fn thread_search_returns_content_matches() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_search_matches_json_escaped_content() -> Result<()> {
+async fn thread_search_matches_literal_metadata() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_minimal_config(codex_home.path())?;
 
@@ -842,6 +876,7 @@ async fn thread_search_matches_json_escaped_content() -> Result<()> {
         /*git_info*/ None,
     )?;
 
+    index_search_rollouts(codex_home.path(), &[("2025-01-02T10-00-00", &thread_id)]).await?;
     let mut mcp = init_mcp(codex_home.path()).await?;
     let request_id = mcp
         .send_thread_search_request(codex_app_server_protocol::ThreadSearchParams {
@@ -887,6 +922,14 @@ async fn thread_search_filters_by_source_kind() -> Result<()> {
         CoreSessionSource::Exec,
     )?;
 
+    index_search_rollouts(
+        codex_home.path(),
+        &[
+            ("2025-02-01T10-00-00", &cli_id),
+            ("2025-02-01T11-00-00", &exec_id),
+        ],
+    )
+    .await?;
     let mut mcp = init_mcp(codex_home.path()).await?;
     let request_id = mcp
         .send_thread_search_request(codex_app_server_protocol::ThreadSearchParams {

@@ -2,15 +2,18 @@ use std::collections::HashMap;
 
 use chrono::DateTime;
 use chrono::Utc;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::parse_cursor;
 use codex_state::ThreadFilterOptions;
 
 use super::LocalThreadStore;
+use super::helpers::distinct_thread_metadata_title;
 use super::helpers::resolve_thread_names;
 use super::helpers::resolve_thread_section_metadata;
 use super::helpers::set_thread_name;
+use super::helpers::sqlite_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
 use super::read_thread::stored_thread_from_state_metadata;
 use crate::ListThreadsParams;
@@ -87,7 +90,30 @@ pub(super) async fn list_threads(
         .iter()
         .map(|thread| (thread.thread_id, thread.history_mode))
         .collect::<HashMap<_, _>>();
-    let names = resolve_thread_names(store, &thread_history_modes).await;
+    let names = if params.use_state_db_only {
+        let mut names = HashMap::new();
+        if let Some(state_db) = state_db.as_ref() {
+            for (&thread_id, &history_mode) in &thread_history_modes {
+                let metadata = state_db.get_thread(thread_id).await.map_err(|err| {
+                    ThreadStoreError::Internal {
+                        message: format!("failed to read thread name from state DB: {err}"),
+                    }
+                })?;
+                if let Some(metadata) = metadata {
+                    let name = match history_mode {
+                        ThreadHistoryMode::Legacy => distinct_thread_metadata_title(&metadata),
+                        ThreadHistoryMode::Paginated => sqlite_thread_name(&metadata),
+                    };
+                    if let Some(name) = name {
+                        names.insert(thread_id, name);
+                    }
+                }
+            }
+        }
+        names
+    } else {
+        resolve_thread_names(store, &thread_history_modes).await
+    };
     for thread in &mut items {
         if let Some(name) = names.get(&thread.thread_id).cloned() {
             set_thread_name(thread, name);
@@ -253,7 +279,11 @@ pub(super) async fn list_rollout_threads(
     sort_key: codex_rollout::ThreadSortKey,
     sort_direction: codex_rollout::SortDirection,
 ) -> ThreadStoreResult<codex_rollout::ThreadsPage> {
-    if params.relation_filter.is_some() || params.section.is_some() || params.project_id.is_some() {
+    if params.use_state_db_only
+        || params.relation_filter.is_some()
+        || params.section.is_some()
+        || params.project_id.is_some()
+    {
         let relation_filter = params
             .relation_filter
             .map(|relation_filter| match relation_filter {
@@ -287,37 +317,7 @@ pub(super) async fn list_rollout_threads(
         return Ok(page.into());
     }
 
-    let page = if params.use_state_db_only && params.archived {
-        RolloutRecorder::list_archived_threads_from_state_db(
-            state_db,
-            config,
-            params.page_size,
-            cursor,
-            sort_key,
-            sort_direction,
-            params.allowed_sources.as_slice(),
-            params.model_providers.as_deref(),
-            params.cwd_filters.as_deref(),
-            default_model_provider_id,
-            params.search_term.as_deref(),
-        )
-        .await
-    } else if params.use_state_db_only {
-        RolloutRecorder::list_threads_from_state_db(
-            state_db,
-            config,
-            params.page_size,
-            cursor,
-            sort_key,
-            sort_direction,
-            params.allowed_sources.as_slice(),
-            params.model_providers.as_deref(),
-            params.cwd_filters.as_deref(),
-            default_model_provider_id,
-            params.search_term.as_deref(),
-        )
-        .await
-    } else if params.archived {
+    let page = if params.archived {
         RolloutRecorder::list_archived_threads(
             state_db,
             config,
