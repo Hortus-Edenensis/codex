@@ -65,9 +65,9 @@ jobs:
       - name: Test search, state, rollout listing and read repair
         working-directory: codex-rs
         run: just test -p codex-rollout -p codex-thread-store -p codex-state --lib --locked --release --target x86_64-unknown-linux-gnu
-      - name: Test public search and DB-only listing APIs
+      - name: Test public search, listing and task lifecycle APIs
         working-directory: codex-rs
-        run: just test -p codex-app-server --test all --locked --release --target x86_64-unknown-linux-gnu -E 'test(thread_search) | test(thread_list_state_db_only)'
+        run: just test -p codex-app-server --test all --locked --release --target x86_64-unknown-linux-gnu -E 'test(thread_search) | test(thread_list_state_db_only) | test(thread_start_creates_thread_and_emits_started) | test(thread_start_ephemeral_remains_pathless) | test(thread_resume_can_skip_turns_for_metadata_only_resume) | test(thread_resume_keeps_in_flight_turn_streaming)'
       - name: Fix scoped lints and reject unrecorded source changes
         working-directory: codex-rs
         run: |
@@ -100,7 +100,7 @@ jobs:
           output = subprocess.check_output(['readelf', '--version-info', str(binary)], text=True)
           versions = [tuple(map(int, x.split('.'))) for x in re.findall(r'GLIBC_([0-9.]+)', output)]
           assert versions and max(versions) <= (2, 35), max(versions)
-          record = {'source_commit': os.environ['GITHUB_SHA'], 'upstream_commit': 'b1a547b1f73ce86205d9222ac19cff334b3b7a2e', 'maintenance_base_commit': '092586815f0185ac46d59299bf7f1b0d3eb9e3fb', 'version': os.environ['BUILD_VERSION'], 'target': 'x86_64-unknown-linux-gnu', 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'guard_sha256': hashlib.sha256(pathlib.Path('dist/overlay/bin/workspace-rg-guard.py').read_bytes()).hexdigest(), 'required_base_release': '0.153.3-x86_64-unknown-linux-musl', 'base_bwrap_sha256': os.environ['CODEX_BWRAP_SHA256'], 'maximum_glibc': '.'.join(map(str, max(versions))), 'tests': 'workspace rg guard; rollout, thread-store and state libraries; public thread_search and thread_list_state_db_only APIs; scoped clippy', 'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
+          record = {'source_commit': os.environ['GITHUB_SHA'], 'upstream_commit': 'b1a547b1f73ce86205d9222ac19cff334b3b7a2e', 'maintenance_base_commit': '092586815f0185ac46d59299bf7f1b0d3eb9e3fb', 'version': os.environ['BUILD_VERSION'], 'target': 'x86_64-unknown-linux-gnu', 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'guard_sha256': hashlib.sha256(pathlib.Path('dist/overlay/bin/workspace-rg-guard.py').read_bytes()).hexdigest(), 'required_base_release': '0.153.3-x86_64-unknown-linux-musl', 'base_bwrap_sha256': os.environ['CODEX_BWRAP_SHA256'], 'maximum_glibc': '.'.join(map(str, max(versions))), 'tests': 'workspace rg guard; rollout, thread-store and state libraries; public search, DB-only listing, task start and resume APIs; scoped clippy', 'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
           pathlib.Path('dist/provenance.json').write_text(json.dumps(record, indent=2) + '\n')
           PY
           tar -C dist/overlay -czf "dist/codex-${BUILD_VERSION}-x86_64-unknown-linux-gnu-overlay.tar.gz" bin/codex bin/workspace-rg-guard.py

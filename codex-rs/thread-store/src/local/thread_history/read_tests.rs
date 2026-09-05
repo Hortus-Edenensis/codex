@@ -1305,10 +1305,9 @@ async fn occurrence_search_cancellation_holds_workspace_slot_until_sqlite_stops(
         .execute(db)
         .await
         .expect("replace items");
-    let view = format!(
-        "CREATE VIEW thread_items AS WITH RECURSIVE n(x) AS (VALUES(2) UNION ALL SELECT x + 1 FROM n WHERE x < 100000000) SELECT '{thread_id}' AS thread_id, 'turn' AS turn_id, CAST(x AS TEXT) AS item_id, x AS rollout_ordinal, CASE WHEN x = 100000000 THEN 'userMessage' ELSE 'other' END AS item_type, '{{}}' AS item_json FROM n"
-    );
-    sqlx::query(&view)
+    sqlx::query(
+        "CREATE VIEW thread_items AS WITH RECURSIVE n(x) AS (VALUES(2) UNION ALL SELECT x + 1 FROM n WHERE x < 100000000) SELECT (SELECT thread_id FROM thread_turns LIMIT 1) AS thread_id, 'turn' AS turn_id, CAST(x AS TEXT) AS item_id, x AS rollout_ordinal, CASE WHEN x = 100000000 THEN 'userMessage' ELSE 'other' END AS item_type, '{}' AS item_json FROM n",
+    )
         .execute(db)
         .await
         .expect("slow search view");
