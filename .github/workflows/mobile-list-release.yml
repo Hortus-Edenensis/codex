@@ -31,7 +31,8 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends build-essential binutils file libcap-dev libssl-dev pkg-config protobuf-compiler
+          sudo apt-get install -y --no-install-recommends build-essential binutils file libcap-dev libssl-dev pkg-config protobuf-compiler ripgrep
+          rg --version
       - name: Bind binary version to tag and source
         run: |
           python3 - <<'PY'
@@ -55,6 +56,13 @@ jobs:
       - name: Build Linux x86_64 CLI and App Server
         working-directory: codex-rs
         run: cargo build --locked --release --target x86_64-unknown-linux-gnu -p codex-cli --bin codex
+      - name: Retain compiled binary before packaging
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: mobile-list-raw-linux-x86_64
+          path: codex-rs/target/x86_64-unknown-linux-gnu/release/codex
+          if-no-files-found: error
+          retention-days: 3
       - name: Verify and package binary overlay
         run: |
           set -euo pipefail
