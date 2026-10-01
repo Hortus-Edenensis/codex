@@ -838,6 +838,7 @@ async fn lookup_latest_session_target_with_app_server(
         let response = app_server
             .thread_list(latest_session_lookup_params(
                 uses_remote_filesystem,
+                uses_remote_workspace,
                 model_provider.clone(),
                 config,
                 cwd_filter,
@@ -866,6 +867,7 @@ enum LatestSessionLookupMode {
 
 fn latest_session_lookup_params(
     uses_remote_filesystem: bool,
+    uses_remote_workspace: bool,
     model_provider: Option<String>,
     config: &Config,
     cwd_filter: Option<&Path>,
@@ -878,7 +880,9 @@ fn latest_session_lookup_params(
         limit: Some(1),
         sort_key: Some(AppServerThreadSortKey::UpdatedAt),
         sort_direction: None,
-        model_providers: model_provider.map(|provider| vec![provider]),
+        model_providers: model_provider
+            .map(|provider| vec![provider])
+            .or_else(|| uses_remote_workspace.then(Vec::new)),
         source_kinds: Some(resume_source_kinds(include_non_interactive)),
         archived: Some(false),
         section_id: None,
@@ -3205,6 +3209,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ false,
+            /*uses_remote_workspace*/ false,
             /*model_provider*/ None,
             &config,
             Some(cwd.as_path()),
@@ -3221,6 +3226,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let scan_params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ false,
+            /*uses_remote_workspace*/ false,
             /*model_provider*/ None,
             &config,
             Some(cwd.as_path()),
@@ -3236,23 +3242,26 @@ requires_openai_auth = {requires_openai_auth}
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
-        let params = latest_session_lookup_params(
-            /*uses_remote_filesystem*/ false,
-            Some("selected-provider".to_string()),
-            &config,
-            Some(cwd.as_path()),
-            /*include_non_interactive*/ false,
-            LatestSessionLookupMode::StateDbOnly,
-        );
+        for uses_remote_workspace in [false, true] {
+            let params = latest_session_lookup_params(
+                /*uses_remote_filesystem*/ false,
+                uses_remote_workspace,
+                Some("selected-provider".to_string()),
+                &config,
+                Some(cwd.as_path()),
+                /*include_non_interactive*/ false,
+                LatestSessionLookupMode::StateDbOnly,
+            );
 
-        assert_eq!(
-            params.model_providers,
-            Some(vec!["selected-provider".to_string()])
-        );
-        assert_eq!(
-            params.cwd,
-            Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
-        );
+            assert_eq!(
+                params.model_providers,
+                Some(vec!["selected-provider".to_string()])
+            );
+            assert_eq!(
+                params.cwd,
+                Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
+            );
+        }
         Ok(())
     }
 
@@ -3264,6 +3273,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ true,
+            /*uses_remote_workspace*/ true,
             /*model_provider*/ None,
             &config,
             /*cwd_filter*/ None,
@@ -3271,7 +3281,7 @@ requires_openai_auth = {requires_openai_auth}
             LatestSessionLookupMode::StateDbOnly,
         );
 
-        assert_eq!(params.model_providers, None);
+        assert_eq!(params.model_providers, Some(Vec::new()));
         assert_eq!(params.cwd, None);
         Ok(())
     }
@@ -3284,6 +3294,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ true,
+            /*uses_remote_workspace*/ true,
             /*model_provider*/ None,
             &config,
             /*cwd_filter*/ None,
@@ -3312,6 +3323,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ true,
+            /*uses_remote_workspace*/ true,
             /*model_provider*/ None,
             &config,
             Some(cwd),
@@ -3319,7 +3331,7 @@ requires_openai_auth = {requires_openai_auth}
             LatestSessionLookupMode::StateDbOnly,
         );
 
-        assert_eq!(params.model_providers, None);
+        assert_eq!(params.model_providers, Some(Vec::new()));
         assert_eq!(
             params.cwd,
             Some(ThreadListCwdFilter::One(String::from("repo/on/server")))

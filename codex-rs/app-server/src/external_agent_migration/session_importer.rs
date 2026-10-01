@@ -494,6 +494,8 @@ impl ExternalAgentSessionImporter {
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(cwd.clone()),
                 model_provider: model_provider.clone(),
+                model: Some(model.clone()),
+                reasoning_effort: config.model_reasoning_effort,
                 memory_mode,
             },
         };

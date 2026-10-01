@@ -38,8 +38,10 @@ const STDERR_LOG_TAIL_BYTES: u64 = 4096;
 pub(crate) struct PidBackend {
     pub(super) feature_overrides: BTreeMap<String, bool>,
     codex_bin: PathBuf,
+    codex_home: PathBuf,
     pid_file: PathBuf,
     lock_file: PathBuf,
+    socket_path: Option<PathBuf>,
     command_kind: PidCommandKind,
 }
 
@@ -99,13 +101,21 @@ impl PidBackend {
         }
     }
 
-    pub(crate) fn new(codex_bin: PathBuf, pid_file: PathBuf, remote_control_enabled: bool) -> Self {
+    pub(crate) fn new(
+        codex_bin: PathBuf,
+        codex_home: PathBuf,
+        pid_file: PathBuf,
+        socket_path: PathBuf,
+        remote_control_enabled: bool,
+    ) -> Self {
         let lock_file = pid_file.with_extension("pid.lock");
         Self {
             feature_overrides: BTreeMap::new(),
             codex_bin,
+            codex_home,
             pid_file,
             lock_file,
+            socket_path: Some(socket_path),
             command_kind: PidCommandKind::AppServer {
                 remote_control_enabled,
             },
@@ -114,6 +124,7 @@ impl PidBackend {
 
     pub(crate) fn new_update_loop(
         codex_bin: PathBuf,
+        codex_home: PathBuf,
         pid_file: PathBuf,
         restore_release: Option<String>,
     ) -> Self {
@@ -121,8 +132,10 @@ impl PidBackend {
         Self {
             feature_overrides: BTreeMap::new(),
             codex_bin,
+            codex_home,
             pid_file,
             lock_file,
+            socket_path: None,
             command_kind: PidCommandKind::UpdateLoop { restore_release },
         }
     }
@@ -371,16 +384,25 @@ impl PidBackend {
     fn command_args(&self) -> Vec<Cow<'_, str>> {
         let mut args = match &self.command_kind {
             PidCommandKind::AppServer {
-                remote_control_enabled: true,
-            } => vec![
-                "app-server".into(),
-                "--remote-control".into(),
-                "--listen".into(),
-                "unix://".into(),
-            ],
-            PidCommandKind::AppServer {
-                remote_control_enabled: false,
-            } => vec!["app-server".into(), "--listen".into(), "unix://".into()],
+                remote_control_enabled,
+            } => {
+                let mut args = vec!["app-server".into()];
+                if *remote_control_enabled {
+                    args.push("--remote-control".into());
+                }
+                args.extend([
+                    "--listen".into(),
+                    format!(
+                        "unix://{}",
+                        self.socket_path
+                            .as_ref()
+                            .expect("app-server pid backend must have a socket path")
+                            .display()
+                    )
+                    .into(),
+                ]);
+                args
+            }
             PidCommandKind::UpdateLoop { restore_release } => {
                 let mut args = vec![
                     "app-server".into(),
@@ -402,16 +424,17 @@ impl PidBackend {
     }
 
     #[cfg(any(unix, windows))]
-    fn command_env(&self) -> Option<(&'static str, &'static str)> {
-        match self.command_kind {
+    fn command_env(&self) -> Vec<(&'static str, String)> {
+        let mut env = vec![("CODEX_HOME", self.codex_home.to_string_lossy().into_owned())];
+        if matches!(
+            self.command_kind,
             PidCommandKind::AppServer {
-                remote_control_enabled: false,
-            } => Some((REMOTE_CONTROL_DISABLED_ENV_VAR, "1")),
-            PidCommandKind::AppServer {
-                remote_control_enabled: true,
+                remote_control_enabled: false
             }
-            | PidCommandKind::UpdateLoop { .. } => None,
+        ) {
+            env.push((REMOTE_CONTROL_DISABLED_ENV_VAR, "1".to_string()));
         }
+        env
     }
 
     fn terminate_process(&self, pid: u32) -> Result<()> {

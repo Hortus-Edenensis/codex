@@ -215,7 +215,7 @@ pub enum Feature {
     AgentMessageBoard,
     /// Removed compatibility flag retained as a no-op.
     MultiAgentMode,
-    /// Removed compatibility flag for the deleted agent-job tools.
+    /// Enable PostgreSQL-backed CSV agent-job tools.
     SpawnCsv,
     /// Enable apps.
     Apps,
@@ -1360,7 +1360,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::SpawnCsv,
         key: "enable_fanout",
-        stage: Stage::Removed,
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {

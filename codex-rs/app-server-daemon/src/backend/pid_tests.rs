@@ -50,7 +50,9 @@ async fn locked_empty_pid_file_is_treated_as_active_reservation() {
         .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().join("codex-home"),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     let reservation = tokio::fs::OpenOptions::new()
@@ -78,7 +80,9 @@ async fn unlocked_empty_pid_file_is_treated_as_stale_reservation() {
         .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().join("codex-home"),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
 
@@ -98,7 +102,9 @@ async fn stop_waits_for_live_reservation_to_resolve() {
         .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().join("codex-home"),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     let reservation = tokio::fs::OpenOptions::new()
@@ -134,7 +140,9 @@ async fn start_retries_stale_empty_pid_file_under_its_own_lock() {
         .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("missing-codex"),
+        temp_dir.path().join("codex-home"),
         pid_file,
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
 
@@ -170,7 +178,9 @@ async fn legacy_launch_clears_recovery_best_effort() {
         }
         let backend = PidBackend::new(
             home.path().join("missing-codex"),
+            home.path().to_path_buf(),
             state_dir.join("app-server.pid"),
+            home.path().join("app-server.sock"),
             /*remote_control_enabled*/ false,
         );
 
@@ -191,7 +201,9 @@ async fn stale_record_cleanup_preserves_replacement_record() {
     let pid_file = temp_dir.path().join("app-server.pid");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().join("codex-home"),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     let stale = PidRecord {
@@ -244,7 +256,9 @@ async fn pid_record_captures_the_resolved_launch_binary() {
     std::os::unix::fs::symlink(&original, &selected).expect("selected binary");
     let backend = PidBackend::new(
         selected.clone(),
+        temp.path().to_path_buf(),
         temp.path().join("app-server.pid"),
+        temp.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     backend.start().await.expect("start daemon");
@@ -284,7 +298,9 @@ async fn legacy_start_time_mismatch_preserves_record_and_process() {
     let temp = TempDir::new().unwrap();
     let backend = PidBackend::new(
         temp.path().join("codex"),
+        temp.path().to_path_buf(),
         temp.path().join("app-server.pid"),
+        temp.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     let contents = serde_json::to_vec(&serde_json::json!({
@@ -337,7 +353,9 @@ async fn stop_reaps_untracked_app_server_child() {
     .expect("write pid file");
     let backend = PidBackend::new(
         temp_dir.path().join("codex"),
+        temp_dir.path().to_path_buf(),
         pid_file.clone(),
+        temp_dir.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
 
@@ -430,12 +448,15 @@ async fn shutdown_grace_handles_process_exit() {
         #[cfg(unix)]
         let backend = PidBackend::new(
             temp.path().join("codex"),
+            temp.path().to_path_buf(),
             pid_file,
+            temp.path().join("app-server.sock"),
             /*remote_control_enabled*/ false,
         );
         #[cfg(windows)]
         let backend = PidBackend::new_update_loop(
             temp.path().join("codex"),
+            temp.path().to_path_buf(),
             pid_file,
             /*restore_release*/ None,
         );
@@ -509,6 +530,7 @@ async fn stopping_updater_signals_its_installer_process_group() {
     .expect("write pid file");
     let backend = PidBackend::new_update_loop(
         temp.path().join("codex"),
+        temp.path().to_path_buf(),
         pid_file,
         /*restore_release*/ None,
     );
@@ -552,6 +574,7 @@ async fn exited_unreaped_updater_is_reaped() {
     };
     let backend = PidBackend::new_update_loop(
         temp.path().join("codex"),
+        temp.path().to_path_buf(),
         temp.path().join("updater.pid"),
         /*restore_release*/ None,
     );
@@ -576,11 +599,13 @@ async fn exited_unreaped_updater_is_reaped() {
 
 #[test]
 fn update_loop_uses_hidden_app_server_subcommand() {
-    let backend = PidBackend {
+    let mut backend = PidBackend {
         feature_overrides: Default::default(),
         codex_bin: "codex".into(),
+        codex_home: "/tmp/codex-home".into(),
         pid_file: "updater.pid".into(),
         lock_file: "updater.pid.lock".into(),
+        socket_path: None,
         command_kind: PidCommandKind::UpdateLoop {
             restore_release: None,
         },
@@ -588,21 +613,67 @@ fn update_loop_uses_hidden_app_server_subcommand() {
 
     assert_eq!(
         backend.command_args(),
-        vec!["app-server", "daemon", "pid-update-loop"]
+        vec![
+            "app-server".to_string(),
+            "daemon".to_string(),
+            "pid-update-loop".to_string()
+        ]
+    );
+    assert_eq!(
+        backend.command_env(),
+        vec![("CODEX_HOME", "/tmp/codex-home".to_string())]
+    );
+    backend.command_kind = PidCommandKind::UpdateLoop {
+        restore_release: Some("local-release".to_string()),
+    };
+    assert_eq!(
+        backend.command_args(),
+        vec![
+            "app-server",
+            "daemon",
+            "pid-update-loop",
+            "--restore-release",
+            "local-release"
+        ]
     );
 }
 
 #[test]
 fn app_server_remote_control_uses_runtime_flag() {
-    let backend = PidBackend::new(
+    let mut backend = PidBackend::new(
         "codex".into(),
+        "/tmp/codex-home".into(),
         "app-server.pid".into(),
+        "/tmp/codex-home/app-server-control/app-server-control.sock".into(),
         /*remote_control_enabled*/ true,
     );
 
     assert_eq!(
         backend.command_args(),
-        vec!["app-server", "--remote-control", "--listen", "unix://"]
+        vec![
+            "app-server".to_string(),
+            "--remote-control".to_string(),
+            "--listen".to_string(),
+            "unix:///tmp/codex-home/app-server-control/app-server-control.sock".to_string()
+        ]
+    );
+    assert_eq!(
+        backend.command_env(),
+        vec![("CODEX_HOME", "/tmp/codex-home".to_string())]
+    );
+    backend
+        .feature_overrides
+        .insert("memories".to_string(), true);
+    assert_eq!(
+        backend.command_args(),
+        vec![
+            "app-server",
+            "--remote-control",
+            "--listen",
+            "unix:///tmp/codex-home/app-server-control/app-server-control.sock",
+            "-c",
+            "features.memories=true"
+        ]
     );
 }
 
@@ -610,17 +681,26 @@ fn app_server_remote_control_uses_runtime_flag() {
 fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env() {
     let backend = PidBackend::new(
         "codex".into(),
+        "/tmp/codex-home".into(),
         "app-server.pid".into(),
+        "/tmp/codex-home/app-server-control/app-server-control.sock".into(),
         /*remote_control_enabled*/ false,
     );
 
     assert_eq!(
         backend.command_args(),
-        vec!["app-server", "--listen", "unix://"]
+        vec![
+            "app-server".to_string(),
+            "--listen".to_string(),
+            "unix:///tmp/codex-home/app-server-control/app-server-control.sock".to_string()
+        ]
     );
     assert_eq!(
         backend.command_env(),
-        Some((REMOTE_CONTROL_DISABLED_ENV_VAR, "1"))
+        vec![
+            ("CODEX_HOME", "/tmp/codex-home".to_string()),
+            (REMOTE_CONTROL_DISABLED_ENV_VAR, "1".to_string()),
+        ]
     );
 }
 
@@ -650,7 +730,9 @@ async fn stale_creation_time_never_stops_reused_pid() {
     let temp = TempDir::new().expect("temp");
     let backend = PidBackend::new(
         temp.path().join("codex.exe"),
+        temp.path().to_path_buf(),
         temp.path().join("server.pid"),
+        temp.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -705,6 +787,7 @@ async fn failed_updater_handoff_preserves_predecessor_record() {
         .expect("private state directory");
     let backend = PidBackend::new_update_loop(
         temp.path().join("missing-codex.exe"),
+        temp.path().to_path_buf(),
         state_dir.join("updater.pid"),
         /*restore_release*/ None,
     );
@@ -752,6 +835,7 @@ async fn updater_readiness_and_post_publication_failure_preserve_ownership() {
     let temp = TempDir::new().expect("temp");
     let backend = PidBackend::new_update_loop(
         temp.path().join("codex.exe"),
+        temp.path().to_path_buf(),
         temp.path().join("updater.pid"),
         /*restore_release*/ None,
     );

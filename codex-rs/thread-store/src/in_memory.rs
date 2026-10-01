@@ -187,6 +187,8 @@ mod tests {
                     metadata: ThreadPersistenceMetadata {
                         cwd: None,
                         model_provider: "test-provider".to_string(),
+                        model: None,
+                        reasoning_effort: None,
                         memory_mode: ThreadMemoryMode::Enabled,
                     },
                 })
@@ -466,6 +468,8 @@ mod tests {
         ThreadPersistenceMetadata {
             cwd: None,
             model_provider: "test-provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             memory_mode: ThreadMemoryMode::Enabled,
         }
     }

@@ -3409,3 +3409,34 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
     bedrock_with_standalone_web_search.assert_visible_contains(&["web_search"]);
     bedrock_with_standalone_web_search.assert_visible_lacks(&["web"]);
 }
+
+#[tokio::test]
+async fn csv_agent_jobs_are_registered_only_for_postgres_and_worker_results() {
+    for (store, is_worker, enabled) in [
+        (crate::config::ThreadStoreConfig::Local, false, false),
+        (crate::config::ThreadStoreConfig::default(), false, true),
+        (crate::config::ThreadStoreConfig::default(), true, true),
+    ] {
+        let result = probe(|turn| {
+            set_feature(turn, Feature::SpawnCsv, true);
+            turn.multi_agent_version = MultiAgentVersion::V1;
+            update_config(turn, |config| config.experimental_thread_store = store);
+            if is_worker {
+                turn.session_source = SessionSource::SubAgent(SubAgentSource::Other(
+                    "agent_job:test-job".to_string(),
+                ));
+            }
+        })
+        .await;
+        if enabled {
+            result.assert_registered_contains(&["spawn_agents_on_csv"]);
+        } else {
+            result.assert_registered_lacks(&["spawn_agents_on_csv"]);
+        }
+        if is_worker {
+            result.assert_registered_contains(&["report_agent_job_result"]);
+        } else {
+            result.assert_registered_lacks(&["report_agent_job_result"]);
+        }
+    }
+}

@@ -1,3 +1,4 @@
+pub(crate) mod chat;
 pub(crate) mod images;
 pub(crate) mod memories;
 pub(crate) mod models;
@@ -8,9 +9,12 @@ pub(crate) mod responses_websocket;
 pub(crate) mod search;
 mod session;
 
+pub use chat::ChatClient;
 pub use images::ImageRequestError;
 pub use images::ImagesClient;
 pub use memories::MemoriesClient;
+pub use models::CompatibleModelInfo;
+pub use models::CompatibleReasoningEfforts;
 pub use models::ModelsClient;
 pub use realtime_call::RealtimeCallClient;
 pub use realtime_call::RealtimeCallResponse;

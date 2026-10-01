@@ -43,6 +43,8 @@ pub enum RemoteCompactionSupport {
     V2,
 }
 
+const KIMI_K3_MODEL: &str = "kimi-k3";
+
 /// Optional provider-backed features that Codex may expose at runtime.
 ///
 /// These capabilities are a provider-owned upper bound. Callers can disable
@@ -474,6 +476,9 @@ impl ModelProvider for ConfiguredModelProvider {
     }
 
     fn approval_review_preferred_model(&self) -> &'static str {
+        if self.is_kimi_provider() {
+            return KIMI_K3_MODEL;
+        }
         if self
             .auth_manager
             .as_ref()
@@ -502,6 +507,22 @@ impl ModelProvider for ConfiguredModelProvider {
             .as_ref()
             .and_then(|auth_manager| auth_manager.auth_cached())
             .is_some_and(|auth| auth.is_chatgpt_auth())
+    }
+
+    fn memory_extraction_preferred_model(&self) -> &'static str {
+        if self.is_kimi_provider() {
+            KIMI_K3_MODEL
+        } else {
+            DEFAULT_MEMORY_EXTRACTION_PREFERRED_MODEL
+        }
+    }
+
+    fn memory_consolidation_preferred_model(&self) -> &'static str {
+        if self.is_kimi_provider() {
+            KIMI_K3_MODEL
+        } else {
+            DEFAULT_MEMORY_CONSOLIDATION_PREFERRED_MODEL
+        }
     }
 
     fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
@@ -615,6 +636,17 @@ impl ModelProvider for ConfiguredModelProvider {
         cache: Arc<dyn ModelsCache>,
     ) -> SharedModelsManager {
         self.create_models_manager(config_model_catalog, ModelsCacheConfig::Custom(cache))
+    }
+}
+
+impl ConfiguredModelProvider {
+    fn is_kimi_provider(&self) -> bool {
+        self.info.name.eq_ignore_ascii_case("kimi")
+            || self
+                .info
+                .base_url
+                .as_deref()
+                .is_some_and(|url| url.contains("moonshot.cn") || url.contains("moonshot.ai"))
     }
 }
 
@@ -840,6 +872,21 @@ mod tests {
         assert_eq!(
             provider.approval_review_preferred_model(),
             DEFAULT_APPROVAL_REVIEW_PREFERRED_MODEL
+        );
+    }
+
+    #[test]
+    fn kimi_provider_uses_kimi_k3_for_internal_model_tasks() {
+        let mut info = provider_for("https://api.moonshot.cn/v1".to_string());
+        info.name = "Kimi".to_string();
+        info.wire_api = WireApi::Chat;
+        let provider = create_model_provider(info, /*auth_manager*/ None);
+
+        assert_eq!(provider.approval_review_preferred_model(), KIMI_K3_MODEL);
+        assert_eq!(provider.memory_extraction_preferred_model(), KIMI_K3_MODEL);
+        assert_eq!(
+            provider.memory_consolidation_preferred_model(),
+            KIMI_K3_MODEL
         );
     }
 

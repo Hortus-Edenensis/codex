@@ -77,6 +77,7 @@ use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::TurnToolOutput;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
@@ -93,6 +94,7 @@ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -139,6 +141,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -541,6 +544,249 @@ async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
 
     assert_eq!(resumed.id, thread.id);
+    Ok(())
+}
+
+#[test_case("codex_desktop", true, ThreadHistoryMode::Legacy, false, false; "codex desktop legacy history")]
+#[test_case("codex_desktop", true, ThreadHistoryMode::Paginated, false, false; "codex desktop paginated history")]
+#[test_case("codex-app-server-tests", false, ThreadHistoryMode::Legacy, false, false; "other client legacy history")]
+#[test_case("codex-app-server-tests", false, ThreadHistoryMode::Paginated, false, false; "other client paginated history")]
+#[test_case("codex_desktop", true, ThreadHistoryMode::Legacy, true, false; "desktop legacy tool output")]
+#[test_case("codex_desktop", true, ThreadHistoryMode::Paginated, true, false; "desktop paginated tool output")]
+#[test_case("codex_desktop", true, ThreadHistoryMode::Legacy, false, true; "desktop cold legacy history")]
+#[test_case("codex_desktop", true, ThreadHistoryMode::Paginated, false, true; "desktop cold paginated history")]
+#[tokio::test]
+async fn completed_running_resume_fences_implicit_empty_continuation(
+    client_name: &str,
+    expect_rejection: bool,
+    history_mode: ThreadHistoryMode,
+    use_tool_output: bool,
+    cold_resume: bool,
+) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    mcp.initialize_with_client_info(ClientInfo {
+        name: client_name.to_string(),
+        title: None,
+        version: "0.1.0".to_string(),
+    })
+    .await?;
+
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("gpt-5.4".to_string()),
+            history_mode: Some(history_mode),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+
+    let turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "materialize completed turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    if cold_resume {
+        timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+        mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .build()
+            .await?;
+        mcp.initialize_with_client_info(ClientInfo {
+            name: client_name.to_string(),
+            title: None,
+            version: "0.1.0".to_string(),
+        })
+        .await?;
+    }
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            initial_turns_page: matches!(history_mode, ThreadHistoryMode::Paginated).then_some(
+                ThreadResumeInitialTurnsPageParams {
+                    limit: Some(1),
+                    sort_direction: Some(SortDirection::Desc),
+                    items_view: Some(TurnItemsView::NotLoaded),
+                },
+            ),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        thread: resumed,
+        initial_turns_page,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    let latest_status = match history_mode {
+        ThreadHistoryMode::Legacy => resumed.turns.last().map(|turn| &turn.status),
+        ThreadHistoryMode::Paginated => initial_turns_page
+            .as_ref()
+            .and_then(|page| page.data.first())
+            .map(|turn| &turn.status),
+    };
+    assert_eq!(latest_status, Some(&TurnStatus::Completed));
+
+    let empty_turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: Vec::new(),
+            ..Default::default()
+        })
+        .await?;
+    if !expect_rejection {
+        let _: TurnStartResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(empty_turn_id)).await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock recorded requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/responses"))
+                .count(),
+            2,
+            "other clients must retain the empty turn/start contract"
+        );
+        return Ok(());
+    }
+
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(empty_turn_id)),
+    )
+    .await??;
+    assert!(
+        error
+            .error
+            .message
+            .contains("resumed completed turn requires an explicit turnTrigger"),
+        "unexpected error: {}",
+        error.error.message
+    );
+
+    for trigger in ["", " \t\n"] {
+        let blank_trigger_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: Vec::new(),
+                turn_trigger: Some(trigger.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(blank_trigger_id)),
+        )
+        .await??;
+        assert!(
+            error
+                .error
+                .message
+                .contains("resumed completed turn requires an explicit turnTrigger"),
+            "blank turnTrigger must not bypass the resume fence: {}",
+            error.error.message
+        );
+    }
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/responses"))
+            .count(),
+        1,
+        "implicit empty continuation must not reach the model"
+    );
+
+    let explicit_turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            client_user_message_id: None,
+            input: Vec::new(),
+            turn_trigger: (!use_tool_output).then(|| "explicit_continuation".to_string()),
+            tool_output: use_tool_output.then(|| {
+                Box::new(TurnToolOutput {
+                    name: "send_message_to_thread".to_string(),
+                    namespace: Some("codex_app".to_string()),
+                    output: FunctionCallOutputBody::Text(
+                        "Continue the delegated task.".to_string(),
+                    ),
+                })
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(explicit_turn_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let post_success_empty_turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: resumed.id,
+            client_user_message_id: None,
+            input: Vec::new(),
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_response(post_success_empty_turn_id),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/responses"))
+            .count(),
+        3,
+        "a successful explicit turn must clear the completed-resume fence"
+    );
+
     Ok(())
 }
 
@@ -4775,7 +5021,14 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
 
     let mut primary = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build_initialized()
+        .build()
+        .await?;
+    primary
+        .initialize_with_client_info(ClientInfo {
+            name: "codex_desktop".to_string(),
+            title: Some("Codex Desktop".to_string()),
+            version: "0.1.0".to_string(),
+        })
         .await?;
 
     let start_id = primary
@@ -5366,6 +5619,31 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
     let initial_turns_page = initial_turns_page.expect("resume should include initial turns page");
     assert_eq!(initial_turns_page.data.len(), 1);
     assert_eq!(initial_turns_page.data[0].id, seed_turn.id);
+    let empty_turn_id = primary
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: Vec::new(),
+            ..Default::default()
+        })
+        .await?;
+    let empty_turn_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_error_message(RequestId::Integer(empty_turn_id)),
+    )
+    .await??;
+    assert!(
+        empty_turn_error.error.message.contains("EmptyInput"),
+        "the active turn should reach the core empty-steer validation: {}",
+        empty_turn_error.error.message
+    );
+    assert!(
+        !empty_turn_error
+            .error
+            .message
+            .contains("resumed completed turn requires an explicit turnTrigger"),
+        "an old ascending page must not fence a live turn"
+    );
     // The running-thread resume response is queued onto the thread listener task.
     // If the in-flight turn completes before that queued command runs, the response
     // can legitimately observe the thread as idle.
@@ -5984,22 +6262,20 @@ async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> 
 }
 
 #[tokio::test]
-async fn thread_resume_uses_path_over_non_running_thread_id() -> Result<()> {
+async fn thread_resume_uses_thread_id_over_path() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
 
     let RestartedThreadFixture {
-        mut mcp,
-        thread_id,
-        rollout_file_path,
-        ..
+        mut mcp, thread_id, ..
     } = start_materialized_thread_and_restart(codex_home.path(), "materialize").await?;
+    let wrong_path = codex_home.path().join("missing-rollout.jsonl");
 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: ThreadId::new().to_string(),
-            path: Some(rollout_file_path),
+            thread_id: thread_id.to_string(),
+            path: Some(wrong_path),
             ..Default::default()
         })
         .await?;

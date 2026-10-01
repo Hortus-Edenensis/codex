@@ -56,6 +56,12 @@
           "description": "Whether to record a model-visible message when an agent turn is interrupted. Defaults to true.",
           "type": "boolean"
         },
+        "job_max_runtime_seconds": {
+          "description": "Maximum runtime in seconds for PostgreSQL-backed CSV job workers.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "max_concurrent_threads_per_session": {
           "description": "Maximum number of spawned agent threads that can be open concurrently per session. When unset, the selected multi-agent backend uses its default.",
           "format": "uint",
@@ -4190,6 +4196,35 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "database_url_env": {
+              "default": "CODEX_REMOTE_SQL_URL",
+              "description": "Environment variable containing the PostgreSQL connection URL.",
+              "type": "string"
+            },
+            "default_workspace_id": {
+              "default": "default",
+              "description": "Workspace used before app-server exposes explicit workspace routing.",
+              "type": "string"
+            },
+            "redis_url_env": {
+              "default": null,
+              "description": "Optional environment variable containing the Redis URL for realtime state.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "postgres"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -6558,6 +6593,13 @@
           "description": "The Responses API exposed by OpenAI at `/v1/responses`.",
           "enum": [
             "responses"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "OpenAI-compatible Chat Completions exposed at `/v1/chat/completions`.",
+          "enum": [
+            "chat"
           ],
           "type": "string"
         }

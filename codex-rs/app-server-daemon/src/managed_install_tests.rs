@@ -1,7 +1,9 @@
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
 use super::ExecutableIdentity;
 use super::executable_identity;
+use super::managed_codex_remote_sql_build_tag;
 use super::parse_codex_version;
 
 #[test]
@@ -42,5 +44,38 @@ async fn executable_identity_uses_binary_contents() {
             .await
             .expect("new identity"),
         old
+    );
+}
+
+#[tokio::test]
+async fn reads_remote_sql_build_tag_from_release_dir() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let release_dir = temp_dir.path().join("current");
+    let bin_dir = release_dir.join("bin");
+    tokio::fs::create_dir_all(&bin_dir)
+        .await
+        .expect("create bin dir");
+    tokio::fs::write(
+        release_dir.join("REMOTE_SQL_BUILD_TAG"),
+        "release_version=0.142.5-remote-sql.123+abc123\ngit_sha=abc123\n",
+    )
+    .await
+    .expect("write build tag");
+
+    for binary in [bin_dir.join("codex"), release_dir.join("codex")] {
+        assert_eq!(
+            managed_codex_remote_sql_build_tag(&binary)
+                .await
+                .expect("build tag"),
+            "release_version=0.142.5-remote-sql.123+abc123\ngit_sha=abc123"
+        );
+    }
+    tokio::fs::write(release_dir.join("REMOTE_SQL_BUILD_TAG"), " \n")
+        .await
+        .expect("empty build tag");
+    assert!(
+        managed_codex_remote_sql_build_tag(&bin_dir.join("codex"))
+            .await
+            .is_err()
     );
 }

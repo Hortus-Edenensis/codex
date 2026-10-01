@@ -8,6 +8,7 @@ use crate::FreeformToolFormat;
 use crate::JsonSchema;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
+use crate::create_tools_json_for_chat_completions_api;
 use crate::create_tools_json_for_responses_api;
 use crate::create_tools_json_for_responses_lite;
 use crate::create_tools_raw_json_for_responses_api;
@@ -268,6 +269,44 @@ fn raw_tool_json_matches_value_encoding() {
         serde_json::from_str::<Vec<serde_json::Value>>(raw.get()).expect("parse raw tools"),
         expected,
     );
+}
+
+#[test]
+fn chat_completions_flattens_namespace_tools_and_omits_responses_fields() {
+    let tools =
+        create_tools_json_for_chat_completions_api(&[ToolSpec::Namespace(ResponsesApiNamespace {
+            name: "mcp__demo__".to_string(),
+            description: "Demo tools".to_string(),
+            tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                name: "lookup_order".to_string(),
+                description: "Look up an order".to_string(),
+                strict: false,
+                defer_loading: Some(true),
+                parameters: JsonSchema::object(
+                    BTreeMap::new(),
+                    /*required*/ None,
+                    /*additional_properties*/ None,
+                ),
+                output_schema: None,
+            })],
+        })])
+        .expect("serialize chat tools");
+
+    assert_eq!(
+        tools,
+        vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__demo__lookup_order",
+                "description": "Look up an order",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        })]
+    );
+    assert!(tools[0]["function"].get("defer_loading").is_none());
 }
 
 #[test]

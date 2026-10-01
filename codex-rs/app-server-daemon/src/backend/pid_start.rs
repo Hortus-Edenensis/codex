@@ -129,7 +129,7 @@ impl PidBackend {
                 }
             }
         }
-        if let Some((key, value)) = self.command_env() {
+        for (key, value) in self.command_env() {
             command.env(key, value);
         }
 

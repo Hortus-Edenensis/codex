@@ -317,6 +317,8 @@ fn persistence_metadata(
     Some(ThreadPersistenceMetadata {
         cwd: Some(meta.cwd.clone()),
         model_provider: meta.model_provider.clone()?,
+        model: None,
+        reasoning_effort: None,
         memory_mode,
     })
 }

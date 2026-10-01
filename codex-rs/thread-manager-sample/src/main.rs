@@ -61,6 +61,7 @@ use codex_core_api::TurnInputRequest;
 use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
 use codex_core_api::WebSearchMode;
+use codex_core_api::agent_graph_store_from_config;
 use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::bootstrap_auth_config;
 use codex_core_api::build_models_manager;
@@ -70,7 +71,6 @@ use codex_core_api::init_state_db;
 use codex_core_api::install_image_generation_extension;
 use codex_core_api::item_event_to_server_notification;
 use codex_core_api::load_config_toml_with_layer_stack;
-use codex_core_api::local_agent_graph_store_from_state_db;
 use codex_core_api::passthrough_image_store;
 use codex_core_api::resolve_bootstrap_respect_system_proxy;
 use codex_core_api::resolve_installation_id;
@@ -158,7 +158,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         /*analytics_events_client*/ None,
         passthrough_image_store(),
         Arc::clone(&thread_store),
-        local_agent_graph_store_from_state_db(state_db.as_ref()),
+        agent_graph_store_from_config(&config, state_db.as_ref()),
         installation_id,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
@@ -322,6 +322,7 @@ async fn new_config(
         tool_output_token_limit: None,
         agents_enabled: true,
         agent_max_threads: Some(6),
+        agent_job_max_runtime_seconds: None,
         agent_default_subagent_model: None,
         agent_default_subagent_reasoning_effort: None,
         agent_interrupt_message_enabled: false,

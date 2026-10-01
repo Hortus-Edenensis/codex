@@ -78,6 +78,7 @@ pub(crate) async fn request(daemon: &Daemon) -> Result<UpdateOutput> {
                         };
                         let worker = crate::backend::PidBackend::new_update_loop(
                             paths.codex_bin,
+                            paths.codex_home,
                             paths.update_pid_file,
                             restore_release,
                         );

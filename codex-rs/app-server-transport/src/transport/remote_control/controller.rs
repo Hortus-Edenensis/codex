@@ -19,7 +19,7 @@ struct CurrentSession {
 
 pub(super) struct RemoteControl {
     config: RemoteControlStartConfig,
-    state_db: Option<Arc<StateRuntime>>,
+    state_db: Option<Arc<dyn RemoteControlStateStore>>,
     auth_manager: Arc<AuthManager>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown: CancellationToken,
@@ -262,9 +262,9 @@ impl RemoteControlHandle {
     }
 }
 
-pub async fn start_remote_control(
+pub async fn start_remote_control_with_state_store(
     config: RemoteControlStartConfig,
-    state_db: Option<Arc<StateRuntime>>,
+    state_db: Option<Arc<dyn RemoteControlStateStore>>,
     auth_manager: Arc<AuthManager>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
@@ -365,4 +365,26 @@ pub async fn start_remote_control(
         inner.persistence.tasks.wait().await;
     });
     Ok((task, handle))
+}
+
+pub async fn start_remote_control(
+    config: RemoteControlStartConfig,
+    state_db: Option<Arc<StateRuntime>>,
+    auth_manager: Arc<AuthManager>,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    shutdown_token: CancellationToken,
+    app_server_client_name_rx: Option<oneshot::Receiver<String>>,
+    startup_mode: RemoteControlStartupMode,
+) -> io::Result<(JoinHandle<()>, RemoteControlHandle)> {
+    let state_store = state_db.map(|state_db| state_db as Arc<dyn RemoteControlStateStore>);
+    start_remote_control_with_state_store(
+        config,
+        state_store,
+        auth_manager,
+        transport_event_tx,
+        shutdown_token,
+        app_server_client_name_rx,
+        startup_mode,
+    )
+    .await
 }

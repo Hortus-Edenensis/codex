@@ -562,10 +562,29 @@ pub struct ConfigToml {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadStoreToml {
     Local {},
+    Postgres {
+        /// Environment variable containing the PostgreSQL connection URL.
+        #[serde(default = "default_remote_sql_url_env")]
+        database_url_env: String,
+        /// Workspace used before app-server exposes explicit workspace routing.
+        #[serde(default = "default_remote_sql_workspace_id")]
+        default_workspace_id: String,
+        /// Optional environment variable containing the Redis URL for realtime state.
+        #[serde(default)]
+        redis_url_env: Option<String>,
+    },
     #[schemars(skip)]
     InMemory {
         id: String,
     },
+}
+
+fn default_remote_sql_url_env() -> String {
+    "CODEX_REMOTE_SQL_URL".to_string()
+}
+
+fn default_remote_sql_workspace_id() -> String {
+    "default".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
@@ -742,8 +761,7 @@ pub struct AgentsToml {
     pub default_subagent_model: Option<String>,
     /// Default reasoning effort for spawned subagents when the spawn call does not select one.
     pub default_subagent_reasoning_effort: Option<ReasoningEffort>,
-    /// Removed agent-job setting retained as a no-op for compatibility.
-    #[schemars(skip)]
+    /// Maximum runtime in seconds for PostgreSQL-backed CSV job workers.
     pub job_max_runtime_seconds: Option<u64>,
     /// Whether to record a model-visible message when an agent turn is interrupted.
     /// Defaults to true.

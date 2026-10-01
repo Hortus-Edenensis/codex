@@ -77,7 +77,9 @@ async fn promotes_timestamp_only_macos_record() {
     std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     let backend = PidBackend::new(
         temp.path().join("codex"),
+        temp.path().to_path_buf(),
         path.clone(),
+        temp.path().join("app-server.sock"),
         /*remote_control_enabled*/ false,
     );
     backend.promote_legacy_identity().await.unwrap();

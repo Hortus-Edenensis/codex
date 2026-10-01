@@ -2692,3 +2692,77 @@ async fn pathless_ephemeral_thread_rejects_codex_home_path_after_reload() -> Res
 
     Ok(())
 }
+
+#[tokio::test]
+async fn thread_fork_replays_recent_duplicate_request() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let params = ThreadForkParams {
+        thread_id: conversation_id.clone(),
+        thread_source: Some(ThreadSource::User),
+        ..Default::default()
+    };
+    let first_id = mcp.send_thread_fork_request(params.clone()).await?;
+    let first_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(first_id)),
+    )
+    .await??;
+    let ThreadForkResponse {
+        thread: first_thread,
+        ..
+    } = to_response::<ThreadForkResponse>(first_resp)?;
+
+    let started = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/started"),
+    )
+    .await??;
+    let started: ThreadStartedNotification =
+        serde_json::from_value(started.params.expect("params must be present"))?;
+    assert_eq!(started.thread.id, first_thread.id);
+
+    let second_id = mcp.send_thread_fork_request(params).await?;
+    let second_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(second_id)),
+    )
+    .await??;
+    let ThreadForkResponse {
+        thread: second_thread,
+        ..
+    } = to_response::<ThreadForkResponse>(second_resp)?;
+
+    assert_eq!(second_thread, first_thread);
+
+    let ThreadListResponse { data, .. } = list_threads(&mut mcp).await?;
+    let forks = data
+        .iter()
+        .filter(|candidate| candidate.forked_from_id.as_deref() == Some(conversation_id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        forks
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![first_thread.id.as_str()]
+    );
+    Ok(())
+}

@@ -7,13 +7,13 @@ use super::protocol::StartRemoteControlPairingRequest;
 use super::protocol::StartRemoteControlPairingResponse;
 use super::server_api::RemoteControlServerRequestError;
 use super::server_api::retry_after_with_jitter;
+use super::storage::PersistedRemoteControlEnrollment;
+use super::storage::RemoteControlStateStore;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_protocol::RemoteControlPairingStatusResponse;
 use codex_http_client::HttpClientFactory;
-use codex_state::RemoteControlEnrollmentRecord;
-use codex_state::StateRuntime;
 use std::io;
 use std::io::ErrorKind;
 use time::OffsetDateTime;
@@ -290,22 +290,25 @@ fn pairing_response_error(
     }
 }
 
-pub(super) async fn load_persisted_remote_control_enrollment(
-    state_db: Option<&StateRuntime>,
+pub(super) async fn load_persisted_remote_control_enrollment<S>(
+    state_store: Option<&S>,
     remote_control_target: &RemoteControlTarget,
     account_id: &str,
     app_server_client_name: Option<&str>,
-) -> io::Result<Option<RemoteControlEnrollment>> {
-    let Some(state_db) = state_db else {
+) -> io::Result<Option<RemoteControlEnrollment>>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
+    let Some(state_store) = state_store else {
         return Err(io::Error::new(
             ErrorKind::NotFound,
             format!(
-                "remote control enrollment cache unavailable because sqlite state db is disabled: websocket_url={}, account_id={}, app_server_client_name={:?}",
+                "remote control enrollment cache unavailable because state storage is disabled: websocket_url={}, account_id={}, app_server_client_name={:?}",
                 remote_control_target.websocket_url, account_id, app_server_client_name
             ),
         ));
     };
-    let enrollment = match state_db
+    let enrollment = match state_store
         .get_remote_control_enrollment(
             &remote_control_target.websocket_url,
             account_id,
@@ -319,7 +322,7 @@ pub(super) async fn load_persisted_remote_control_enrollment(
                 "failed to load persisted remote control enrollment: websocket_url={}, account_id={}, app_server_client_name={:?}, err={err}",
                 remote_control_target.websocket_url, account_id, app_server_client_name
             );
-            return Err(io::Error::other(err));
+            return Err(err);
         }
     };
 
@@ -354,19 +357,22 @@ pub(super) async fn load_persisted_remote_control_enrollment(
     }
 }
 
-pub(super) async fn update_persisted_remote_control_enrollment(
-    state_db: Option<&StateRuntime>,
+pub(super) async fn update_persisted_remote_control_enrollment<S>(
+    state_store: Option<&S>,
     remote_control_target: &RemoteControlTarget,
     account_id: &str,
     app_server_client_name: Option<&str>,
     enrollment: Option<&RemoteControlEnrollment>,
     remote_control_enabled: Option<bool>,
-) -> io::Result<()> {
-    let Some(state_db) = state_db else {
+) -> io::Result<()>
+where
+    S: RemoteControlStateStore + ?Sized,
+{
+    let Some(state_store) = state_store else {
         return Err(io::Error::new(
             ErrorKind::NotFound,
             format!(
-                "remote control enrollment persistence unavailable because sqlite state db is disabled: websocket_url={}, account_id={}, app_server_client_name={:?}, has_enrollment={}",
+                "remote control enrollment persistence unavailable because state storage is disabled: websocket_url={}, account_id={}, app_server_client_name={:?}, has_enrollment={}",
                 remote_control_target.websocket_url,
                 account_id,
                 app_server_client_name,
@@ -383,8 +389,8 @@ pub(super) async fn update_persisted_remote_control_enrollment(
     }
 
     if let Some(enrollment) = enrollment {
-        state_db
-            .upsert_remote_control_enrollment(&RemoteControlEnrollmentRecord {
+        state_store
+            .upsert_remote_control_enrollment(&PersistedRemoteControlEnrollment {
                 websocket_url: remote_control_target.websocket_url.clone(),
                 account_id: account_id.to_string(),
                 app_server_client_name: app_server_client_name.map(str::to_string),
@@ -393,8 +399,7 @@ pub(super) async fn update_persisted_remote_control_enrollment(
                 server_name: enrollment.server_name.clone(),
                 remote_control_enabled,
             })
-            .await
-            .map_err(io::Error::other)?;
+            .await?;
         info!(
             "persisted remote control enrollment: websocket_url={}, account_id={}, app_server_client_name={:?}, server_id={}, environment_id={}",
             remote_control_target.websocket_url,
@@ -405,14 +410,13 @@ pub(super) async fn update_persisted_remote_control_enrollment(
         );
         Ok(())
     } else {
-        let rows_affected = state_db
+        let rows_affected = state_store
             .delete_remote_control_enrollment(
                 &remote_control_target.websocket_url,
                 account_id,
                 app_server_client_name,
             )
-            .await
-            .map_err(io::Error::other)?;
+            .await?;
         info!(
             "cleared persisted remote control enrollment: websocket_url={}, account_id={}, app_server_client_name={:?}, rows_affected={rows_affected}",
             remote_control_target.websocket_url, account_id, app_server_client_name

@@ -4,6 +4,7 @@ use crate::ThreadManager;
 use crate::agent::child_config::apply_spawn_agent_service_tier;
 use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::child_config::build_agent_spawn_config;
+use crate::agent_graph_store_from_config;
 use crate::config::AgentRoleConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::config::PermissionProfileSnapshot;
@@ -11,7 +12,6 @@ use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::TurnEnvironmentState;
 use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
-use crate::local_agent_graph_store_from_state_db;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::update_selected_settings_for_test;
@@ -4307,6 +4307,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let (_session, turn) = make_session_and_context().await;
     let mut config = turn.config.as_ref().clone();
     config.agent_max_depth = 3;
+    config.experimental_thread_store = crate::config::ThreadStoreConfig::Local;
     config
         .permissions
         .set_permission_profile(PermissionProfile::workspace_write())
@@ -4329,7 +4330,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         /*analytics_events_client*/ None,
         crate::thread_manager::passthrough_image_store(),
         thread_store_from_config(&config, state_db.clone()),
-        local_agent_graph_store_from_state_db(state_db.as_ref()),
+        agent_graph_store_from_config(&config, state_db.as_ref()),
         "11111111-1111-4111-8111-111111111111".to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
