@@ -1,3 +1,4 @@
+mod agent_job;
 mod backfill_state;
 mod graph;
 mod log;
@@ -54,3 +55,11 @@ pub(crate) use thread_metadata::anchor_from_item;
 pub(crate) use thread_metadata::datetime_to_epoch_millis;
 pub(crate) use thread_metadata::datetime_to_epoch_seconds;
 pub(crate) use thread_metadata::epoch_millis_to_datetime;
+
+pub use agent_job::AgentJob;
+pub use agent_job::AgentJobCreateParams;
+pub use agent_job::AgentJobItem;
+pub use agent_job::AgentJobItemCreateParams;
+pub use agent_job::AgentJobItemStatus;
+pub use agent_job::AgentJobProgress;
+pub use agent_job::AgentJobStatus;

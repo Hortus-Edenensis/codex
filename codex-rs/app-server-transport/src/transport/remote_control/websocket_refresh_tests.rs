@@ -21,6 +21,7 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::save_auth;
+use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
@@ -195,7 +196,7 @@ async fn websocket_retry_after_throttles_pairing_refresh() {
     let auth_manager = remote_control_auth_manager();
     let mut remote_handle =
         remote_control_handle_with_current_enrollment(&remote_control_url, auth_manager.clone());
-    remote_handle.state_db = Some(state_db.clone());
+    remote_handle.state_db = Some(state_db.clone() as Arc<dyn RemoteControlStateStore>);
     remote_handle
         .current_enrollment
         .lock()

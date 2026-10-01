@@ -80,6 +80,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use codex_rollout::state_db::StateDbHandle;
+use codex_state::GeneratedMemoryStore;
 
 static LIVE_THREADS: Gauge = Gauge::new("core.threads.live");
 
@@ -875,6 +876,14 @@ impl CodexThread {
 
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.session.state_db()
+    }
+
+    pub fn generated_memory_store(&self) -> Option<Arc<dyn GeneratedMemoryStore>> {
+        self.session.services.generated_memory_store.clone()
+    }
+
+    pub fn thread_store(&self) -> Arc<dyn codex_thread_store::ThreadStore> {
+        Arc::clone(&self.session.services.thread_store)
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {

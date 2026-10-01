@@ -264,7 +264,9 @@ fn detached_launch_preflight_allows_residual_job() {
         .expect("write daemon fixture");
         let backend = crate::backend::pid::PidBackend::new(
             script,
+            temp.path().to_path_buf(),
             temp.path().join("state").join("daemon.pid"),
+            temp.path().join("app-server.sock"),
             /*remote_control_enabled*/ false,
         );
         let runtime = tokio::runtime::Builder::new_current_thread()

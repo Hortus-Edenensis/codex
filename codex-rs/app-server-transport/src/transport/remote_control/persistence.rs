@@ -1,5 +1,5 @@
 //! Serializes enrollment storage across login sessions.
-//! An admitted SQLite write keeps its permit until completion even if its caller is cancelled.
+//! An admitted storage write keeps its permit until completion even if its caller is cancelled.
 //! Process shutdown drains admitted writes after stopping the session workers.
 
 use super::RemoteControlSession;
@@ -8,7 +8,7 @@ use super::desired_state::RemoteControlDesiredState;
 use super::enroll::RemoteControlEnrollment;
 use super::enroll::update_persisted_remote_control_enrollment;
 use super::protocol::RemoteControlTarget;
-use codex_state::StateRuntime;
+use super::storage::RemoteControlStateStore;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
@@ -79,15 +79,15 @@ async fn commit<T: Send + 'static>(
     .map_err(io::Error::other)?
 }
 
-pub(super) async fn save_enrollment(
+pub(super) async fn save_enrollment<S: RemoteControlStateStore + ?Sized>(
     auth: &RemoteControlAuth,
     lock: &RemoteControlPersistence,
-    state_db: &StateRuntime,
+    state_db: &S,
     enrollment: &RemoteControlEnrollment,
     client_name: Option<&str>,
     desired: &watch::Sender<RemoteControlDesiredState>,
 ) -> io::Result<()> {
-    let state_db = state_db.clone();
+    let state_db = state_db.clone_store();
     let enrollment = enrollment.clone();
     let client_name = client_name.map(str::to_owned);
     let desired = desired.clone();
@@ -104,7 +104,7 @@ pub(super) async fn save_enrollment(
             }
         };
         update_persisted_remote_control_enrollment(
-            Some(&state_db),
+            Some(state_db.as_ref()),
             &enrollment.remote_control_target,
             &enrollment.account_id,
             client_name.as_deref(),
@@ -117,16 +117,16 @@ pub(super) async fn save_enrollment(
 }
 
 impl RemoteControlSession {
-    pub(super) async fn set_preference(
+    pub(super) async fn set_preference<S: RemoteControlStateStore + ?Sized>(
         &self,
-        state_db: &StateRuntime,
+        state_db: &S,
         target: &RemoteControlTarget,
         account_id: &str,
         client_name: Option<&str>,
         enabled: bool,
         fallback_enrollment: Option<&RemoteControlEnrollment>,
     ) -> io::Result<()> {
-        let state_db = state_db.clone();
+        let state_db = state_db.clone_store();
         let target = target.clone();
         let account_id = account_id.to_owned();
         let client_name = client_name.map(str::to_owned);
@@ -146,7 +146,7 @@ impl RemoteControlSession {
                 && let Some(enrollment) = enrollment
             {
                 update_persisted_remote_control_enrollment(
-                    Some(&state_db),
+                    Some(state_db.as_ref()),
                     &target,
                     &account_id,
                     client_name.as_deref(),

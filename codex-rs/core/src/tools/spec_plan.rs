@@ -31,6 +31,8 @@ use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WaitForEnvironmentHandler;
 use crate::tools::handlers::WriteStdinHandler;
+use crate::tools::handlers::agent_jobs::ReportAgentJobResultHandler;
+use crate::tools::handlers::agent_jobs::SpawnAgentsOnCsvHandler;
 use crate::tools::handlers::extension_tools::ExtensionToolAdapter;
 use crate::tools::handlers::multi_agents::CloseAgentHandler;
 use crate::tools::handlers::multi_agents::ResumeAgentHandler;
@@ -1418,6 +1420,21 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             registry
                 .add_with_exposure(WaitAgentHandler::new(context.wait_agent_timeouts), exposure);
             registry.add_with_exposure(CloseAgentHandler, exposure);
+        }
+        if turn_context.config.features.enabled(Feature::SpawnCsv)
+            && matches!(
+                turn_context.config.experimental_thread_store,
+                crate::config::ThreadStoreConfig::Postgres { .. }
+            )
+        {
+            registry.add(SpawnAgentsOnCsvHandler);
+            if matches!(
+                &turn_context.session_source,
+                codex_protocol::protocol::SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::Other(label))
+                    if label.starts_with("agent_job:")
+            ) {
+                registry.add(ReportAgentJobResultHandler);
+            }
         }
     }
 }

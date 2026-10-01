@@ -16,14 +16,23 @@ impl ThreadRequestProcessor {
                 "minConsolidatedThreads must be between 1 and 4096",
             ));
         }
-        let db = self
-            .state_db
-            .as_ref()
-            .ok_or_else(|| internal_error("sqlite state db unavailable for memory status"))?;
-        let store = db
-            .memories_for_version(MemoryVersion::V2)
-            .await
-            .map_err(|error| internal_error(format!("failed to open v2 memory state: {error}")))?;
+        let store: crate::thread_state::GeneratedMemoryStoreHandle =
+            if let Some(db) = self.state_db.as_ref() {
+                Arc::new(
+                    db.memories_for_version(MemoryVersion::V2)
+                        .await
+                        .map_err(|error| {
+                            internal_error(format!("failed to open v2 memory state: {error}"))
+                        })?,
+                )
+            } else {
+                self.generated_memory_store
+                    .as_ref()
+                    .and_then(|store| store.for_version(MemoryVersion::V2))
+                    .ok_or_else(|| {
+                        internal_error("generated memory store unavailable for memory status")
+                    })?
+            };
         let count = store
             .max_consolidated_thread_count()
             .await

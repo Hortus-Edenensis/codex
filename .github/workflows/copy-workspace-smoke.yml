@@ -1,0 +1,723 @@
+name: copy-workspace-smoke
+
+on:
+  push:
+    branches:
+      - remote-sql-postgres-workspace
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Operation to run: smoke, delete-thread, or unarchive-thread."
+        required: false
+        type: string
+        default: smoke
+      target_thread_id:
+        description: Thread id used by delete-thread and unarchive-thread operations.
+        required: false
+        type: string
+        default: ""
+      resume_thread_id:
+        description: Known Postgres-backed thread id to validate with thread/read and thread/resume.
+        required: false
+        type: string
+        default: 019f1846-9419-7853-b035-f2ba0fad3d72
+      min_interactive_threads:
+        description: Minimum interactive thread count expected from thread/list.
+        required: false
+        type: string
+        default: "8"
+      expected_model:
+        description: Expected model for copy workspace start/resume smoke.
+        required: false
+        type: string
+        default: gpt-5.5
+      expected_resume_model:
+        description: Expected persisted model for the known thread used by thread/read and thread/resume.
+        required: false
+        type: string
+        default: gpt-5.4
+      expected_model_provider:
+        description: Expected model provider for copy workspace start/resume smoke.
+        required: false
+        type: string
+        default: openai
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-copy-workspace:
+    name: Smoke test deployed copy workspace
+    runs-on: [self-hosted, Linux, X64, codex-workspace-copy]
+    timeout-minutes: 20
+    env:
+      ALL_PROXY: http://10.42.0.1:10809
+      CODEX_DEPLOY_CONTAINER: workspace
+      CODEX_DEPLOY_NAMESPACE: codex-internal
+      CODEX_DEPLOY_POD_PREFIX: codex-workspace-copy-
+      COPY_WORKSPACE_CANONICAL_WORKSPACE_ID: codex-workspace
+      COPY_WORKSPACE_MIN_INTERACTIVE_THREADS: "8"
+      COPY_WORKSPACE_EXPECTED_MODEL: gpt-5.5
+      COPY_WORKSPACE_EXPECTED_RESUME_MODEL: gpt-5.4
+      COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER: openai
+      COPY_WORKSPACE_PG_PROBE_IMAGE: dockerhub.aiebk.cn/library/postgres:16-alpine
+      COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS: "120"
+      COPY_WORKSPACE_RESUME_THREAD_ID: 019f1846-9419-7853-b035-f2ba0fad3d72
+      HTTPS_PROXY: http://10.42.0.1:10809
+      HTTP_PROXY: http://10.42.0.1:10809
+      NO_PROXY: 127.0.0.1,localhost,10.0.0.0/8,10.42.0.0/16,202.189.11.100
+    steps:
+      - name: Smoke test copy workspace control plane
+        id: control_plane_smoke
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          python3 --version
+
+          operation="${{ github.event.inputs.operation }}"
+          if [ -z "${operation}" ]; then
+            operation="smoke"
+          fi
+          target_thread_id="${{ github.event.inputs.target_thread_id }}"
+
+          resume_thread_id="${{ github.event.inputs.resume_thread_id }}"
+          if [ -z "${resume_thread_id}" ]; then
+            resume_thread_id="${COPY_WORKSPACE_RESUME_THREAD_ID}"
+          fi
+
+          min_interactive_threads="${{ github.event.inputs.min_interactive_threads }}"
+          if [ -z "${min_interactive_threads}" ]; then
+            min_interactive_threads="${COPY_WORKSPACE_MIN_INTERACTIVE_THREADS}"
+          fi
+          expected_model="${{ github.event.inputs.expected_model }}"
+          if [ -z "${expected_model}" ]; then
+            expected_model="${COPY_WORKSPACE_EXPECTED_MODEL}"
+          fi
+          expected_resume_model="${{ github.event.inputs.expected_resume_model }}"
+          if [ -z "${expected_resume_model}" ]; then
+            expected_resume_model="${COPY_WORKSPACE_EXPECTED_RESUME_MODEL}"
+          fi
+          expected_model_provider="${{ github.event.inputs.expected_model_provider }}"
+          if [ -z "${expected_model_provider}" ]; then
+            expected_model_provider="${COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER}"
+          fi
+
+          smoke_script="/tmp/copy_workspace_smoke.py"
+          for attempt in 1 2 3; do
+            rm -f "${smoke_script}"
+            if curl -fsSL \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.github/scripts/copy_workspace_smoke.py?ref=${GITHUB_SHA}" \
+              -o "${smoke_script}"; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::Failed to download copy-workspace smoke script after ${attempt} attempts"
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
+          test -s "${smoke_script}"
+          chmod 0755 "${smoke_script}"
+
+          pod="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
+              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" && !printed { print $1; printed = 1 }'
+          )"
+          if [ -z "${pod}" ]; then
+            echo "::error::No running ${CODEX_DEPLOY_POD_PREFIX} pod found"
+            exit 1
+          fi
+
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- sh -lc '
+            release_tag_file="/home/codex/.codex/packages/standalone/current/REMOTE_SQL_BUILD_TAG"
+            if [ -f "${release_tag_file}" ]; then
+              echo "== current deployed release =="
+              cat "${release_tag_file}"
+            fi
+          '
+
+          if [ "${operation}" = "delete-thread" ]; then
+            if [ -z "${target_thread_id}" ]; then
+              echo "::error::target_thread_id is required for operation=delete-thread"
+              exit 1
+            fi
+            python3 "${smoke_script}" \
+              --namespace "${CODEX_DEPLOY_NAMESPACE}" \
+              --pod "${pod}" \
+              --container "${CODEX_DEPLOY_CONTAINER}" \
+              --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
+              --delete-only-thread-id "${target_thread_id}"
+            exit 0
+          fi
+
+          if [ "${operation}" = "unarchive-thread" ]; then
+            if [ -z "${target_thread_id}" ]; then
+              echo "::error::target_thread_id is required for operation=unarchive-thread"
+              exit 1
+            fi
+            python3 "${smoke_script}" \
+              --namespace "${CODEX_DEPLOY_NAMESPACE}" \
+              --pod "${pod}" \
+              --container "${CODEX_DEPLOY_CONTAINER}" \
+              --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
+              --unarchive-only-thread-id "${target_thread_id}"
+            exit 0
+          fi
+
+          if [ "${operation}" != "smoke" ]; then
+            echo "::error::Unsupported operation ${operation}"
+            exit 1
+          fi
+
+          summary_path="${RUNNER_TEMP}/copy-workspace-smoke-summary.json"
+          python3 "${smoke_script}" \
+            --namespace "${CODEX_DEPLOY_NAMESPACE}" \
+            --pod "${pod}" \
+            --container "${CODEX_DEPLOY_CONTAINER}" \
+            --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
+            --resume-thread-id "${resume_thread_id}" \
+            --min-interactive-threads "${min_interactive_threads}" \
+            --expected-model "${expected_model}" \
+            --expected-resume-model "${expected_resume_model}" \
+            --expected-model-provider "${expected_model_provider}" \
+            --keep-smoke-thread \
+            --summary-json-path "${summary_path}"
+
+          python3 - "${summary_path}" "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import sys
+
+          summary_path = sys.argv[1]
+          github_output = sys.argv[2]
+          with open(summary_path, "r", encoding="utf-8") as summary_file:
+              summary = json.load(summary_file)
+          with open(github_output, "a", encoding="utf-8") as output_file:
+              output_file.write(f"smoke_thread_id={summary['smokeThreadId']}\n")
+              output_file.write(f"smoke_goal_objective={summary['smokeGoalObjective']}\n")
+          PY
+
+      - name: Read PostgreSQL workspace memory and goal counts
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.operation == '' || github.event.inputs.operation == 'smoke' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pod="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
+              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" && !printed { print $1; printed = 1 }'
+          )"
+          if [ -z "${pod}" ]; then
+            echo "::error::No running ${CODEX_DEPLOY_POD_PREFIX} pod found"
+            exit 1
+          fi
+
+          database_url="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec -i "${pod}" -c "${CODEX_DEPLOY_CONTAINER}" -- \
+              sh -lc 'printf %s "${CODEX_REMOTE_SQL_URL:-}"'
+          )"
+          if [ -z "${database_url}" ]; then
+            echo "::error::CODEX_REMOTE_SQL_URL is not set in ${pod}"
+            exit 1
+          fi
+
+          smoke_thread_id="${{ steps.control_plane_smoke.outputs.smoke_thread_id }}"
+          smoke_goal_objective="${{ steps.control_plane_smoke.outputs.smoke_goal_objective }}"
+          if [ -z "${smoke_thread_id}" ] || [ -z "${smoke_goal_objective}" ]; then
+            echo "::error::Missing smoke thread outputs from control plane step"
+            exit 1
+          fi
+          resume_thread_id="${{ github.event.inputs.resume_thread_id }}"
+          if [ -z "${resume_thread_id}" ]; then
+            resume_thread_id="${COPY_WORKSPACE_RESUME_THREAD_ID}"
+          fi
+          expected_model="${{ github.event.inputs.expected_model }}"
+          if [ -z "${expected_model}" ]; then
+            expected_model="${COPY_WORKSPACE_EXPECTED_MODEL}"
+          fi
+          expected_resume_model="${{ github.event.inputs.expected_resume_model }}"
+          if [ -z "${expected_resume_model}" ]; then
+            expected_resume_model="${COPY_WORKSPACE_EXPECTED_RESUME_MODEL}"
+          fi
+          expected_model_provider="${{ github.event.inputs.expected_model_provider }}"
+          if [ -z "${expected_model_provider}" ]; then
+            expected_model_provider="${COPY_WORKSPACE_EXPECTED_MODEL_PROVIDER}"
+          fi
+
+          sql_file="$(mktemp)"
+          cat >"${sql_file}" <<'SQL'
+          CREATE TEMP TABLE probe_results (
+              metric TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+          );
+
+          DO $probe$
+          DECLARE
+              workspace TEXT := '__WORKSPACE_ID__';
+              known_thread_id TEXT := '__KNOWN_THREAD_ID__';
+              smoke_thread_id TEXT := '__SMOKE_THREAD_ID__';
+              expected_model TEXT := '__EXPECTED_MODEL__';
+              expected_resume_model TEXT := '__EXPECTED_RESUME_MODEL__';
+              expected_provider TEXT := '__EXPECTED_PROVIDER__';
+              value_count BIGINT := 0;
+              route TEXT := 'none';
+          BEGIN
+              INSERT INTO probe_results (metric, value)
+              SELECT
+                  'columns_' || table_name,
+                  string_agg(column_name, ',' ORDER BY ordinal_position)
+              FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name IN (
+                    'threads',
+                    'sessions',
+                    'thread_events',
+                    'thread_goals',
+                    'memories',
+                    'memory_stage1_outputs',
+                    'memory_jobs'
+                )
+              GROUP BY table_name;
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  IF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'threads'
+                        AND column_name = 'workspace_id'
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.threads WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'threads.workspace_id';
+                  ELSIF to_regclass('public.sessions') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'sessions'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.threads t
+                           JOIN public.sessions s ON s.id = t.session_id
+                           WHERE s.workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'sessions.workspace_id';
+                  ELSIF to_regclass('public.thread_events') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'thread_events'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(DISTINCT thread_id)
+                           FROM public.thread_events
+                           WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_events.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('threads', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('threads_workspace_route', route);
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.thread_goals') IS NOT NULL THEN
+                  IF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'thread_goals'
+                        AND column_name = 'workspace_id'
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.thread_goals WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_goals.workspace_id';
+                  ELSIF to_regclass('public.threads') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'threads'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.thread_goals g
+                           JOIN public.threads t ON t.id = g.thread_id
+                           WHERE t.workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'threads.workspace_id';
+                  ELSIF to_regclass('public.sessions') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'sessions'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.thread_goals g
+                           JOIN public.threads t ON t.id = g.thread_id
+                           JOIN public.sessions s ON s.id = t.session_id
+                           WHERE s.workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'sessions.workspace_id';
+                  ELSIF to_regclass('public.thread_events') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'thread_events'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.thread_goals g
+                           JOIN (
+                               SELECT DISTINCT thread_id
+                               FROM public.thread_events
+                               WHERE workspace_id = $1
+                           ) visible_threads USING (thread_id)'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_events.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('thread_goals', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('thread_goals_route', route);
+
+              value_count := 0;
+              IF to_regclass('public.thread_goals') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*) FROM public.thread_goals WHERE thread_id = $1'
+                      INTO value_count
+                      USING '__SMOKE_THREAD_ID__';
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_goal_count', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.thread_goals') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.thread_goals
+                       WHERE thread_id = $1
+                         AND objective = $2'
+                      INTO value_count
+                      USING '__SMOKE_THREAD_ID__', '__SMOKE_GOAL_OBJECTIVE__';
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_goal_objective_match', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.threads
+                       WHERE id = $1
+                         AND model = $2'
+                      INTO value_count
+                      USING known_thread_id, expected_resume_model;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('known_thread_model_match', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.threads
+                       WHERE id = $1
+                         AND model_provider = $2'
+                      INTO value_count
+                      USING known_thread_id, expected_provider;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('known_thread_provider_match', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.threads
+                       WHERE id = $1
+                         AND model = $2'
+                      INTO value_count
+                      USING smoke_thread_id, expected_model;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_model_match', value_count::TEXT);
+
+              value_count := 0;
+              IF to_regclass('public.threads') IS NOT NULL THEN
+                  EXECUTE
+                      'SELECT COUNT(*)
+                       FROM public.threads
+                       WHERE id = $1
+                         AND model_provider = $2'
+                      INTO value_count
+                      USING smoke_thread_id, expected_provider;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('smoke_thread_provider_match', value_count::TEXT);
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.memories') IS NOT NULL THEN
+                  IF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memories'
+                        AND column_name = 'workspace_id'
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.memories WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'memories.workspace_id';
+                  ELSIF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memories'
+                        AND column_name = 'thread_id'
+                  ) AND to_regclass('public.thread_events') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'thread_events'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.memories m
+                           JOIN (
+                               SELECT DISTINCT thread_id
+                               FROM public.thread_events
+                               WHERE workspace_id = $1
+                           ) visible_threads ON visible_threads.thread_id = m.thread_id'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_events.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('memories', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('memories_route', route);
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.memory_stage1_outputs') IS NOT NULL THEN
+                  IF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memory_stage1_outputs'
+                        AND column_name = 'workspace_id'
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.memory_stage1_outputs
+                           WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'memory_stage1_outputs.workspace_id';
+                  ELSIF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memory_stage1_outputs'
+                        AND column_name = 'thread_id'
+                  ) AND to_regclass('public.thread_events') IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'thread_events'
+                            AND column_name = 'workspace_id'
+                      ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*)
+                           FROM public.memory_stage1_outputs m
+                           JOIN (
+                               SELECT DISTINCT thread_id
+                               FROM public.thread_events
+                               WHERE workspace_id = $1
+                           ) visible_threads ON visible_threads.thread_id = m.thread_id'
+                          INTO value_count
+                          USING workspace;
+                      route := 'thread_events.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('memory_stage1_outputs', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('memory_stage1_outputs_route', route);
+
+              value_count := 0;
+              route := 'none';
+              IF to_regclass('public.memory_jobs') IS NOT NULL THEN
+                  IF EXISTS (
+                      SELECT 1
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'memory_jobs'
+                        AND column_name = 'workspace_id'
+                  ) THEN
+                      EXECUTE
+                          'SELECT COUNT(*) FROM public.memory_jobs WHERE workspace_id = $1'
+                          INTO value_count
+                          USING workspace;
+                      route := 'memory_jobs.workspace_id';
+                  END IF;
+              END IF;
+              INSERT INTO probe_results (metric, value) VALUES ('memory_jobs', value_count::TEXT);
+              INSERT INTO probe_results (metric, value) VALUES ('memory_jobs_route', route);
+          END
+          $probe$;
+
+          SELECT metric || '=' || value
+          FROM probe_results
+          ORDER BY metric;
+          SQL
+          sed -i.bak "s/__WORKSPACE_ID__/${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}/g" "${sql_file}"
+          sed -i.bak "s/__KNOWN_THREAD_ID__/${resume_thread_id}/g" "${sql_file}"
+          sed -i.bak "s/__SMOKE_THREAD_ID__/${smoke_thread_id}/g" "${sql_file}"
+          sed -i.bak "s/__SMOKE_GOAL_OBJECTIVE__/${smoke_goal_objective}/g" "${sql_file}"
+          sed -i.bak "s/__EXPECTED_MODEL__/${expected_model}/g" "${sql_file}"
+          sed -i.bak "s/__EXPECTED_RESUME_MODEL__/${expected_resume_model}/g" "${sql_file}"
+          sed -i.bak "s/__EXPECTED_PROVIDER__/${expected_model_provider}/g" "${sql_file}"
+          rm -f "${sql_file}.bak"
+
+          probe_name="copy-workspace-pg-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" delete pod "${probe_name}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+            rm -f "${sql_file}"
+          }
+          trap cleanup EXIT
+
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" run "${probe_name}" \
+            --image="${COPY_WORKSPACE_PG_PROBE_IMAGE}" \
+            --restart=Never \
+            --labels=app=copy-workspace-pg-probe \
+            --command -- sh -lc 'sleep 600'
+
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" wait --for=condition=Ready "pod/${probe_name}" --timeout=120s
+          kubectl -n "${CODEX_DEPLOY_NAMESPACE}" cp \
+            "${sql_file}" \
+            "${probe_name}:/tmp/copy-workspace-counts.sql"
+
+          counts="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" exec "${probe_name}" -- env \
+              DATABASE_URL="${database_url}" \
+              sh -lc 'psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -Atf /tmp/copy-workspace-counts.sql'
+          )"
+
+          printf '%s\n' "${counts}"
+
+          threads=0
+          thread_goals=0
+          memories=0
+          memory_stage1_outputs=0
+          memory_jobs=0
+          smoke_thread_goal_count=0
+          smoke_thread_goal_objective_match=0
+          known_thread_model_match=0
+          known_thread_provider_match=0
+          smoke_thread_model_match=0
+          smoke_thread_provider_match=0
+          threads_workspace_route=none
+          while IFS='=' read -r metric value; do
+            case "${metric}" in
+              threads) threads="${value}" ;;
+              thread_goals) thread_goals="${value}" ;;
+              memories) memories="${value}" ;;
+              memory_stage1_outputs) memory_stage1_outputs="${value}" ;;
+              memory_jobs) memory_jobs="${value}" ;;
+              smoke_thread_goal_count) smoke_thread_goal_count="${value}" ;;
+              smoke_thread_goal_objective_match) smoke_thread_goal_objective_match="${value}" ;;
+              known_thread_model_match) known_thread_model_match="${value}" ;;
+              known_thread_provider_match) known_thread_provider_match="${value}" ;;
+              smoke_thread_model_match) smoke_thread_model_match="${value}" ;;
+              smoke_thread_provider_match) smoke_thread_provider_match="${value}" ;;
+              threads_workspace_route) threads_workspace_route="${value}" ;;
+            esac
+          done <<< "${counts}"
+
+          case "${threads_workspace_route}" in
+            threads.workspace_id) echo "Postgres probe filtered threads directly by threads.workspace_id" ;;
+            sessions.workspace_id) echo "Postgres probe filtered threads via sessions.workspace_id fallback" ;;
+            thread_events.workspace_id) echo "Postgres probe filtered threads via thread_events.workspace_id fallback" ;;
+            none) echo "::warning::Postgres probe could not detect a workspace filter path for threads" ;;
+          esac
+
+          if [ "${threads}" -lt 100 ]; then
+            echo "::error::Expected at least 100 Postgres threads for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got ${threads}"
+            exit 1
+          fi
+          if [ "${smoke_thread_goal_count}" -lt 1 ]; then
+            echo "::error::Expected a PostgreSQL thread_goals row for smoke thread ${smoke_thread_id}, got ${smoke_thread_goal_count}"
+            exit 1
+          fi
+          if [ "${smoke_thread_goal_objective_match}" -lt 1 ]; then
+            echo "::error::Expected PostgreSQL smoke thread goal objective to match ${smoke_goal_objective}"
+            exit 1
+          fi
+          if [ "${known_thread_model_match}" -lt 1 ] || [ "${known_thread_provider_match}" -lt 1 ]; then
+            echo "::error::Expected known thread ${resume_thread_id} to have model=${expected_resume_model} provider=${expected_model_provider} in PostgreSQL"
+            exit 1
+          fi
+          if [ "${smoke_thread_model_match}" -lt 1 ] || [ "${smoke_thread_provider_match}" -lt 1 ]; then
+            echo "::error::Expected smoke thread ${smoke_thread_id} to have model=${expected_model} provider=${expected_model_provider} in PostgreSQL"
+            exit 1
+          fi
+          if [ "${memories}" -lt 1 ] && [ "${memory_stage1_outputs}" -lt 1 ]; then
+            echo "::error::Expected PostgreSQL-backed memories for ${COPY_WORKSPACE_CANONICAL_WORKSPACE_ID}, got memories=${memories} memory_stage1_outputs=${memory_stage1_outputs}"
+            exit 1
+          fi
+
+      - name: Delete retained smoke thread
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || github.event.inputs.operation == '' || github.event.inputs.operation == 'smoke') && steps.control_plane_smoke.outputs.smoke_thread_id != '' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          smoke_thread_id="${{ steps.control_plane_smoke.outputs.smoke_thread_id }}"
+          smoke_script="/tmp/copy_workspace_smoke.py"
+          curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.github/scripts/copy_workspace_smoke.py?ref=${GITHUB_SHA}" \
+            -o "${smoke_script}"
+          chmod 0755 "${smoke_script}"
+
+          pod="$(
+            kubectl -n "${CODEX_DEPLOY_NAMESPACE}" get pods --no-headers \
+              | awk -v prefix="${CODEX_DEPLOY_POD_PREFIX}" '$1 ~ ("^" prefix) && $3 == "Running" && !printed { print $1; printed = 1 }'
+          )"
+          if [ -z "${pod}" ]; then
+            echo "::warning::Skipping smoke thread cleanup because no running ${CODEX_DEPLOY_POD_PREFIX} pod was found"
+            exit 0
+          fi
+
+          python3 "${smoke_script}" \
+            --namespace "${CODEX_DEPLOY_NAMESPACE}" \
+            --pod "${pod}" \
+            --container "${CODEX_DEPLOY_CONTAINER}" \
+            --request-timeout-seconds "${COPY_WORKSPACE_REQUEST_TIMEOUT_SECONDS}" \
+            --resume-thread-id "${COPY_WORKSPACE_RESUME_THREAD_ID}" \
+            --delete-only-thread-id "${smoke_thread_id}"

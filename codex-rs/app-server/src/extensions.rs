@@ -28,6 +28,7 @@ use codex_rollout::state_db::StateDbHandle;
 
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::thread_state::ThreadGoalStoreHandle;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
 
@@ -35,6 +36,7 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) state_db: Option<StateDbHandle>,
+    pub(crate) goal_store: Option<ThreadGoalStoreHandle>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) thread_manager: Weak<ThreadManager>,
     pub(crate) goal_service: Arc<GoalService>,
@@ -54,6 +56,7 @@ pub(crate) fn thread_extensions(
         event_sink,
         auth_manager,
         state_db,
+        goal_store,
         analytics_events_client,
         thread_manager,
         goal_service,
@@ -73,9 +76,10 @@ pub(crate) fn thread_extensions(
     }
     codex_history_notes_extension::install(&mut builder, auth_manager.clone());
     codex_core::install_agent_message_board(&mut builder, thread_manager.clone());
-    if let Some(state_db) = state_db {
-        codex_goal_extension::install_with_backend(
+    if let Some(goal_store) = goal_store {
+        codex_goal_extension::install_with_goal_store(
             &mut builder,
+            goal_store,
             state_db,
             analytics_events_client,
             codex_otel::global(),

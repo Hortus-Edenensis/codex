@@ -3,9 +3,9 @@ use super::RemoteControlSession;
 use super::RemoteControlUnavailable;
 use super::protocol::normalize_remote_control_url;
 use super::publish_current_enrollment;
+use super::storage::PersistedRemoteControlEnrollment;
 use super::websocket::RemoteControlStatusPublisher;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
-use codex_state::RemoteControlEnrollmentRecord;
 use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +29,7 @@ impl RemoteControlDesiredState {
 }
 
 pub(super) fn desired_state_from_persisted_enrollment(
-    enrollment: Option<RemoteControlEnrollmentRecord>,
+    enrollment: Option<PersistedRemoteControlEnrollment>,
 ) -> RemoteControlDesiredState {
     if enrollment.and_then(|enrollment| enrollment.remote_control_enabled) == Some(true) {
         RemoteControlDesiredState::Enabled {
@@ -75,8 +75,7 @@ impl RemoteControlSession {
                 &auth.account_id,
                 app_server_client_name.as_deref(),
             )
-            .await
-            .map_err(io::Error::other)?;
+            .await?;
         let desired_state = desired_state_from_persisted_enrollment(enrollment);
         self.desired_state_tx.send_if_modified(|state| {
             if !matches!(*state, RemoteControlDesiredState::Unknown) {

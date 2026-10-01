@@ -70,6 +70,8 @@ impl ThreadMetadataSync {
             title: guardian_review.then(|| codex_state::GUARDIAN_THREAD_TITLE.to_string()),
             preview: guardian_review.then(|| codex_state::GUARDIAN_THREAD_PREVIEW.to_string()),
             model_provider: Some(params.metadata.model_provider.clone()),
+            model: params.metadata.model.clone(),
+            reasoning_effort: params.metadata.reasoning_effort.clone().map(Some),
             created_at: Some(created_at),
             updated_at: Some(created_at),
             source: Some(params.source.clone()),
@@ -130,6 +132,14 @@ impl ThreadMetadataSync {
             defer_create_update_until_history_exists: false,
             defer_resume_update_until_append: false,
         };
+        sync.merge_pending_update(Some(ThreadMetadataPatch {
+            model_provider: Some(params.metadata.model_provider.clone()),
+            model: params.metadata.model.clone(),
+            reasoning_effort: params.metadata.reasoning_effort.clone().map(Some),
+            cwd: params.metadata.cwd.clone(),
+            memory_mode: Some(params.metadata.memory_mode),
+            ..Default::default()
+        }));
         if let Some(history) = params.history.as_deref() {
             sync.record_resume_history(history);
         }
@@ -290,6 +300,17 @@ impl ThreadMetadataSync {
                     update.reasoning_effort = Some(turn_ctx.effort.clone());
                     update.approval_mode = Some(turn_ctx.approval_policy);
                     update.permission_profile = Some(turn_ctx.permission_profile());
+                }
+                RolloutItem::EventMsg(EventMsg::SessionConfigured(event)) => {
+                    update.model = Some(event.model.clone());
+                    update.model_provider = Some(event.model_provider_id.clone());
+                    update.reasoning_effort = Some(event.reasoning_effort.clone());
+                    if !self.cwd_seen {
+                        self.cwd_seen = true;
+                        update.cwd = Some(event.cwd.clone().into_path_buf());
+                    }
+                    update.approval_mode = Some(event.approval_policy);
+                    update.permission_profile = Some(event.permission_profile.clone());
                 }
                 RolloutItem::EventMsg(EventMsg::UserMessage(user)) => {
                     self.observe_user_message(user, &mut update);
@@ -497,12 +518,19 @@ mod tests {
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffort::XHigh),
                 memory_mode: ThreadMemoryMode::Enabled,
             },
         })
         .await;
 
         let update = sync.take_pending_update().expect("pending metadata update");
+        assert_eq!(update.patch.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            update.patch.reasoning_effort,
+            Some(Some(ReasoningEffort::XHigh))
+        );
         assert_eq!(
             (update.patch.project_id, update.patch.originator.as_deref()),
             (None, Some("test_originator")),
@@ -879,6 +907,8 @@ mod tests {
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
+                model: None,
+                reasoning_effort: None,
                 memory_mode: ThreadMemoryMode::Enabled,
             },
         }

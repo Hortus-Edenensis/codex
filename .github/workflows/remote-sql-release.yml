@@ -1,0 +1,251 @@
+name: remote-sql-release
+
+on:
+  push:
+    tags:
+      - 'v*-patch-*'
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Version to embed in the Codex binary, for example 0.159.3-patch-1.
+        required: false
+        type: string
+
+concurrency:
+  group: remote-sql-release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE: "0.159.3"
+  CODEX_OFFICIAL_BASE_TAG: "rust-v0.159.3"
+  CODEX_OFFICIAL_BASE_COMMIT: "01fc69f4026735edfdf6789820549727a4867b11"
+  STABLE_GIT_COMMIT: ${{ github.sha }}
+  CODEX_REPO_ROOT: ${{ github.workspace }}
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  linux-cargo-build:
+    name: Linux remote SQL cargo build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: codex_test
+          POSTGRES_PASSWORD: codex_test
+          POSTGRES_DB: codex_release_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U codex_test -d codex_release_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    outputs:
+      release_version: ${{ steps.embed-release.outputs.release_version }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Validate release workflow
+        run: python3 ../.github/scripts/remote_sql_release_test.py
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Install native build dependencies
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libcap-dev \
+            libssl-dev \
+            pkg-config \
+            protobuf-compiler \
+            postgresql-client
+      - name: Test legacy PostgreSQL memory migration
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: ${{ job.services.postgres.ports[5432] }}
+          PGUSER: codex_test
+          PGPASSWORD: codex_test
+          PGDATABASE: codex_release_test
+        run: psql -X --set ON_ERROR_STOP=1 --file postgres-thread-store/tests/legacy_generated_memories.sql
+      - name: Embed release version
+        id: embed-release
+        env:
+          INPUT_RELEASE_VERSION: ${{ github.event.inputs.release_version }}
+        run: |
+          set -euo pipefail
+          release_version="${INPUT_RELEASE_VERSION:-}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            if [[ ! "${GITHUB_REF_NAME}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+-patch-[0-9]+)$ ]]; then
+              echo "::error::Expected a complete vMAJOR.MINOR.PATCH-patch-N tag"
+              exit 1
+            fi
+            tag_version="${BASH_REMATCH[1]}"
+            if [ -n "${release_version}" ] && [ "${release_version}" != "${tag_version}" ]; then
+              echo "::error::release_version does not match the tag"
+              exit 1
+            fi
+            release_version="${tag_version}"
+          fi
+          if [ -z "${release_version}" ]; then
+            release_version="${CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE}-remote-sql.${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:12}"
+          fi
+          CODEX_PACKAGE_VERSION="${release_version}" PYTHONPATH=../scripts python3 - <<'PYVERSION'
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+          from codex_package.cli import parse_package_version
+
+          version = parse_package_version(os.environ["CODEX_PACKAGE_VERSION"])
+          path = Path("Cargo.toml")
+          source = path.read_text()
+          metadata = tomllib.loads(source)
+          section = re.search(r"(?ms)^\[workspace\.package\][ \t]*\n(.*?)(?=^\[|\Z)", source)
+          if section is None:
+              raise SystemExit("missing [workspace.package]")
+          updated_section, count = re.subn(
+              r'(?m)^(version[ \t]*=[ \t]*")[^"]*("[ \t]*(?:#.*)?)$',
+              lambda match: match[1] + version + match[2], section[1],
+          )
+          if count != 1:
+              raise SystemExit("expected exactly one workspace package version")
+          updated = source[:section.start(1)] + updated_section + source[section.end(1):]
+          metadata["workspace"]["package"]["version"] = version
+          if tomllib.loads(updated) != metadata:
+              raise SystemExit("version edit changed unrelated Cargo metadata")
+          path.write_text(updated)
+          PYVERSION
+          echo "release_version=${release_version}" >> "${GITHUB_OUTPUT}"
+          cargo metadata --format-version 1 --no-deps >/dev/null
+          git merge-base --is-ancestor "${CODEX_OFFICIAL_BASE_COMMIT}" HEAD
+      - name: Prepare official V8 artifacts
+        run: |
+          PYTHONPATH=../scripts python3 - <<'PY'
+          import os
+          from codex_package.targets import TARGET_SPECS
+          from codex_package.v8 import resolve_codex_v8_cargo_env
+          values = resolve_codex_v8_cargo_env(TARGET_SPECS["x86_64-unknown-linux-gnu"])
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          PY
+      - name: Build bundled sandbox and stamp its digest
+        run: |
+          set -euo pipefail
+          cargo build --release -p codex-bwrap --bin bwrap
+          strip --strip-unneeded target/release/bwrap
+          digest="$(sha256sum target/release/bwrap | cut -d ' ' -f 1)"
+          echo "CODEX_BWRAP_SHA256=${digest}" >> "${GITHUB_ENV}"
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: just,nextest@0.9.103
+      - name: Test remote SQL targets
+        run: |
+          just test --cargo-profile release \
+            -p codex-postgres-thread-store \
+            -p codex-api \
+            -p codex-model-provider \
+            -p codex-responses-api-proxy \
+            -p codex-app-server-daemon
+      - name: Build remote SQL targets
+        run: |
+          cargo build --release \
+            -p codex-cli -p codex-code-mode-host \
+            --bin codex --bin codex-code-mode-host
+      - name: Test memory and thread callers
+        run: |
+          just test --cargo-profile release --lib \
+            -p codex-core \
+            -p codex-state \
+            -p codex-thread-store \
+            -p codex-app-server
+      - name: Stage release artifact
+        id: stage-release
+        env:
+          RELEASE_VERSION: ${{ steps.embed-release.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/codex-release
+          for bin in codex codex-code-mode-host; do
+            test -x "target/release/${bin}"
+            strip --strip-unneeded "target/release/${bin}"
+          done
+          python3 ../scripts/build_codex_package.py \
+            --target x86_64-unknown-linux-gnu \
+            --package-version "${RELEASE_VERSION}" \
+            --package-dir target/codex-package \
+            --entrypoint-bin target/release/codex \
+            --code-mode-host-bin target/release/codex-code-mode-host \
+            --bwrap-bin target/release/bwrap
+          printf 'release_version=%s\ngit_sha=%s\nofficial_base_tag=%s\nofficial_base_commit=%s\nrun_id=%s\n' \
+            "${RELEASE_VERSION}" "${GITHUB_SHA}" "${CODEX_OFFICIAL_BASE_TAG}" \
+            "${CODEX_OFFICIAL_BASE_COMMIT}" "${GITHUB_RUN_ID}" \
+            > target/codex-package/REMOTE_SQL_BUILD_TAG
+          version="$(target/codex-package/bin/codex --version)"
+          test "${version##* }" = "${RELEASE_VERSION}"
+          target/codex-package/bin/codex-code-mode-host --help >/dev/null
+          (
+            cd target/codex-package
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          archive="codex-${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -C target/codex-package -czf "target/codex-release/${archive}" .
+          (
+            cd target/codex-release
+            sha256sum "${archive}" > "${archive}.sha256"
+          )
+          du -sh target/codex-release
+          ls -lh target/codex-release
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-linux-native
+          path: codex-rs/target/codex-release/
+          if-no-files-found: error
+
+  release:
+    name: Publish tagged native package
+    runs-on: ubuntu-22.04
+    needs: linux-cargo-build
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codex-linux-native
+          path: release
+      - name: Publish release assets
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.linux-cargo-build.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          archive="codex-${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          sha256sum --check "${archive}.sha256"
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${archive}" "${archive}.sha256" \
+              --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${GITHUB_REF_NAME}" "${archive}" "${archive}.sha256" \
+              --repo "${GITHUB_REPOSITORY}" --verify-tag \
+              --title "Codex ${RELEASE_VERSION}" \
+              --notes "Native Linux x86_64 package based on ${CODEX_OFFICIAL_BASE_TAG}, with PostgreSQL-backed memory and thread storage."
+          fi

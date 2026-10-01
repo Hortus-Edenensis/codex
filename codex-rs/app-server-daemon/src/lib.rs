@@ -35,6 +35,7 @@ use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_transport::app_server_control_socket_path;
 use codex_utils_home_dir::find_codex_home;
 use managed_install::managed_codex_bin;
+use managed_install::managed_codex_remote_sql_build_tag;
 #[cfg(any(unix, windows))]
 use managed_install::managed_codex_version;
 use serde::Serialize;
@@ -84,6 +85,8 @@ pub struct LifecycleOutput {
     pub pid: Option<u32>,
     pub managed_codex_path: PathBuf,
     pub managed_codex_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_sql_build_tag: Option<String>,
     pub socket_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_version: Option<String>,
@@ -117,6 +120,8 @@ pub struct BootstrapOutput {
     pub remote_control_enabled: bool,
     pub managed_codex_path: PathBuf,
     pub managed_codex_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_sql_build_tag: Option<String>,
     pub socket_path: PathBuf,
     pub cli_version: String,
     pub app_server_version: String,
@@ -306,6 +311,7 @@ fn ensure_supported_platform() -> Result<()> {
 
 #[derive(Clone)]
 struct Daemon {
+    codex_home: PathBuf,
     // Feature-aware TUI startup owns a live terminal. Direct lifecycle commands
     // must still report their diagnostics to stderr.
     log_diagnostics: bool,
@@ -333,6 +339,7 @@ impl Daemon {
                 (DAEMON_PID_FILE_NAME, DAEMON_UPDATE_PID_FILE_NAME)
             };
         Ok(Self {
+            codex_home: codex_home.as_path().to_path_buf(),
             log_diagnostics: false,
             socket_path,
             pid_file: state_dir.join(pid_file),
@@ -820,6 +827,7 @@ impl Daemon {
         let info = self.wait_until_ready().await?;
         let auto_update_enabled = managed.ensure_managed_updater(&settings).await?;
         let managed_codex_version = managed.managed_codex_version_best_effort().await;
+        let remote_sql_build_tag = managed.remote_sql_build_tag_best_effort().await;
         Ok(BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
@@ -827,6 +835,7 @@ impl Daemon {
             remote_control_enabled: settings.remote_control_enabled,
             managed_codex_path: managed.managed_codex_bin,
             managed_codex_version,
+            remote_sql_build_tag,
             socket_path: self.socket_path.clone(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
             app_server_version: info.app_server_version,
@@ -972,6 +981,12 @@ impl Daemon {
         None
     }
 
+    async fn remote_sql_build_tag_best_effort(&self) -> Option<String> {
+        managed_codex_remote_sql_build_tag(&self.managed_codex_bin)
+            .await
+            .ok()
+    }
+
     fn backend_paths(&self, settings: &DaemonSettings) -> BackendPaths {
         self.backend_paths_with_bin(settings, &self.managed_codex_bin)
     }
@@ -983,8 +998,10 @@ impl Daemon {
     ) -> BackendPaths {
         BackendPaths {
             codex_bin: managed_codex_bin.to_path_buf(),
+            codex_home: self.codex_home.clone(),
             pid_file: self.pid_file.clone(),
             update_pid_file: self.update_pid_file.clone(),
+            socket_path: self.socket_path.clone(),
             remote_control_enabled: settings.remote_control_enabled,
             feature_overrides: settings.feature_overrides.clone(),
         }
@@ -1050,12 +1067,14 @@ impl Daemon {
         app_server_version: Option<String>,
     ) -> LifecycleOutput {
         let managed_codex_version = self.managed_codex_version_best_effort().await;
+        let remote_sql_build_tag = self.remote_sql_build_tag_best_effort().await;
         LifecycleOutput {
             status,
             backend,
             pid,
             managed_codex_path: self.managed_codex_bin.clone(),
             managed_codex_version,
+            remote_sql_build_tag,
             socket_path: self.socket_path.clone(),
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             app_server_version,
@@ -1205,6 +1224,7 @@ mod tests {
             pid: None,
             managed_codex_path: "codex".into(),
             managed_codex_version: Some("1.2.3".to_string()),
+            remote_sql_build_tag: None,
             socket_path: "codex.sock".into(),
             cli_version: Some("1.2.3".to_string()),
             app_server_version: Some("1.2.4".to_string()),
@@ -1235,6 +1255,7 @@ mod tests {
             remote_control_enabled: true,
             managed_codex_path: "codex".into(),
             managed_codex_version: Some("1.2.3".to_string()),
+            remote_sql_build_tag: None,
             socket_path: "codex.sock".into(),
             cli_version: "1.2.3".to_string(),
             app_server_version: "1.2.4".to_string(),
@@ -1268,6 +1289,7 @@ mod tests {
         let legacy = home.path().join("packages/standalone/current");
         std::fs::create_dir_all(&legacy).expect("legacy selection");
         let daemon = Daemon {
+            codex_home: home.path().to_path_buf(),
             log_diagnostics: false,
             socket_path: home.path().join("server.sock"),
             pid_file: state.join(super::LEGACY_PID_FILE_NAME),
@@ -1302,6 +1324,7 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let state = temp.path().join("missing-home").join("daemon-state");
         let daemon = Daemon {
+            codex_home: temp.path().join("missing-home"),
             log_diagnostics: false,
             socket_path: state.join("server.sock"),
             pid_file: state.join("server.pid"),
@@ -1328,6 +1351,7 @@ mod tests {
             .await
             .expect("private state directory");
         let daemon = Daemon {
+            codex_home: home.path().to_path_buf(),
             log_diagnostics: false,
             socket_path: home.path().join("server.sock"),
             pid_file: state.join("server.pid"),
@@ -1383,6 +1407,7 @@ mod tests {
             .expect("current local build");
         let state = home.path().join("app-server-daemon");
         let daemon = Daemon {
+            codex_home: home.path().to_path_buf(),
             log_diagnostics: false,
             socket_path: home
                 .path()
@@ -1411,6 +1436,7 @@ mod tests {
     async fn not_ready_context_reports_daemon_app_server_before_stderr() {
         let temp_dir = TempDir::new().expect("temp dir");
         let daemon = Daemon {
+            codex_home: temp_dir.path().to_path_buf(),
             log_diagnostics: false,
             socket_path: temp_dir.path().join("app-server-control.sock"),
             pid_file: temp_dir.path().join("app-server.pid"),

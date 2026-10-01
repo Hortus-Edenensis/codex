@@ -37,8 +37,11 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
-use codex_state::MemoryStore;
+use codex_state::GeneratedMemoryStore;
 use codex_terminal_detection::user_agent;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::StoredThreadHistory;
+use codex_thread_store::ThreadStore;
 use futures::StreamExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -81,6 +84,8 @@ pub(crate) struct MemoryStartupContext {
     version: MemoryVersion,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
+    generated_memory_store: Option<Arc<dyn GeneratedMemoryStore>>,
+    thread_store: Arc<dyn ThreadStore>,
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
     provider: SharedModelProvider,
@@ -197,11 +202,15 @@ impl MemoryStartupContext {
             model,
             originator().value,
         );
+        let generated_memory_store = thread.generated_memory_store();
+        let thread_store = thread.thread_store();
 
         Self {
             version: config.memories.version,
             thread_id,
             thread,
+            generated_memory_store,
+            thread_store,
             thread_manager,
             auth_manager,
             provider,
@@ -243,19 +252,37 @@ impl MemoryStartupContext {
         );
     }
 
-    pub(crate) async fn memory_store(&self) -> Option<MemoryStore> {
+    pub(crate) async fn memory_store(&self) -> Option<Arc<dyn GeneratedMemoryStore>> {
+        if let Some(store) = self.generated_memory_store.as_ref()
+            && let Some(store) = store.for_version(self.version)
+        {
+            return Some(store);
+        }
         match self
             .thread
             .state_db()?
             .memories_for_version(self.version)
             .await
         {
-            Ok(store) => Some(store),
+            Ok(store) => Some(Arc::new(store)),
             Err(err) => {
                 tracing::warn!("failed opening memory store: {err}");
                 None
             }
         }
+    }
+
+    pub(crate) async fn load_thread_history(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<StoredThreadHistory> {
+        self.thread_store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to load thread history for {thread_id}: {err}"))
     }
 
     pub(crate) fn provider(&self) -> &dyn ModelProvider {

@@ -444,6 +444,40 @@ async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
     );
 }
 
+#[test]
+fn handler_looks_up_flattened_namespaced_tool_name() {
+    let namespaced_name = codex_tools::ToolName::namespaced("codex_app", "read_thread");
+    let handler = Arc::new(TestHandler {
+        tool_name: namespaced_name,
+    }) as Arc<dyn CoreToolRuntime>;
+    let registry = ToolRegistry::from_tools([Arc::clone(&handler)]);
+
+    let flattened = registry.tool(&codex_tools::ToolName::plain("codex_appread_thread"));
+
+    assert!(
+        flattened
+            .as_ref()
+            .is_some_and(|resolved| Arc::ptr_eq(resolved, &handler))
+    );
+}
+
+#[test]
+fn flattened_namespace_lookup_rejects_ambiguous_names() {
+    let registry = ToolRegistry::from_tools([
+        Arc::new(TestHandler {
+            tool_name: codex_tools::ToolName::namespaced("ab", "c"),
+        }) as Arc<dyn CoreToolRuntime>,
+        Arc::new(TestHandler {
+            tool_name: codex_tools::ToolName::namespaced("a", "bc"),
+        }) as Arc<dyn CoreToolRuntime>,
+    ]);
+    assert!(
+        registry
+            .tool(&codex_tools::ToolName::plain("abc"))
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::Result<()> {
     let (session, turn) = crate::session::tests::make_session_and_context().await;

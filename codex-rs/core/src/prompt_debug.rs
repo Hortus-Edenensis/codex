@@ -43,6 +43,7 @@ pub async fn build_prompt_input(
     )?;
 
     let thread_store = thread_store_from_config(&config, state_db.clone());
+    let agent_graph_store = crate::agent_graph_store_from_config(&config, state_db.as_ref());
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let thread_manager = ThreadManager::new(
         &config,
@@ -64,7 +65,7 @@ pub async fn build_prompt_input(
         /*analytics_events_client*/ None,
         crate::thread_manager::passthrough_image_store(),
         thread_store,
-        crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
+        agent_graph_store,
         installation_id,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,

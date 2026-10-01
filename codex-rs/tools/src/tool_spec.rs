@@ -148,6 +148,56 @@ pub fn create_tools_raw_json_for_responses_api(
     serde_json::value::to_raw_value(tools).map(Arc::from)
 }
 
+/// Returns standard OpenAI Chat Completions function-tool definitions.
+///
+/// Responses namespaces are flattened to the same callable name used by the
+/// runtime registry. Responses-only tool kinds are omitted.
+pub fn create_tools_json_for_chat_completions_api(
+    tools: &[ToolSpec],
+) -> Result<Vec<Value>, serde_json::Error> {
+    let mut chat_tools = Vec::new();
+    for tool in tools {
+        match tool {
+            ToolSpec::Function(function) => {
+                chat_tools.push(chat_function_tool(&function.name, function)?);
+            }
+            ToolSpec::Namespace(namespace) => {
+                for tool in &namespace.tools {
+                    let ResponsesApiNamespaceTool::Function(function) = tool else {
+                        continue;
+                    };
+                    chat_tools.push(chat_function_tool(
+                        &if namespace.name.is_empty()
+                            || namespace.name == DEFAULT_FUNCTION_NAMESPACE
+                        {
+                            function.name.clone()
+                        } else {
+                            format!("{}{}", namespace.name, function.name)
+                        },
+                        function,
+                    )?);
+                }
+            }
+            ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => {}
+        }
+    }
+    Ok(chat_tools)
+}
+
+fn chat_function_tool(
+    callable_name: &str,
+    function: &ResponsesApiTool,
+) -> Result<Value, serde_json::Error> {
+    Ok(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": callable_name,
+            "description": function.description,
+            "parameters": serde_json::to_value(&function.parameters)?,
+        },
+    }))
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ResponsesApiWebSearchFilters {
     #[serde(skip_serializing_if = "Option::is_none")]

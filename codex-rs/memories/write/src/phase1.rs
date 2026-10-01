@@ -10,7 +10,6 @@ use crate::runtime::MemoryStartupContext;
 use crate::runtime::StageOneRequestContext;
 use codex_config::types::MemoriesConfig;
 use codex_core::Prompt;
-use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_protocol::MemoryVersion;
 use codex_protocol::ResponseItemId;
@@ -95,9 +94,9 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
 
 /// Prune old un-used "dead" raw memories.
 pub async fn prune(context: &MemoryStartupContext, config: &Config) {
-    if let Some(db) = context.memory_store().await {
+    if let Some(store) = context.memory_store().await {
         let max_unused_days = config.memories.max_unused_days;
-        match db
+        match store
             .prune_stage1_outputs_for_retention(max_unused_days, crate::stage_one::PRUNE_BATCH_SIZE)
             .await
         {
@@ -121,9 +120,8 @@ async fn claim_startup_jobs(
     context: &MemoryStartupContext,
     memories_config: &MemoriesConfig,
 ) -> Option<Vec<codex_state::Stage1JobClaim>> {
-    let Some(state_db) = context.memory_store().await else {
-        // This should not happen.
-        warn!("state db unavailable while claiming phase-1 startup jobs; skipping");
+    let Some(store) = context.memory_store().await else {
+        warn!("generated memory store unavailable while claiming phase-1 startup jobs; skipping");
         return None;
     };
 
@@ -132,7 +130,7 @@ async fn claim_startup_jobs(
         .map(ToString::to_string)
         .collect::<Vec<_>>();
 
-    match state_db
+    match store
         .claim_stage1_jobs_for_startup(
             context.thread_id(),
             codex_state::Stage1StartupClaimParams {
@@ -204,6 +202,7 @@ mod job {
         let (stage_one_output, token_usage) = match sample(
             context,
             config,
+            claimed_thread.id,
             &claimed_thread.rollout_path,
             &claimed_thread.cwd,
             claimed_thread.git_branch.as_deref(),
@@ -259,12 +258,13 @@ mod job {
     async fn sample(
         context: &MemoryStartupContext,
         config: &Config,
+        thread_id: codex_protocol::ThreadId,
         rollout_path: &Path,
         rollout_cwd: &Path,
         rollout_git_branch: Option<&str>,
         stage_one_context: &StageOneRequestContext,
     ) -> anyhow::Result<(StageOneOutput, Option<TokenUsage>)> {
-        let (rollout_items, _, _) = RolloutRecorder::load_rollout_items(rollout_path).await?;
+        let rollout_items = context.load_thread_history(thread_id).await?.items;
         let rollout_contents = match config.memories.version {
             MemoryVersion::V1 => serialize_filtered_rollout_response_items(&rollout_items)?,
             MemoryVersion::V2 => crate::rollout_input::serialize_tiered_input(
@@ -329,8 +329,8 @@ mod job {
             reason: &str,
         ) {
             tracing::warn!("Phase 1 job failed for thread {thread_id}: {reason}");
-            if let Some(state_db) = context.memory_store().await {
-                let _ = state_db
+            if let Some(store) = context.memory_store().await {
+                let _ = store
                     .mark_stage1_job_failed(
                         thread_id,
                         ownership_token,
@@ -346,11 +346,11 @@ mod job {
             thread_id: codex_protocol::ThreadId,
             ownership_token: &str,
         ) -> JobOutcome {
-            let Some(state_db) = context.memory_store().await else {
+            let Some(store) = context.memory_store().await else {
                 return JobOutcome::Failed;
             };
 
-            if state_db
+            if store
                 .mark_stage1_job_succeeded_no_output(thread_id, ownership_token)
                 .await
                 .unwrap_or(false)
@@ -370,11 +370,11 @@ mod job {
             rollout_summary: &str,
             rollout_slug: Option<&str>,
         ) -> JobOutcome {
-            let Some(state_db) = context.memory_store().await else {
+            let Some(store) = context.memory_store().await else {
                 return JobOutcome::Failed;
             };
 
-            if state_db
+            if store
                 .mark_stage1_job_succeeded(
                     thread_id,
                     ownership_token,

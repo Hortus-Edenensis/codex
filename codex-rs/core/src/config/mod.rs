@@ -308,16 +308,20 @@ fn resolve_mcp_oauth_credentials_store_mode(
 #[cfg(test)]
 pub(crate) async fn test_config() -> Config {
     let codex_home = tempfile::tempdir().expect("create temp dir");
-    Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            model: Some("gpt-5.5".to_string()),
-            ..Default::default()
-        },
+    let base_config = ConfigToml {
+        model: Some("gpt-5.5".to_string()),
+        experimental_thread_store: Some(ThreadStoreToml::Local {}),
+        ..Default::default()
+    };
+    let mut config = Config::load_from_base_config_with_overrides(
+        base_config,
         ConfigOverrides::default(),
         AbsolutePathBuf::from_absolute_path(codex_home.path()).expect("temp dir should resolve"),
     )
     .await
-    .expect("load default test config")
+    .expect("load default test config");
+    config.experimental_thread_store = ThreadStoreConfig::Local;
+    config
 }
 
 /// Application configuration loaded from disk and merged with overrides.
@@ -595,13 +599,29 @@ fn build_network_proxy_spec(
 }
 
 /// Configured thread persistence backend.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadStoreConfig {
-    /// Persist threads locally using rollout JSONL files and sqlite metadata.
-    #[default]
+    /// Persist threads in remote PostgreSQL. This is the required default for
+    /// shared workspaces; local JSONL/SQLite remains a legacy explicit mode.
+    Postgres {
+        database_url_env: String,
+        default_workspace_id: String,
+        redis_url_env: Option<String>,
+    },
+    /// Legacy local rollout JSONL files and SQLite metadata.
     Local,
     /// In-memory thread store for test and debug configurations.
     InMemory { id: String },
+}
+
+impl Default for ThreadStoreConfig {
+    fn default() -> Self {
+        Self::Postgres {
+            database_url_env: codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV.to_string(),
+            default_workspace_id: codex_postgres_thread_store::DEFAULT_WORKSPACE_ID.to_string(),
+            redis_url_env: Some("CODEX_REDIS_URL".to_string()),
+        }
+    }
 }
 
 /// Application configuration loaded from disk and merged with overrides.
@@ -918,6 +938,8 @@ pub struct Config {
 
     /// User-configured maximum number of spawned agent threads per session.
     pub agent_max_threads: Option<usize>,
+    /// Maximum runtime for PostgreSQL-backed CSV job workers.
+    pub agent_job_max_runtime_seconds: Option<u64>,
 
     /// Default model for spawned subagents when the spawn call does not select one.
     pub agent_default_subagent_model: Option<String>,
@@ -2510,9 +2532,30 @@ fn resolve_tool_suggest_config_from_config(
 
 fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConfig {
     match thread_store {
-        Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
+        Some(ThreadStoreToml::Local {}) => default_thread_store_config(None),
+        Some(ThreadStoreToml::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        }) => ThreadStoreConfig::Postgres {
+            database_url_env,
+            default_workspace_id,
+            redis_url_env,
+        },
         Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
-        None => ThreadStoreConfig::Local,
+        None => default_thread_store_config(
+            std::env::var(codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV)
+                .ok()
+                .as_deref(),
+        ),
+    }
+}
+
+fn default_thread_store_config(_database_url: Option<&str>) -> ThreadStoreConfig {
+    ThreadStoreConfig::Postgres {
+        database_url_env: codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV.to_string(),
+        default_workspace_id: codex_postgres_thread_store::DEFAULT_WORKSPACE_ID.to_string(),
+        redis_url_env: Some("CODEX_REDIS_URL".to_string()),
     }
 }
 
@@ -3883,6 +3926,16 @@ impl Config {
             .as_ref()
             .and_then(|agents| agents.max_depth)
             .unwrap_or(DEFAULT_AGENT_MAX_DEPTH);
+        let agent_job_max_runtime_seconds = cfg
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.job_max_runtime_seconds);
+        if agent_job_max_runtime_seconds.is_some_and(|seconds| seconds == 0 || seconds > i64::MAX as u64) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agents.job_max_runtime_seconds must be between 1 and i64::MAX",
+            ));
+        }
         let agent_default_subagent_model = cfg
             .agents
             .as_ref()
@@ -4345,6 +4398,7 @@ impl Config {
             tool_output_token_limit: cfg.tool_output_token_limit,
             agents_enabled,
             agent_max_threads,
+            agent_job_max_runtime_seconds,
             agent_default_subagent_model,
             agent_default_subagent_reasoning_effort,
             agent_max_depth,

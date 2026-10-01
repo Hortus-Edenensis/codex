@@ -54,6 +54,11 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
         false
     }
 
+    /// Returns whether the configured wire protocol discovers a compatible `/models` catalog.
+    fn supports_compatible_models(&self) -> bool {
+        false
+    }
+
     /// Returns whether explicit provider configuration supplies API-key authentication.
     /// This takes precedence over any unrelated first-party login used by the picker.
     fn has_provider_api_key(&self) -> bool {
@@ -486,6 +491,7 @@ impl OpenAiModelsManager {
         // Otherwise even a matching cache from an earlier run would bypass bundled-only behavior.
         // Command-auth providers retain their existing discovery behavior.
         if self.uses_api_key_auth()
+            && !self.endpoint_client.supports_compatible_models()
             && !self.endpoint_client.has_command_auth()
             && (!self.endpoint_client.supports_api_key_models()
                 || !self.api_key_model_discovery_enabled.load(Ordering::SeqCst))
@@ -564,6 +570,7 @@ impl OpenAiModelsManager {
 
     async fn should_refresh_models(&self) -> bool {
         self.endpoint_client.uses_codex_backend().await
+            || self.endpoint_client.supports_compatible_models()
             || self.endpoint_client.has_command_auth()
             || self.supports_api_key_discovery()
     }
@@ -579,7 +586,8 @@ impl OpenAiModelsManager {
             .models
             .iter()
             .any(|model| model.visibility == ModelVisibility::List)
-            && (self.supports_api_key_discovery()
+            && (self.endpoint_client.supports_compatible_models()
+                || self.supports_api_key_discovery()
                 || self.auth_manager.as_ref().is_some_and(|auth_manager| {
                     auth_manager
                         .auth_mode()
@@ -738,8 +746,18 @@ fn requested_model_is_available(
     requested_model.is_some_and(|requested_model| {
         available_models
             .iter()
-            .any(|available_model| available_model.model == requested_model)
+            .any(|available_model| model_ids_match(&available_model.model, requested_model))
     })
+}
+
+fn model_ids_match(available_model: &str, requested_model: &str) -> bool {
+    available_model == requested_model
+        || available_model
+            .strip_prefix("openai.")
+            .is_some_and(|model| model == requested_model)
+        || requested_model
+            .strip_prefix("openai.")
+            .is_some_and(|model| model == available_model)
 }
 
 fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {

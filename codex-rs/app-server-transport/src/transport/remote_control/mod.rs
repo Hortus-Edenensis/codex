@@ -5,12 +5,14 @@ mod controller;
 mod persistence;
 pub use controller::RemoteControlHandle;
 pub use controller::start_remote_control;
+pub use controller::start_remote_control_with_state_store;
 mod desired_state;
 mod enroll;
 mod host_device;
 mod protocol;
 mod segment;
 mod server_api;
+mod storage;
 mod websocket;
 
 use self::auth::load_remote_control_auth;
@@ -30,6 +32,8 @@ use self::protocol::RemoteControlPairingStatusCode;
 use self::protocol::ServerEvent;
 use self::protocol::StreamId;
 use self::protocol::normalize_remote_control_url;
+pub use self::storage::PersistedRemoteControlEnrollment;
+pub use self::storage::RemoteControlStateStore;
 use super::CHANNEL_CAPACITY;
 use super::TransportEvent;
 use super::next_connection_id;
@@ -111,7 +115,7 @@ struct RemoteControlSession {
     desired_state_rpc_lock: Arc<Semaphore>,
     persistence: RemoteControlPersistence,
     status_tx: Arc<watch::Sender<RemoteControlStatusChangedNotification>>,
-    state_db: Option<Arc<StateRuntime>>,
+    state_db: Option<Arc<dyn RemoteControlStateStore>>,
     remote_control_url: String,
     current_enrollment: CurrentRemoteControlEnrollment,
     pairing_persistence_key: RemoteControlPairingPersistenceKey,
@@ -240,7 +244,7 @@ impl fmt::Display for RemoteControlUnavailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "remote control cannot be enabled because sqlite state db is unavailable"
+            "remote control cannot be enabled because state storage is unavailable"
         )
     }
 }
@@ -303,7 +307,7 @@ impl RemoteControlSession {
         self.ensure_remote_control_allowed()
             .map_err(RemoteControlEnableError::DisabledByRequirements)?;
         if self.state_db.is_none() {
-            warn!("remote control cannot be enabled because sqlite state db is unavailable");
+            warn!("remote control cannot be enabled because state storage is unavailable");
             return Err(RemoteControlEnableError::Unavailable(
                 RemoteControlUnavailable,
             ));

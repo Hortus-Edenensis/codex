@@ -181,6 +181,31 @@ pub(crate) async fn managed_codex_version(codex_bin: &Path) -> Result<String> {
     parse_codex_version(&stdout)
 }
 
+pub(crate) async fn managed_codex_remote_sql_build_tag(codex_bin: &Path) -> Result<String> {
+    let bin_dir = codex_bin
+        .parent()
+        .context("managed Codex binary path has no parent directory")?;
+    let release_dir = if bin_dir.file_name().is_some_and(|name| name == "bin") {
+        bin_dir
+            .parent()
+            .context("managed Codex binary path has no release directory")?
+    } else {
+        bin_dir
+    };
+    let tag_path = release_dir.join("REMOTE_SQL_BUILD_TAG");
+    let contents = fs::read_to_string(&tag_path)
+        .await
+        .with_context(|| format!("failed to read {}", tag_path.display()))?;
+    let tag = contents.trim();
+    if tag.is_empty() {
+        return Err(anyhow!(
+            "remote SQL build tag was empty in {}",
+            tag_path.display()
+        ));
+    }
+    Ok(tag.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutableIdentity {
     digest: [u8; 32],
