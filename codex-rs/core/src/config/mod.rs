@@ -2551,11 +2551,20 @@ fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConf
             redis_url_env,
         },
         Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
-        None => default_thread_store_config(
-            std::env::var(codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV)
-                .ok()
-                .as_deref(),
-        ),
+        None => {
+            let database_url =
+                std::env::var(codex_postgres_thread_store::DEFAULT_DATABASE_URL_ENV).ok();
+            // Official integration tests exercise local rollout files without a PostgreSQL service.
+            #[cfg(debug_assertions)]
+            if std::env::var("CODEX_TEST_LOCAL_THREAD_STORE").as_deref() == Ok("1")
+                && database_url
+                    .as_deref()
+                    .is_none_or(|url| url.trim().is_empty())
+            {
+                return ThreadStoreConfig::Local;
+            }
+            default_thread_store_config(database_url.as_deref())
+        }
     }
 }
 
