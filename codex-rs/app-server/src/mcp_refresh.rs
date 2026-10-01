@@ -80,6 +80,7 @@ mod tests {
     use codex_config::types::AuthKeyringBackendKind;
     use codex_config::types::McpServerConfig;
     use codex_core::config::ConfigOverrides;
+    use codex_core::config::ThreadStoreConfig;
     use codex_core::init_state_db;
     use codex_core::thread_store_from_config;
     use codex_exec_server::EnvironmentManager;
@@ -187,6 +188,10 @@ mod tests {
             AuthKeyringBackendKind::Secrets
         );
         assert_eq!(thread.config().await.model, original_model);
+        assert_eq!(
+            thread.config().await.experimental_thread_store,
+            ThreadStoreConfig::Local
+        );
         Ok(())
     }
 
@@ -195,7 +200,7 @@ mod tests {
         let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
         let initial_config_manager =
             ConfigManager::without_managed_config_for_tests(temp_dir.path().to_path_buf());
-        let thread_config = initial_config_manager
+        let mut thread_config = initial_config_manager
             .load_for_cwd(
                 Some(HashMap::from([
                     (
@@ -208,6 +213,7 @@ mod tests {
                 Some(temp_dir.path().join("good")),
             )
             .await?;
+        thread_config.experimental_thread_store = ThreadStoreConfig::Local;
         let thread = thread_manager
             .start_thread(codex_core::StartThreadOptions::new(thread_config))
             .await?
@@ -293,20 +299,23 @@ enabled = false
 
         let initial_config_manager =
             ConfigManager::without_managed_config_for_tests(temp_dir.path().to_path_buf());
-        let good_config = initial_config_manager
+        let mut good_config = initial_config_manager
             .load_for_cwd(
                 /*request_overrides*/ None,
                 ConfigOverrides::default(),
                 Some(good_cwd.clone()),
             )
             .await?;
-        let bad_config = initial_config_manager
+        good_config.experimental_thread_store = ThreadStoreConfig::Local;
+        let mut bad_config = initial_config_manager
             .load_for_cwd(
                 /*request_overrides*/ None,
                 ConfigOverrides::default(),
                 Some(bad_cwd.clone()),
             )
             .await?;
+
+        bad_config.experimental_thread_store = ThreadStoreConfig::Local;
 
         let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
         let state_db = init_state_db(&good_config)

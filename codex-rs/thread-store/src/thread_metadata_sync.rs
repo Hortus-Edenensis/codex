@@ -137,7 +137,6 @@ impl ThreadMetadataSync {
             model: params.metadata.model.clone(),
             reasoning_effort: params.metadata.reasoning_effort.clone().map(Some),
             cwd: params.metadata.cwd.clone(),
-            memory_mode: Some(params.metadata.memory_mode),
             ..Default::default()
         }));
         if let Some(history) = params.history.as_deref() {

@@ -31,11 +31,12 @@ mod live_thread_goal_storage_preference_tests {
     #[tokio::test]
     async fn local_mode_uses_local_state_db_when_available() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
-        let config = ConfigBuilder::default()
+        let mut config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .build()
             .await?;
+        config.experimental_thread_store = ThreadStoreConfig::Local;
 
         assert_eq!(
             live_thread_goal_storage_preference(&config, /*has_state_db*/ true),
@@ -48,11 +49,12 @@ mod live_thread_goal_storage_preference_tests {
     #[tokio::test]
     async fn local_mode_without_state_db_has_no_live_goal_store() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
-        let config = ConfigBuilder::default()
+        let mut config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .build()
             .await?;
+        config.experimental_thread_store = ThreadStoreConfig::Local;
 
         assert_eq!(live_thread_goal_storage_preference(&config, false), None);
 
