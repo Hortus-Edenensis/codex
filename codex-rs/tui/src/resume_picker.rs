@@ -3878,6 +3878,7 @@ mod tests {
         ));
         let mut local = crate::latest_session_lookup_params(
             /*uses_remote_filesystem*/ false,
+            /*uses_remote_workspace*/ false,
             /*model_provider*/ None,
             &config,
             Some(&primary),
@@ -3889,6 +3890,7 @@ mod tests {
         assert_eq!(
             crate::latest_session_lookup_params(
                 /*uses_remote_filesystem*/ true,
+                /*uses_remote_workspace*/ false,
                 /*model_provider*/ None,
                 &config,
                 Some(&primary),
