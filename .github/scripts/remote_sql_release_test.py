@@ -119,21 +119,21 @@ def main():
         env = {
             **os.environ,
             "CODEX_REPO_ROOT": str(ROOT),
-            "CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE": "0.159.3",
+            "CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE": "0.160.0",
             "GITHUB_OUTPUT": str(output),
             "GITHUB_RUN_NUMBER": "42",
             "GITHUB_SHA": "a" * 40,
         }
         cases = [
-            ("tag", "v0.159.3-patch-1", "", "0.159.3-patch-1"),
-            ("tag", "v0.159.3-patch-1", "0.159.3-patch-1", "0.159.3-patch-1"),
-            ("tag", "prefix-v0.159.3-patch-1", "", None),
-            ("tag", "v0.159.3-patch-1-extra", "", None),
-            ("tag", "v0.159.3-patch-1", "0.159.3-patch-2", None),
-            ("tag", "v00.159.3-patch-1", "", None),
+            ("tag", "v0.160.0-patch-1", "", "0.160.0-patch-1"),
+            ("tag", "v0.160.0-patch-1", "0.160.0-patch-1", "0.160.0-patch-1"),
+            ("tag", "prefix-v0.160.0-patch-1", "", None),
+            ("tag", "v0.160.0-patch-1-extra", "", None),
+            ("tag", "v0.160.0-patch-1", "0.160.0-patch-2", None),
+            ("tag", "v00.160.0-patch-1", "", None),
             ("branch", "release", "bad/version", None),
-            ("branch", "release", "0.159.3-patch-2", "0.159.3-patch-2"),
-            ("branch", "release", "", "0.159.3-remote-sql.42+aaaaaaaaaaaa"),
+            ("branch", "release", "0.160.0-patch-2", "0.160.0-patch-2"),
+            ("branch", "release", "", "0.160.0-remote-sql.42+aaaaaaaaaaaa"),
         ]
         for ref_type, ref, requested, expected in cases:
             output.write_text("")
@@ -164,7 +164,7 @@ def main():
                 assert actual == original
             else:
                 assert cargo_path.read_text() == source
-        for base in ["0.0.0", "0.159.3"]:
+        for base in ["0.0.0", "0.160.0"]:
             cargo_path.write_text(
                 f'[workspace.package]\nversion = "{base}" # preserved\n[workspace.dependencies]\nexample = "{base}"\n'
             )
@@ -174,7 +174,7 @@ def main():
                 env={
                     **env,
                     "GITHUB_REF_TYPE": "tag",
-                    "GITHUB_REF_NAME": "v0.159.3-patch-1",
+                    "GITHUB_REF_NAME": "v0.160.0-patch-1",
                     "INPUT_RELEASE_VERSION": "",
                 },
                 check=True,
@@ -183,7 +183,7 @@ def main():
             )
             assert (
                 cargo_path.read_text()
-                == f'[workspace.package]\nversion = "0.159.3-patch-1" # preserved\n[workspace.dependencies]\nexample = "{base}"\n'
+                == f'[workspace.package]\nversion = "0.160.0-patch-1" # preserved\n[workspace.dependencies]\nexample = "{base}"\n'
             )
         # Use prebuilt stand-ins to exercise the official package layout without a build or download.
         binary = Path(temp) / "stand-in"
@@ -196,7 +196,7 @@ def main():
             "--target",
             "x86_64-unknown-linux-gnu",
             "--package-version",
-            "0.159.3-patch-1",
+            "0.160.0-patch-1",
             "--package-dir",
             str(Path(temp) / "package"),
             "--archive-output",
@@ -219,7 +219,7 @@ def main():
                 "codex-resources/bwrap",
             } <= set(archive.getnames())
             manifest = json.load(archive.extractfile("codex-package.json"))
-            assert manifest["version"] == "0.159.3-patch-1"
+            assert manifest["version"] == "0.160.0-patch-1"
             assert manifest["entrypoint"] == "bin/codex"
     print(
         "release workflow checks passed: 9 version cases with real Cargo.toml + 2 base versions, isolated PostgreSQL gate, test/build/release gates, shell syntax, native package layout"

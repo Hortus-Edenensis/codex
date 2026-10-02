@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: Version to embed in the Codex binary, for example 0.159.3-patch-1.
+        description: Version to embed in the Codex binary, for example 0.160.0-patch-1.
         required: false
         type: string
 
@@ -24,9 +24,9 @@ env:
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   CARGO_PROFILE_RELEASE_DEBUG: "0"
   CARGO_PROFILE_RELEASE_LTO: "false"
-  CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE: "0.159.3"
-  CODEX_OFFICIAL_BASE_TAG: "rust-v0.159.3"
-  CODEX_OFFICIAL_BASE_COMMIT: "01fc69f4026735edfdf6789820549727a4867b11"
+  CODEX_REMOTE_SQL_DEFAULT_VERSION_BASE: "0.160.0"
+  CODEX_OFFICIAL_BASE_TAG: "rust-v0.160.0"
+  CODEX_OFFICIAL_BASE_COMMIT: "a956835d020762cb2b570053af06f643a11c0ecc"
   STABLE_GIT_COMMIT: ${{ github.sha }}
   CODEX_REPO_ROOT: ${{ github.workspace }}
   RUST_MIN_STACK: "8388608"
